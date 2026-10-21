@@ -1,0 +1,20 @@
+{
+  "$schema": "https://go.kicad.org/api/schemas/v1",
+  "identifier": "io.github.nathanslab.copperpath",
+  "name": "copperpath",
+  "description": "Route the open board with the copperpath autorouter; one Ctrl+Z undoes the route",
+  "runtime": {
+    "type": "python",
+    "min_version": "3.9"
+  },
+  "actions": [
+    {
+      "identifier": "io.github.nathanslab.copperpath.route",
+      "name": "Route with copperpath",
+      "description": "Route all routable nets of the open board with copperpath",
+      "show-button": true,
+      "scopes": ["pcb"],
+      "entrypoint": "copperpath_action.py"
+    }
+  ]
+}

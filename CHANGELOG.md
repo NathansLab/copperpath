@@ -44,6 +44,10 @@ All notable changes to this project are documented here. The format follows
   Linux and macOS and write the best result so far like `--time-limit`; Ctrl+C / Ctrl+Break
   do the same on Windows. `--json` reports `stopped: "cancel"` (#19).
 - `--yield-pours` / config `yield_pours`: locked pours that yield like unlocked ones (#0009).
+- `kicad-plugin/`: KiCad 9/10 IPC API plugin (MVP). A **Route with copperpath** button routes the
+  open board and applies the `--delta-json` change set as one commit (one Ctrl+Z undoes it, no
+  file reload); binary from the plugin setting, the bundled `bin/` or `PATH`; errors in a dialog
+  with the last log lines. Tested against a mocked kipy API in CI (#21).
 
 ## [0.1.0] - 2026-10-21
 
