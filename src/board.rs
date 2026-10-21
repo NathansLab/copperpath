@@ -421,7 +421,7 @@ fn graphic_shapes(g: &List) -> Vec<Shape> {
                 .map(|s| (s.0, s.1))
                 .unwrap_or((1.0, 1.0));
             let t = font.and_then(|f| f.valf("thickness")).unwrap_or(0.15);
-            let lines: Vec<&str> = txt.split("\\n").collect();
+            let lines: Vec<&str> = txt.split('\n').collect(); // the parser already unescaped \n
             let len = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as f64;
             let (bw, bh) = (len * w * 1.1 + t, lines.len() as f64 * h * 1.6 + t);
             let just = g
@@ -915,6 +915,18 @@ mod tests {
             (a.x - 30.0).abs() < 1e-6 && (a.y - 28.0).abs() < 1e-6,
             "{a:?}"
         );
+    }
+
+    #[test]
+    fn multi_line_copper_text_is_tall() {
+        let b = parse_board(mini(
+            "(gr_text \"AB\\nCD\" (at 10 10 0) (layer \"F.Cu\") (effects (font (size 1 1) (thickness 0.2))))",
+        ))
+        .unwrap();
+        let (txt, _) = &b.graphics[0];
+        // two lines: 2 x 1.6 mm + thickness high -> 1.5 mm below the anchor is still text
+        assert_eq!(txt.dist(p(10.0, 11.5)), 0.0);
+        assert!(txt.dist(p(10.0 + 1.5, 10.0)) > 0.0); // 2 glyphs wide, not 5
     }
 
     #[test]

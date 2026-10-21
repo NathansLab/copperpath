@@ -20,6 +20,7 @@ All notable changes to this project are documented here. The format follows
 - Vias respect the Board Setup minimum diameter, drill and annular width (#0013).
 - Pad drill offsets shift the pad copper (#0014).
 - New vias and tracks of different nets keep the minimum hole clearance (#0015).
+- Multi-line copper texts are obstacles over their full height.
 
 ### Added
 - `--yield-pours` / config `yield_pours`: locked pours that yield like unlocked ones (#0009).
