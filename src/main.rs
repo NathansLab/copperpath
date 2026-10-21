@@ -1,6 +1,6 @@
 //! copperpath command line: check, place, route, opens, hints, pads, netclass (see README.md).
 
-use copperpath::{board, check, droute, geom, groute, model, place, rules, sch, sites};
+use copperpath::{board, check, delta, droute, geom, groute, model, place, rules, sch, sites};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -18,13 +18,15 @@ const USAGE: &str = "usage: copperpath <command> --pcb BOARD.kicad_pcb [options]
 commands:
   check     routability report (via sites, global-route congestion, hotspots)
   place     simulated-annealing placement inside zones (--zones zones.json)
-  route     detailed router for a region (--region x0,y0,x1,y1 --out OUT.kicad_pcb)
+  route     detailed router for a region (--region x0,y0,x1,y1 --out OUT.kicad_pcb
+            and/or --delta-json DELTA.json: added/removed items in nm for the KiCad IPC API)
   opens     unconnected connections per net, counted from the copper
   hints     near-collinear pad pairs that force jogs between straight pad exits
   pads      pad world positions, sizes and nets (tab separated)
   netclass  net -> net class table (tab separated)
 
 common options:
+  --pcb -             read the board from stdin (give --pro / --dru explicitly)
   --cfg config.json   board configuration (optional, see examples/config.json)
   --board NAME        entry under \"boards\" in the config
   --pro / --dru       project / custom rules file (default: next to the board)
@@ -137,14 +139,29 @@ pub fn load_ctx(a: &Args) -> Result<Ctx, String> {
         .get("pcb")
         .ok_or("missing --pcb BOARD.kicad_pcb")?
         .to_string();
-    if !std::path::Path::new(&pcb).is_file() {
+    // --pcb -: board text on stdin (from an editor plugin); --pro / --dru have no default then
+    let stdin = pcb == "-";
+    if !stdin && !std::path::Path::new(&pcb).is_file() {
         return Err(format!("{pcb}: board file not found"));
     }
     let base = pcb.trim_end_matches(".kicad_pcb").to_string();
-    let pro = a.s("pro", &format!("{base}.kicad_pro"));
-    let dru = a.s("dru", &format!("{base}.kicad_dru"));
+    let (pro, dru) = if stdin {
+        (a.s("pro", ""), a.s("dru", ""))
+    } else {
+        (
+            a.s("pro", &format!("{base}.kicad_pro")),
+            a.s("dru", &format!("{base}.kicad_dru")),
+        )
+    };
     let t0 = Instant::now();
-    let board = board::load(&pcb)?;
+    let board = if stdin {
+        let mut t = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut t)
+            .map_err(|e| format!("stdin: {e}"))?;
+        board::parse_board(t)?
+    } else {
+        board::load(&pcb)?
+    };
     // without a project file KiCad uses its default net class; do the same
     let pro = if std::path::Path::new(&pro).is_file() {
         pro
@@ -858,16 +875,27 @@ fn cmd_route(a: &Args) -> CmdResult {
             b
         }
     };
+    // --delta-json FILE (or - for stdout) instead of or together with --out
+    let delta_out = a.get("delta-json");
+    if delta_out == Some("-") && a.json() {
+        return Err("--delta-json - and --json both use stdout: give the delta a file".into());
+    }
+    let write_board = a.get("out").is_some() || delta_out.is_none();
     let out = a.s("out", "routed.kicad_pcb");
-    if !out.ends_with(".kicad_pcb") {
+    if write_board && !out.ends_with(".kicad_pcb") {
         return Err(format!(
             "--out {out}: the output file must end in .kicad_pcb"
         ));
     }
-    if std::path::Path::new(&out).canonicalize().ok()
-        == std::path::Path::new(&c.pcb).canonicalize().ok()
+    if write_board
+        && c.pcb != "-"
+        && std::path::Path::new(&out).canonicalize().ok()
+            == std::path::Path::new(&c.pcb).canonicalize().ok()
     {
         return Err("--out must differ from --pcb (the input board is never overwritten)".into());
+    }
+    if a.get("drc").is_some() && (!write_board || c.pcb == "-") {
+        return Err("--drc needs board files: give --pcb FILE and --out".into());
     }
     // all existing copper stays in the output, so all of it is an obstacle for other nets (and
     // connectivity for its own net); --ignore-unlocked restores the old "locked only" view
@@ -1017,24 +1045,49 @@ fn cmd_route(a: &Args) -> CmdResult {
             r.debug_images(*n, &res, if d.is_empty() { "." } else { &d });
         }
     }
-    write_file(&out, "")?; // creates the output directory
-    droute::write_pcb(&c.board.text, &c.board.nets, &res, &out)
-        .map_err(|e| format!("{out}: {e}"))?;
-    for (src, ext) in [(&c.pro, "kicad_pro"), (&c.dru, "kicad_dru")] {
-        if std::path::Path::new(src).is_file() {
-            std::fs::copy(src, out.replace(".kicad_pcb", &format!(".{ext}")))
-                .map_err(|e| format!("{src}: {e}"))?;
+    let text = droute::pcb_text(&c.board.text, &c.board.nets, &res);
+    if write_board {
+        write_file(&out, &text)?;
+        for (src, ext) in [(&c.pro, "kicad_pro"), (&c.dru, "kicad_dru")] {
+            if std::path::Path::new(src).is_file() {
+                std::fs::copy(src, out.replace(".kicad_pcb", &format!(".{ext}")))
+                    .map_err(|e| format!("{src}: {e}"))?;
+            }
         }
     }
-    // opens counted on the written board (all copper, routed region and nets only)
-    let mut a2 = Args {
-        cmd: a.cmd.clone(),
-        kv: a.kv.clone(),
+    if let Some(dp) = delta_out {
+        // routed copper is only appended: nothing of the input board is removed (yet)
+        let d = delta::route_delta(&c.board.nets, &res, &[]);
+        let s = serde_json::to_string(&d).unwrap_or_default();
+        if dp == "-" {
+            println!("{s}");
+        } else {
+            write_file(dp, &s)?;
+        }
+        eprintln!(
+            "[route] delta: {} items added, 0 removed -> {dp}",
+            d["add"].as_array().map(|v| v.len()).unwrap_or(0)
+        );
+    }
+    // opens counted on the routed board (all copper, routed region and nets only)
+    let board2 = board::parse_board(text)?;
+    let rules2 = rules::Rules::load(
+        &c.pro,
+        if std::path::Path::new(&c.dru).is_file() {
+            &c.dru
+        } else {
+            ""
+        },
+        &board2.nets,
+    )?;
+    let c2 = Ctx {
+        board: board2,
+        rules: rules2,
+        cfg: c.cfg.clone(),
+        pcb: out.clone(),
+        pro: c.pro.clone(),
+        dru: c.dru.clone(),
     };
-    a2.kv.insert("pcb".into(), out.clone());
-    a2.kv.remove("pro");
-    a2.kv.remove("dru");
-    let c2 = load_ctx(&a2)?;
     let (opens, open_nets) = count_opens(&c2, Some(region), filt.as_ref());
     let drc = if a.get("drc").is_some() {
         Some(drc_delta(a, &c.pcb, &out)?)
@@ -1055,7 +1108,7 @@ fn cmd_route(a: &Args) -> CmdResult {
         }
     }
     let summary = json!({
-        "out": out, "nets": r.jobs.len(), "connections": res.conns, "segments": nseg, "vias": nvia, "length_mm": check::round2(len),
+        "out": write_board.then_some(&out), "delta_json": delta_out, "nets": r.jobs.len(), "connections": res.conns, "segments": nseg, "vias": nvia, "length_mm": check::round2(len),
         "routes": res.routes, "rips": res.rips, "opens": opens,
         "open_nets": open_nets.iter().map(|(n, k)| json!({"net": n, "opens": k})).collect::<Vec<_>>(),
         "aes": {"cleanup_level": level, "pins": s.pins, "pins_no_stub": s.pins_no_stub, "stub_ends": s.stubs_used, "short_stubs": s.short_stubs, "fallback_ends": s.fallback_ends, "aligned": s.aligned, "align_failed": s.align_failed, "pulls": s.pulls, "mitered": s.mitered, "miter_kept_90": s.miter_failed, "stub_end_shifts": s.shifted, "axis_jogs": s.jogs, "kept90_by_cause": {"clearance": s.kept90[0], "L_between_stubs": s.kept90[1], "shift_blocked": s.kept90[2], "Z_U_too_short": s.kept90[3], "short_legs": s.kept90[4]}, "exact_fail": s.exact_fail},
@@ -1065,11 +1118,15 @@ fn cmd_route(a: &Args) -> CmdResult {
         "stopped": stopped,
         "hotspots": res.hotspots.iter().take(20).map(|h| json!({"net": c.board.nets[h.net], "cells": h.cells, "at": [check::round2(h.x), check::round2(h.y)], "layer": h.layer})).collect::<Vec<_>>(),
     });
-    write_file(
-        &out.replace(".kicad_pcb", "_route.json"),
-        &serde_json::to_string_pretty(&summary).unwrap_or_default(),
-    )?;
-    eprintln!("[route] {opens} opens -> {out}");
+    if write_board {
+        write_file(
+            &out.replace(".kicad_pcb", "_route.json"),
+            &serde_json::to_string_pretty(&summary).unwrap_or_default(),
+        )?;
+        eprintln!("[route] {opens} opens -> {out}");
+    } else {
+        eprintln!("[route] {opens} opens");
+    }
     Ok(summary)
 }
 

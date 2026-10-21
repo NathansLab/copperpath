@@ -2602,6 +2602,11 @@ fn uuid(seed: &mut u64) -> String {
 
 /// append routed copper to the board text (unlocked, so it can be ripped by later runs)
 pub fn write_pcb(text: &str, nets: &[String], res: &DResult, out: &str) -> std::io::Result<()> {
+    std::fs::write(out, pcb_text(text, nets, res))
+}
+
+/// the board text with the routed copper appended (what `write_pcb` writes)
+pub fn pcb_text(text: &str, nets: &[String], res: &DResult) -> String {
     let mut seed = 0x1234_5678_9abc_def1u64;
     let mut add = String::new();
     let mut keys: Vec<&usize> = res.routed.keys().collect();
@@ -2627,7 +2632,7 @@ pub fn write_pcb(text: &str, nets: &[String], res: &DResult, out: &str) -> std::
     o.push_str(&text[..end]);
     o.push_str(&add);
     o.push_str(&text[end..]);
-    std::fs::write(out, o)
+    o
 }
 
 #[cfg(test)]
