@@ -14,6 +14,7 @@ pub mod groute;
 pub mod img;
 pub mod model;
 pub mod place;
+pub mod reroute;
 pub mod rules;
 pub mod sch;
 pub mod sexpr;

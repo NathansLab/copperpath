@@ -1,7 +1,7 @@
 //! copperpath command line: check, place, route, opens, hints, pads, netclass (see README.md).
 
 use copperpath::{
-    board, check, droute, fanout, geom, groute, model, place, rules, sch, sites, stitch,
+    board, check, droute, fanout, geom, groute, model, place, reroute, rules, sch, sites, stitch,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -863,8 +863,170 @@ fn cmd_hints(a: &Args) -> CmdResult {
     Ok(json!({"tol_mm": tol, "count": hints.len(), "hints": hints}))
 }
 
-/// route --pcb B [--region x0,y0,x1,y1] [--nets pats] [--res 0.05] [--drc] --out OUT.kicad_pcb
+/// route, then (with --reroute-blockers) rip the unlocked copper of other nets that blocks each
+/// net left open and route it again together with the ripped nets; a try that leaves any of
+/// these nets worse than before is rolled back
 fn cmd_route(a: &Args) -> CmdResult {
+    let mut summary = route_once(a)?;
+    if a.get("reroute-blockers").is_none() || summary["opens"].as_u64().unwrap_or(0) == 0 {
+        return Ok(summary);
+    }
+    let out = summary["out"].as_str().unwrap_or_default().to_string();
+    let c0 = load_ctx(a)?;
+    let region = match a.get("region") {
+        Some(s) => parse_box(s)?,
+        None => c0.board.bbox,
+    };
+    let max_nets = a.u("max-ripped", 3);
+    let max_targets = a.u("max-targets", 10);
+    // rules of the input board for every later step (the copies have other base names)
+    let mut base_kv = a.kv.clone();
+    for k in ["reroute-blockers", "drc", "json", "dbg-net"] {
+        base_kv.remove(k);
+    }
+    if !c0.pro.is_empty() {
+        base_kv.insert("pro".into(), c0.pro.clone());
+    }
+    if std::path::Path::new(&c0.dru).is_file() {
+        base_kv.insert("dru".into(), c0.dru.clone());
+    }
+    let load_out = |path: &str| -> Result<Ctx, String> {
+        let mut kv = base_kv.clone();
+        kv.insert("pcb".into(), path.to_string());
+        load_ctx(&Args {
+            cmd: "route".into(),
+            kv,
+        })
+    };
+    let per_net = |c: &Ctx| -> HashMap<String, usize> {
+        let all: std::collections::HashSet<usize> = (1..c.board.nets.len()).collect();
+        count_opens(c, Some(region), Some(&all))
+            .1
+            .into_iter()
+            .map(|(n, k, _)| (n, k))
+            .collect()
+    };
+    // only the nets the user asked to route are targets
+    let user_filt: Option<std::collections::HashSet<String>> = net_filter(a, &c0.board.nets)
+        .map(|f| f.iter().map(|i| c0.board.nets[*i].clone()).collect());
+    let mut log = Vec::new();
+    let mut tried: std::collections::HashSet<String> = Default::default();
+    for _ in 0..max_targets {
+        let c = load_out(&out)?;
+        let before = per_net(&c);
+        let mut targets: Vec<(&String, &usize)> = before
+            .iter()
+            .filter(|(n, _)| {
+                !tried.contains(*n) && user_filt.as_ref().is_none_or(|f| f.contains(*n))
+            })
+            .collect();
+        targets.sort();
+        let Some((target, t_before)) = targets.first().map(|(n, k)| ((*n).clone(), **k)) else {
+            break;
+        };
+        tried.insert(target.clone());
+        let tnet = c.board.net_id[&target];
+        let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
+        let bp = reroute::BlockerParams {
+            max_nets,
+            margin_mm: a.f("job-margin", 6.0),
+            ..Default::default()
+        };
+        let Some(bl) = reroute::find_blockers(&m, tnet, region, &bp) else {
+            eprintln!("[reroute] {target}: no corridor even through unlocked copper");
+            log.push(json!({"net": target, "accepted": false, "reason": "no corridor through unlocked copper (locked copper, pads or edge block it)"}));
+            continue;
+        };
+        if bl.nets.is_empty() || bl.uuids.is_empty() {
+            eprintln!(
+                "[reroute] {target}: corridor of {} mm has no rippable blocker",
+                bl.length_mm
+            );
+            log.push(json!({"net": target, "accepted": false, "reason": "the cheapest corridor is not blocked by unlocked copper of other nets"}));
+            continue;
+        }
+        let ripped: Vec<String> = bl.nets.iter().map(|n| c.board.nets[*n].clone()).collect();
+        eprintln!(
+            "[reroute] {target}: ripping {} items of {:?} on a {} mm corridor",
+            bl.uuids.len(),
+            ripped,
+            bl.length_mm
+        );
+        let (text, cut) = reroute::remove_items(&c.board.text, &bl.uuids);
+        let rip = out.replace(".kicad_pcb", "_rip.kicad_pcb");
+        let tryo = out.replace(".kicad_pcb", "_try.kicad_pcb");
+        write_file(&rip, &text)?;
+        let mut kv = base_kv.clone();
+        kv.insert("pcb".into(), rip.clone());
+        kv.insert("out".into(), tryo.clone());
+        // exact names as patterns (wildcards in net names are taken literally enough here)
+        let mut nets = vec![target.clone()];
+        nets.extend(ripped.iter().cloned());
+        kv.insert("nets".into(), nets.join(","));
+        let res = route_once(&Args {
+            cmd: "route".into(),
+            kv,
+        });
+        let after = match &res {
+            Ok(_) => per_net(&load_out(&tryo)?),
+            Err(_) => before.clone(),
+        };
+        let worse: Vec<&String> = nets
+            .iter()
+            .filter(|n| after.get(*n).copied().unwrap_or(0) > before.get(*n).copied().unwrap_or(0))
+            .collect();
+        let t_after = after.get(&target).copied().unwrap_or(0);
+        let total = |h: &HashMap<String, usize>| h.values().sum::<usize>();
+        let ok =
+            res.is_ok() && worse.is_empty() && t_after < t_before && total(&after) < total(&before);
+        let cleanup = |p: &str| {
+            for ext in [".kicad_pcb", "_route.json", ".kicad_pro", ".kicad_dru"] {
+                let _ = std::fs::remove_file(p.replace(".kicad_pcb", ext));
+            }
+        };
+        if ok {
+            std::fs::rename(&tryo, &out).map_err(|e| format!("{out}: {e}"))?;
+        }
+        cleanup(&tryo);
+        cleanup(&rip);
+        eprintln!(
+            "[reroute] {target}: {} (opens of the net {t_before} -> {t_after}, board {} -> {})",
+            if ok { "accepted" } else { "rolled back" },
+            total(&before),
+            total(&after)
+        );
+        log.push(json!({
+            "net": target, "ripped_nets": ripped, "ripped_items": cut,
+            "corridor_mm": bl.length_mm, "accepted": ok,
+            "opens_before": t_before, "opens_after": t_after,
+            "board_opens_before": total(&before), "board_opens_after": total(&after),
+            "worse": worse,
+            "reason": if ok { "".to_string() } else if let Err(e) = &res { e.clone() } else if !worse.is_empty() { "a ripped net could not be restored".into() } else { "the target is still open".into() },
+        }));
+    }
+    // final state of the written board
+    let c = load_out(&out)?;
+    let filt = net_filter(a, &c.board.nets);
+    let (opens, open_nets) = count_opens(&c, Some(region), filt.as_ref());
+    summary["opens"] = json!(opens);
+    summary["open_nets"] = json!(open_nets
+        .iter()
+        .map(|(n, k, _)| json!({"net": n, "opens": k}))
+        .collect::<Vec<_>>());
+    summary["reroute"] = json!(log);
+    if a.get("drc").is_some() {
+        summary["drc"] = drc_delta(a, &c0.pcb, &out)?;
+    }
+    write_file(
+        &out.replace(".kicad_pcb", "_route.json"),
+        &serde_json::to_string_pretty(&summary).unwrap_or_default(),
+    )?;
+    eprintln!("[reroute] {opens} opens -> {out}");
+    Ok(summary)
+}
+
+/// route --pcb B [--region x0,y0,x1,y1] [--nets pats] [--res 0.05] [--drc] --out OUT.kicad_pcb
+fn route_once(a: &Args) -> CmdResult {
     let c = load_ctx(a)?;
     let region = match a.get("region") {
         Some(s) => parse_box(s)?,

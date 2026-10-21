@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `route --reroute-blockers [--max-ripped 3] [--max-targets 10]`: for every net left open, the
+  unlocked copper of other nets on its cheapest corridor (search with that copper passable at a
+  high cost) is ripped and the net is rerouted together with the ripped nets; kept only if no
+  net gets worse, rolled back otherwise. `--json` reports each try (`reroute`).
 - `fanout` and `stitch` report the nearest blockers of every failed island in `--json`
   (net, kind, footprint, layer, distance, required clearance, locked, position): what an agent would
   have to move (`model::nearest_blockers`).
