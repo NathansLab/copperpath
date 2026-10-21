@@ -24,6 +24,14 @@ pub enum Kind {
     },
     /// courtyard of a via-keepout footprint (config via_keepout_refs)
     ViaKeepout,
+    /// solder mask aperture (mask graphic or pad mask expansion) on an outer layer: copper of
+    /// other nets inside it would be exposed next to the pads (KiCad `solder_mask_bridge`).
+    /// `fp`: owning footprint (usize::MAX = board graphic); `nets`: nets of the pads and locked
+    /// zones in the aperture (0 = unused slot), the only nets allowed in it
+    Mask {
+        fp: usize,
+        nets: [u32; 4],
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +44,53 @@ pub struct Obj {
     /// drilled hole radius (THT pads, vias), 0 otherwise
     pub hole_r: f64,
     pub bbox: BBox,
+}
+
+impl Obj {
+    /// solder mask aperture on the exposed copper layers `layers` (nets filled in by [`mask_nets`])
+    fn mask(shape: Shape, layers: u8, fp: usize) -> Obj {
+        Obj {
+            bbox: shape.bbox(),
+            shape,
+            layers,
+            net: 0,
+            kind: Kind::Mask { fp, nets: [0; 4] },
+            locked: true,
+            hole_r: 0.0,
+        }
+    }
+}
+
+/// nets allowed in each solder mask aperture: the nets of the pads and locked zones that touch
+/// it on its layer (further nets beyond four are dropped: such an aperture bridges already)
+fn mask_nets(objs: &mut [Obj]) {
+    let copper: Vec<usize> = (0..objs.len())
+        .filter(|&j| objs[j].net != 0 && matches!(objs[j].kind, Kind::Pad { .. } | Kind::Zone))
+        .collect();
+    for i in 0..objs.len() {
+        if !matches!(objs[i].kind, Kind::Mask { .. }) {
+            continue;
+        }
+        let a = &objs[i];
+        let mut found = [0u32; 4];
+        let mut k = 0;
+        for o in copper.iter().map(|&j| &objs[j]) {
+            if o.layers & a.layers == 0
+                || !o.bbox.overlaps(&a.bbox)
+                || found.contains(&(o.net as u32))
+                || shape_dist(&o.shape, &a.shape) > 1e-6
+            {
+                continue;
+            }
+            if k < found.len() {
+                found[k] = o.net as u32;
+                k += 1;
+            }
+        }
+        if let Kind::Mask { nets, .. } = &mut objs[i].kind {
+            *nets = found;
+        }
+    }
 }
 
 /// Board configuration. Everything is optional; the defaults route every net with at least two
@@ -161,7 +216,10 @@ impl<'a> Model<'a> {
     pub fn new(b: &'a Board, r: &'a Rules, cfg: BoardCfg, mode: CopperMode) -> Model<'a> {
         let mut objs = Vec::new();
         for (fi, f) in b.fps.iter().enumerate() {
-            Self::push_fp(&mut objs, f, fi, &cfg);
+            Self::push_fp(&mut objs, f, fi, &cfg, b.mask_margin);
+        }
+        for (s, lm) in &b.mask {
+            objs.push(Obj::mask(s.clone(), *lm, usize::MAX));
         }
         for t in &b.tracks {
             if mode == CopperMode::LockedOnly && !t.locked {
@@ -249,6 +307,7 @@ impl<'a> Model<'a> {
                 hole_r: 0.0,
             });
         }
+        mask_nets(&mut objs);
         let n = b.nets.len();
         let mut npins = vec![0usize; n];
         for f in &b.fps {
@@ -292,8 +351,27 @@ impl<'a> Model<'a> {
         }
     }
 
-    pub fn push_fp(objs: &mut Vec<Obj>, f: &Footprint, fi: usize, cfg: &BoardCfg) {
+    /// pads, mask apertures and via keepout of footprint `fi`; `mask_margin`: board setup solder
+    /// mask expansion of pads without a local one
+    pub fn push_fp(
+        objs: &mut Vec<Obj>,
+        f: &Footprint,
+        fi: usize,
+        cfg: &BoardCfg,
+        mask_margin: f64,
+    ) {
+        for (s, lm) in f.mask_world() {
+            objs.push(Obj::mask(s, lm, fi));
+        }
         for (pi, pd) in f.pads.iter().enumerate() {
+            // the mask opening reaches beyond the copper by the expansion (only then it matters:
+            // with a margin <= 0 the pad clearance already keeps other nets out)
+            let mm = pd.mask_margin.unwrap_or(mask_margin);
+            if pd.mask & pd.layers != 0 && mm > 0.0 {
+                for s in f.pad_shapes(pd) {
+                    objs.push(Obj::mask(s.inflated(mm), pd.mask & pd.layers, fi));
+                }
+            }
             let hole_r = if pd.kind.contains("thru_hole") {
                 pd.drill / 2.0
             } else {
@@ -363,6 +441,14 @@ impl<'a> Model<'a> {
     pub fn clr(&self, net: usize, o: &Obj, l: usize) -> f64 {
         match o.kind {
             Kind::Keepout { .. } | Kind::ViaKeepout => 0.0,
+            // no clearance: other nets only have to stay out of the opening itself
+            Kind::Mask { nets, .. } => {
+                if net != 0 && nets.contains(&(net as u32)) {
+                    -1.0
+                } else {
+                    0.0
+                }
+            }
             _ => {
                 if o.net == net && net != 0 {
                     return -1.0; // same net: not an obstacle
@@ -582,6 +668,40 @@ mod tests {
             ..BoardCfg::default()
         };
         assert_eq!(zones(cfg), 0);
+    }
+
+    #[test]
+    fn mask_apertures_admit_only_the_nets_inside() {
+        let b = board(
+            "(setup (pad_to_mask_clearance 0.1)) \
+             (footprint \"JP\" (layer \"F.Cu\") (at 10 10) (property \"Reference\" \"JP1\") \
+             (fp_poly (pts (xy -1 -1) (xy 1 -1) (xy 1 1) (xy -1 1)) (stroke (width 0)) \
+             (fill yes) (layer \"F.Mask\")) \
+             (pad \"1\" smd rect (at -0.4 0) (size 0.5 1) (layers \"F.Cu\") (net \"A\")) \
+             (pad \"2\" smd rect (at 0.4 0) (size 0.5 1) (layers \"F.Cu\") (net \"B\"))) \
+             (footprint \"R\" (layer \"B.Cu\") (at 20 10) (property \"Reference\" \"R1\") \
+             (pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"B.Cu\" \"B.Mask\") (net \"C\")) \
+             (pad \"2\" smd rect (at 2 0) (size 1 1) (layers \"B.Cu\" \"B.Mask\") \
+             (solder_mask_margin 0) (net \"C\")))",
+        );
+        let r = Rules::load("", "", &b.nets).unwrap();
+        let m = Model::new(&b, &r, BoardCfg::default(), CopperMode::All);
+        let masks: Vec<&Obj> = m
+            .objs
+            .iter()
+            .filter(|o| matches!(o.kind, Kind::Mask { .. }))
+            .collect();
+        // jumper polygon on F.Cu, the board-default expansion of R1 pad 1 on B.Cu; pad 2 has none
+        assert_eq!(masks.len(), 2);
+        let (a, bn, c) = (b.net_id["A"], b.net_id["B"], b.net_id["C"]);
+        let jp = masks.iter().find(|o| o.layers == 1).unwrap();
+        assert!(m.clr(a, jp, 0) < 0.0 && m.clr(bn, jp, 0) < 0.0);
+        assert_eq!(m.clr(c, jp, 0), 0.0);
+        assert_eq!(m.clr(0, jp, 0), 0.0);
+        let pd = masks.iter().find(|o| o.layers == 1 << (NL - 1)).unwrap();
+        assert!((pd.bbox.x1 - pd.bbox.x0 - 1.2).abs() < 1e-6);
+        assert!(m.clr(c, pd, NL - 1) < 0.0);
+        assert_eq!(m.clr(a, pd, NL - 1), 0.0);
     }
 
     #[test]

@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Tracks and vias of other nets stay out of solder mask apertures: F.Mask/B.Mask graphics of
+  footprints and the board (e.g. over a solder jumper) and pad mask expansions only admit the
+  nets of the pads and locked zones inside them; no more `solder_mask_bridge` (#3).
 - `class_layers`: the most specific matching pattern wins; before, `"*"` won because JSON keys
   are sorted. The log prints the effective layers per class (#38).
 - A multi-pin net whose start pin cannot be joined keeps the rest of its routing (the tree is
