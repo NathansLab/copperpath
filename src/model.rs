@@ -8,6 +8,10 @@ use crate::rules::{wild, Rules};
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// gap (mm) that other nets keep from a solder mask aperture: KiCad flags copper that touches the
+/// opening, so the router's exact-touch tolerance must not apply here
+pub const MASK_GAP: f64 = 0.005;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Kind {
     Pad {
@@ -441,12 +445,13 @@ impl<'a> Model<'a> {
     pub fn clr(&self, net: usize, o: &Obj, l: usize) -> f64 {
         match o.kind {
             Kind::Keepout { .. } | Kind::ViaKeepout => 0.0,
-            // no clearance: other nets only have to stay out of the opening itself
+            // other nets only have to stay out of the opening itself; touching its edge already
+            // collides in KiCad (distance 0 at clearance 0), unlike touching a copper clearance
             Kind::Mask { nets, .. } => {
                 if net != 0 && nets.contains(&(net as u32)) {
                     -1.0
                 } else {
-                    0.0
+                    MASK_GAP
                 }
             }
             _ => {
@@ -696,12 +701,12 @@ mod tests {
         let (a, bn, c) = (b.net_id["A"], b.net_id["B"], b.net_id["C"]);
         let jp = masks.iter().find(|o| o.layers == 1).unwrap();
         assert!(m.clr(a, jp, 0) < 0.0 && m.clr(bn, jp, 0) < 0.0);
-        assert_eq!(m.clr(c, jp, 0), 0.0);
-        assert_eq!(m.clr(0, jp, 0), 0.0);
+        assert_eq!(m.clr(c, jp, 0), MASK_GAP);
+        assert_eq!(m.clr(0, jp, 0), MASK_GAP);
         let pd = masks.iter().find(|o| o.layers == 1 << (NL - 1)).unwrap();
         assert!((pd.bbox.x1 - pd.bbox.x0 - 1.2).abs() < 1e-6);
         assert!(m.clr(c, pd, NL - 1) < 0.0);
-        assert_eq!(m.clr(a, pd, NL - 1), 0.0);
+        assert_eq!(m.clr(a, pd, NL - 1), MASK_GAP);
     }
 
     #[test]
