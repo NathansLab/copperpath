@@ -17,6 +17,7 @@ pub mod model;
 pub mod movefp;
 pub mod nudge;
 pub mod place;
+pub mod plane;
 pub mod render;
 pub mod reroute;
 pub mod rules;

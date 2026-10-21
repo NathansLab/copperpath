@@ -1,8 +1,8 @@
 //! copperpath command line: check, place, route, opens, hints, pads, netclass (see README.md).
 
 use copperpath::{
-    board, check, droute, fanout, geom, groute, model, nudge, place, render, reroute, rules, sch,
-    sites, stitch,
+    board, check, droute, fanout, geom, groute, model, nudge, place, plane, render, reroute, rules,
+    sch, sites, stitch,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -30,6 +30,7 @@ commands:
   fanout    track + via from every open island of a plane net to its plane (--net --plane --out)
   nudge     move small parts locally until their nets route (--parts R5,R7 | --spec | --auto --out)
   render    PNG of a board region: layers, pads with labels, opens, DRC markers (--roi --out)
+  plane     planes: list | report | fill | create | adjust (native zone filler, no kicad-cli)
 
 common options:
   --cfg config.json   board configuration (optional, see examples/config.json)
@@ -244,6 +245,7 @@ fn main() {
         "fanout" => cmd_fanout(&a),
         "nudge" => cmd_nudge(&a),
         "render" => cmd_render(&a),
+        "plane" => cmd_plane(&a),
         "" => Err(format!("no command given\n{USAGE}")),
         c => Err(format!("unknown command '{c}'\n{USAGE}")),
     };
@@ -283,9 +285,9 @@ fn main() {
     }
 }
 
-const KNOWN: [&str; 11] = [
+const KNOWN: [&str; 12] = [
     "check", "place", "route", "opens", "pads", "hints", "netclass", "stitch", "fanout", "nudge",
-    "render",
+    "render", "plane",
 ];
 
 fn write_file(path: &str, data: &str) -> Result<(), String> {
@@ -1385,7 +1387,7 @@ fn base_text(a: &Args, c: &Ctx) -> Result<String, String> {
 /// fanout --pcb FILLED --net GND --plane REGEX [--reach 6] [--via D,DRILL] [--width W]
 /// [--margin 0.05] [--min-clr 0] [--islands opens.json] [--base B] --out OUT.kicad_pcb
 fn cmd_fanout(a: &Args) -> CmdResult {
-    let c = load_ctx(a)?;
+    let c = load_ctx_filled(a)?;
     let out = out_path(a, &c, "fanout.kicad_pcb")?;
     let net_name = a.s("net", "GND");
     let net = *c
@@ -1480,7 +1482,7 @@ fn cmd_fanout(a: &Args) -> CmdResult {
 /// stitch --pcb FILLED --net GND --zones REGEX --plane REGEX [--grid G] [--via D,DRILL]
 /// [--margin 0.05] [--min-clr 0] [--min-area 0.3] [--base BASE.kicad_pcb] --out OUT.kicad_pcb
 fn cmd_stitch(a: &Args) -> CmdResult {
-    let c = load_ctx(a)?;
+    let c = load_ctx_filled(a)?;
     let out = out_path(a, &c, "stitched.kicad_pcb")?;
     let net_name = a.s("net", "GND");
     let net = *c
@@ -1560,7 +1562,7 @@ fn cmd_stitch(a: &Args) -> CmdResult {
 
 /// opens --pcb B [--region box] [--nets pats]: unconnected connections counted from copper (all copper)
 fn cmd_opens(a: &Args) -> CmdResult {
-    let c = load_ctx(a)?;
+    let c = load_ctx_filled(a)?;
     let (total, per) = count_opens(
         &c,
         a.get("region").map(parse_box).transpose()?,
@@ -1866,7 +1868,7 @@ fn cmd_nudge(a: &Args) -> CmdResult {
 /// [--labels] [--courtyards] [--opens] [--drc drc.json] [--halo-min 1.0] [--per-layer]
 /// [--px 1200] --out roi.png
 fn cmd_render(a: &Args) -> CmdResult {
-    let c = load_ctx(a)?;
+    let c = load_ctx_filled(a)?;
     let out = a.s("out", "render.png");
     if !out.to_ascii_lowercase().ends_with(".png") {
         return Err(format!("--out {out}: the output file must end in .png"));
@@ -1926,4 +1928,374 @@ fn write_bytes(path: &str, data: &[u8]) -> Result<(), String> {
         }
     }
     std::fs::write(path, data).map_err(|e| format!("{path}: {e}"))
+}
+
+/// [`load_ctx`], then with `--native-fill` the copper zones are filled natively (replacing the
+/// saved fills), so `stitch`, `fanout`, `opens` and `render` work without kicad-cli
+fn load_ctx_filled(a: &Args) -> Result<Ctx, String> {
+    let mut c = load_ctx(a)?;
+    if a.get("native-fill").is_some() {
+        let t = Instant::now();
+        let fp = fill_params(a);
+        let k = plane::fill_board(&mut c.board, &c.rules, &c.cfg, &|_| true, &fp);
+        eprintln!(
+            "[fill] native fill: {k} polygons at {} mm in {:.2} s",
+            fp.res,
+            t.elapsed().as_secs_f64()
+        );
+    }
+    Ok(c)
+}
+
+fn fill_params(a: &Args) -> plane::FillParams {
+    plane::FillParams {
+        res: a.f("fill-res", 0.1).max(0.01),
+        min_width: a.f("min-width", 0.25),
+    }
+}
+
+fn net_arg(c: &Ctx, n: &str) -> Result<usize, String> {
+    c.board
+        .net_id
+        .get(n)
+        .copied()
+        .ok_or(format!("--net {n}: no such net"))
+}
+
+fn nets_regex(c: &Ctx, pat: &str) -> Result<Vec<usize>, String> {
+    let re = regex::Regex::new(&format!("^(?:{pat})$")).map_err(|e| format!("--hv: {e}"))?;
+    Ok((1..c.board.nets.len())
+        .filter(|&i| re.is_match(&c.board.nets[i]))
+        .collect())
+}
+
+/// plane list | report | fill | create | adjust
+fn cmd_plane(a: &Args) -> CmdResult {
+    let sub = std::env::args().nth(2).unwrap_or_default();
+    match sub.as_str() {
+        "list" => {
+            let c = load_ctx(a)?;
+            let v = plane::detect(&c.board, &c.rules, a.u("min-pads", 4));
+            for p in &v {
+                eprintln!(
+                    "[plane] {:<16} {:<10} {:>4} pads  {} zone(s){}{}",
+                    p.net,
+                    p.class,
+                    p.pads,
+                    p.zones.len(),
+                    if p.plane { "  plane" } else { "" },
+                    if p.candidate {
+                        "  candidate (power-like, no zone)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Ok(json!({"nets": v}))
+        }
+        "report" => plane_report(a),
+        "fill" => {
+            let mut c = load_ctx(a)?;
+            let out = out_path(a, &c, "filled.kicad_pcb")?;
+            let nets = match a.get("net") {
+                Some(n) => vec![net_arg(&c, n)?],
+                None => vec![],
+            };
+            let b0 = c.board.clone();
+            let t = Instant::now();
+            let k = plane::fill_board(
+                &mut c.board,
+                &c.rules,
+                &c.cfg,
+                &|zi| nets.is_empty() || nets.contains(&b0.zones[zi].net),
+                &fill_params(a),
+            );
+            write_file(&out, &plane::write_fills(&c.board.text, &c.board))?;
+            eprintln!(
+                "[plane] {k} fill polygons in {:.2} s -> {out}",
+                t.elapsed().as_secs_f64()
+            );
+            Ok(json!({"out": out, "polygons": k}))
+        }
+        "create" | "adjust" => plane_outline(a, &sub),
+        _ => Err(format!(
+            "plane: expected a subcommand: list, report, fill, create, adjust (got '{sub}')"
+        )),
+    }
+}
+
+/// plane report [--net N] [--fill-res 0.1] [--min-width 0.25] [--stitch-radius 5] [--necks 5]
+/// [--png out.png [--roi box] [--px 1200]]
+fn plane_report(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let nets: Vec<usize> = match a.get("net") {
+        Some(n) => vec![net_arg(&c, n)?],
+        None => {
+            let mut v: Vec<usize> = c
+                .board
+                .zones
+                .iter()
+                .filter(|z| !z.keepout && z.net != 0)
+                .map(|z| z.net)
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+    };
+    if nets.is_empty() {
+        return Err("no copper zones on the board (plane create makes one)".into());
+    }
+    let rp = plane::ReportParams {
+        fill: fill_params(a),
+        stitch_radius: a.f("stitch-radius", 5.0),
+        necks: a.u("necks", 5),
+        max_islands: a.u("max-islands", 20),
+    };
+    let t = Instant::now();
+    let mut reps = Vec::new();
+    let mut filled = c.board.clone();
+    for &n in &nets {
+        let (r, nb) = plane::report(&filled, &c.rules, &c.cfg, n, &rp);
+        filled = nb;
+        eprintln!(
+            "[plane] {}: {} components, {} unconnected pads, narrowest neck {}",
+            r.net,
+            r.components,
+            r.unconnected_pads.len(),
+            r.necks
+                .first()
+                .map(|k| format!(
+                    "{:.2} mm at ({:.2}, {:.2}) {}",
+                    k.width_mm, k.at[0], k.at[1], k.layer
+                ))
+                .unwrap_or_else(|| "-".into())
+        );
+        for l in &r.layers {
+            eprintln!(
+                "[plane]   {} {}: fill {:.0}/{:.0} mm2 (lost {:.1} %), {} islands ({} isolated, {} without via), stitch coverage {:.0} %",
+                l.zone, l.layer, l.fill_mm2, l.outline_mm2, l.lost_pct, l.islands,
+                l.isolated_islands, l.islands_without_via, l.stitch_coverage_pct
+            );
+        }
+        reps.push(r);
+    }
+    let mut res = json!({"nets": reps, "fill_s": check::round2(t.elapsed().as_secs_f64())});
+    if let Some(png) = a.get("png") {
+        let mut markers = Vec::new();
+        for r in &reps {
+            for k in &r.necks {
+                markers.push(render::Marker {
+                    at: geom::p(k.at[0], k.at[1]),
+                    to: None,
+                    kind: format!("neck {:.2}", k.width_mm),
+                    error: false,
+                });
+            }
+        }
+        let hl = if nets.len() == 1 { Some(nets[0]) } else { None };
+        let o = render::Opts {
+            roi: a.get("roi").map(parse_box).transpose()?,
+            layers: render::parse_layers(&a.s("layers", "all"))?,
+            nets: None,
+            hl_net: hl,
+            fills: true,
+            labels: a.get("labels").is_some(),
+            courtyards: false,
+            opens: true,
+            halo_min: 0.0,
+            drc: markers,
+            px: a.u("px", 1200).clamp(100, 8000),
+            per_layer: a.get("per-layer").is_some(),
+            title: format!(
+                "plane report {}",
+                reps.iter()
+                    .map(|r| r.net.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        };
+        let m = model::Model::new(&filled, &c.rules, c.cfg.clone(), model::CopperMode::All);
+        let r = render::render(&m, &o)?;
+        write_bytes(png, &r.png)?;
+        res["png"] = json!(png);
+    }
+    Ok(res)
+}
+
+/// plane create --net N --layer L [--region box] | plane adjust --zone NAME [--grow D|max]
+/// [--merge]; both: [--hv REGEX --creepage D] [--margin 0] [--res 0.1] --out OUT.kicad_pcb
+fn plane_outline(a: &Args, sub: &str) -> CmdResult {
+    let c = load_ctx(a)?;
+    let out = out_path(a, &c, "plane.kicad_pcb")?;
+    let b = &c.board;
+    let hv: Vec<usize> = match a.get("hv") {
+        Some(p) => nets_regex(&c, p)?,
+        None => Vec::new(),
+    };
+    let grow = match a.get("grow") {
+        None => None,
+        Some("max") | Some("1") => Some(f64::INFINITY),
+        Some(g) => Some(
+            g.parse::<f64>()
+                .map_err(|_| format!("--grow {g}: expected mm or 'max'"))?,
+        ),
+    };
+    let op = plane::OutlineParams {
+        res: a.f("res", 0.1).max(0.02),
+        grow,
+        hv: hv.clone(),
+        creepage: a.f("creepage", 0.0),
+        margin: a.f("margin", 0.0),
+        min_neck: a.f("min-neck", 1.0),
+        min_area: a.f("min-area", 4.0),
+    };
+    if !hv.is_empty() && op.creepage <= 0.0 {
+        return Err("--hv needs --creepage D (mm)".into());
+    }
+    let m = model::Model::new(b, &c.rules, c.cfg.clone(), model::CopperMode::All);
+    let mut seed = plane::seed_of(&b.text);
+    let mw = a.f("min-width", 0.25);
+    let t = Instant::now();
+    let (text, report) = if sub == "create" {
+        let net_name = a.get("net").ok_or("missing --net NET")?;
+        let net = net_arg(&c, net_name)?;
+        let lname = a.get("layer").ok_or("missing --layer L (e.g. In1.Cu)")?;
+        let lm = render::parse_layers(lname)?;
+        if lm.count_ones() != 1 || lm & b.cu_mask == 0 {
+            return Err(format!("--layer {lname}: one copper layer of the board"));
+        }
+        let l = lm.trailing_zeros() as usize;
+        let region = match a.get("region") {
+            Some(r) => parse_box(r)?,
+            None => b.bbox,
+        };
+        let seed_poly = vec![
+            geom::p(region.x0, region.y0),
+            geom::p(region.x1, region.y0),
+            geom::p(region.x1, region.y1),
+            geom::p(region.x0, region.y1),
+        ];
+        let lshort = board::CU[l].trim_end_matches(".Cu");
+        let name = a.s(
+            "name",
+            &format!(
+                "cp_plane_{}_{lshort}",
+                net_name.replace(|ch: char| !ch.is_ascii_alphanumeric(), "")
+            ),
+        );
+        // a re-run replaces its own zone (and its keep-outs) instead of adding one
+        let skip: Vec<usize> = (0..b.zones.len())
+            .filter(|&i| {
+                b.zones[i].name == name || b.zones[i].name.starts_with(&format!("{name}_hv"))
+            })
+            .collect();
+        let (outers, holes) = plane::outline(&m, net, lm, &[seed_poly], &skip, &op);
+        if outers.is_empty() {
+            return Err(format!("no free area for {net_name} on {lname}"));
+        }
+        let mut add = String::new();
+        let clr = c.rules.class_of(net).clearance;
+        for (k, o) in outers.iter().enumerate() {
+            let nm = if k == 0 {
+                name.clone()
+            } else {
+                format!("{name}_{}", k + 1)
+            };
+            add += &plane::zone_text(
+                net_name,
+                board::CU[l],
+                &nm,
+                a.f("priority", 0.0) as i64,
+                mw,
+                clr,
+                o,
+                &mut seed,
+            );
+        }
+        for (k, h) in holes.iter().enumerate() {
+            add += &plane::keepout_text(board::CU[l], &format!("{name}_hv{}", k + 1), h, &mut seed);
+        }
+        let remove: Vec<String> = skip.iter().map(|&i| b.zones[i].name.clone()).collect();
+        let area: f64 = outers.iter().map(|o| geom::poly_area(o)).sum();
+        (
+            plane::replace_zones(&b.text, &remove, &add),
+            json!({"zone": name, "net": net_name, "layer": board::CU[l],
+                   "outlines": outers.len(), "hv_keepouts": holes.len(),
+                   "area_mm2": check::round2(area), "replaced": remove}),
+        )
+    } else {
+        let pat = a
+            .get("zone")
+            .ok_or("missing --zone NAME (wildcards allowed)")?;
+        let sel: Vec<usize> = (0..b.zones.len())
+            .filter(|&i| {
+                let z = &b.zones[i];
+                !z.keepout && z.fp.is_none() && rules::wild(&z.name, pat) && !z.name.is_empty()
+            })
+            .collect();
+        if sel.is_empty() {
+            return Err(format!("--zone {pat}: no named copper zone matches"));
+        }
+        // groups: with --merge, all selected zones of one net and layer set are one region
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for &zi in &sel {
+            let z = &b.zones[zi];
+            match groups.iter_mut().find(|g| {
+                a.get("merge").is_some()
+                    && b.zones[g[0]].net == z.net
+                    && b.zones[g[0]].layers == z.layers
+            }) {
+                Some(g) => g.push(zi),
+                None => groups.push(vec![zi]),
+            }
+        }
+        let mut text = b.text.clone();
+        let mut rep = Vec::new();
+        for g in groups {
+            let z0 = &b.zones[g[0]];
+            let seeds: Vec<Vec<geom::P>> = g.iter().map(|&i| b.zones[i].outline.clone()).collect();
+            let (outers, holes) =
+                plane::outline(&m, z0.net, z0.layers & b.cu_mask, &seeds, &g, &op);
+            if outers.is_empty() {
+                rep.push(json!({"zone": z0.name, "error": "no free area left"}));
+                continue;
+            }
+            let before: f64 = seeds.iter().map(|s| geom::poly_area(s)).sum();
+            let after: f64 = outers.iter().map(|o| geom::poly_area(o)).sum();
+            text = plane::set_zone_outline(&text, &z0.name, &outers[0], &outers[1..], &mut seed)
+                .ok_or(format!("zone {} not found in the board text", z0.name))?;
+            let merged: Vec<String> = g[1..].iter().map(|&i| b.zones[i].name.clone()).collect();
+            let mut add = String::new();
+            let l0 = (0..board::NL)
+                .find(|l| z0.layers & (1 << l) != 0)
+                .unwrap_or(0);
+            for (k, h) in holes.iter().enumerate() {
+                add += &plane::keepout_text(
+                    board::CU[l0],
+                    &format!("{}_hv{}", z0.name, k + 1),
+                    h,
+                    &mut seed,
+                );
+            }
+            text = plane::replace_zones(&text, &merged, &add);
+            rep.push(
+                json!({"zone": z0.name, "merged": merged, "outlines": outers.len(),
+                "hv_keepouts": holes.len(), "area_before_mm2": check::round2(before),
+                "area_after_mm2": check::round2(after)}),
+            );
+        }
+        (text, json!({"zones": rep}))
+    };
+    // the result must parse
+    board::parse_board(text.clone())
+        .map_err(|e| format!("internal: written board does not parse: {e}"))?;
+    write_file(&out, &text)?;
+    eprintln!(
+        "[plane] {sub} in {:.2} s -> {out}",
+        t.elapsed().as_secs_f64()
+    );
+    let mut r = report;
+    r["out"] = json!(out);
+    Ok(r)
 }

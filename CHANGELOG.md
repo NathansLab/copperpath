@@ -17,6 +17,16 @@ All notable changes to this project are documented here. The format follows
   and only the moving footprints are stamped per candidate (about 10x faster router setup).
 - `sites::track_stamp` / `sites::via_stamp`: stamp objects into existing blocker maps.
 - `droute::QUIET` silences the router's progress lines.
+- `plane` (planes, issues #29, #30, #35): `plane list` detects plane/pour nets and power-like
+  candidates; `plane create` writes a single-net zone on a layer over the free area (other-net
+  zones, keep-outs) with an HV cut-back (`--hv REGEX --creepage D`, pour keep-outs for HV copper
+  inside), idempotent on re-runs; `plane adjust` grows zones into free area, cuts them back from
+  HV copper and merges them; `plane report` fills natively and reports islands, isolated islands,
+  islands without via, unconnected pads, lost area, narrowest necks with positions and stitching
+  coverage (`--png` renders it); `plane fill` writes the native fill as `filled_polygon`.
+  Native filler matches KiCad's fill area within 0.2 % on the demo board.
+- `--native-fill` for `fanout`, `stitch`, `opens` and `render`: zones are filled natively first,
+  no kicad-cli refill needed.
 - `movefp::move_footprints`: footprint move primitive for the board writer. Translates and rotates
   footprints (about their origin) in the `.kicad_pcb` text: the footprint `at`, the absolute pad
   and field angles and the board-coordinate outlines of rule areas inside the footprint change,
