@@ -58,7 +58,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `route [--region x0,y0,x1,y1] [--nets PATTERNS] --out OUT.kicad_pcb [--drc]` | Detailed router (below). Routes every routable net whose pads lie in the region (default: whole board). Appends unlocked tracks/vias to a copy and writes `OUT_route.json`. `--drc` runs `kicad-cli` on input and output and reports the new violations. |
 | `check [--out DIR] [--res 0.25] [--tile 1.0] [--copper locked\|all] [--crop x0,y0,x1,y1 --crop-class C]` | Routability report: via-site maps per net class, region analysis per schematic sheet, what-if ablation (without rule areas, via keepouts, locked copper), global route with congestion per tile and layer, hotspot list. Writes `report.json`, `groute.json`, `congestion.json` and PNG maps. |
 | `place --zones zones.json [--init keep\|schematic\|both] [--moves N] [--starts K] [--out DIR]` | Parallel simulated-annealing placement of the movable parts inside zones (see `examples/zones.json`). Writes `place.json`; apply it to a copy with `scripts/apply_place.py`. |
-| `opens [--region] [--nets]` | Unconnected connections per net, counted from all copper (no 499-item cap as in kicad-cli). |
+| `opens [--region] [--nets] [--max-islands 50]` | Unconnected connections per net, counted from all copper including saved zone fills (no 499-item cap as in kicad-cli). Nets named in `--nets` are counted even if they are plane nets. `--json` lists the islands of each open net (pads per copper component, largest first). |
 | `hints [--region] [--nets] [--tol 1.0]` | Pad pairs of a net that are *almost* in one row or column (offset 0.02..tol mm). Each forces a jog between two straight pad exits; align the pads before routing. |
 | `pads` | Pad world positions, sizes and nets (tab separated). |
 | `netclass` | net → net class table (tab separated). |
@@ -160,6 +160,17 @@ Common fields: `ok`, `command`, `version`, `threads`, `total_s`, `warnings`. On 
   "warnings": []
 }
 ```
+
+`opens --json` lists the islands of every open net; a plane net with saved fills shows its real
+islands instead of one per pad:
+
+```json
+{ "opens": 2, "per_net": [ { "net": "GND", "opens": 2,
+    "islands": [["R1.1", "R2.1", "U1.4"], ["R3.1", "R4.1"], ["C7.2"]] } ] }
+```
+
+Saved fills are read as KiCad wrote them (`filled_polygon`); refill first (`kicad-cli pcb drc
+--refill-zones --save-board` on a copy) so they match the copper.
 
 Suggested agent loop: `hints` → fix placement → `route --drc --json` → accept if `ok`, `opens == 0`
 and `drc.new_errors == 0`, else inspect `open_nets`, `drc.new` and `aes` and adjust nets, region

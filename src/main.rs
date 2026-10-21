@@ -1070,7 +1070,7 @@ fn cmd_route(a: &Args) -> CmdResult {
     let summary = json!({
         "out": out, "nets": r.jobs.len(), "connections": res.conns, "segments": nseg, "vias": nvia, "length_mm": check::round2(len),
         "routes": res.routes, "rips": res.rips, "opens": opens,
-        "open_nets": open_nets.iter().map(|(n, k)| json!({"net": n, "opens": k})).collect::<Vec<_>>(),
+        "open_nets": open_nets.iter().map(|(n, k, _)| json!({"net": n, "opens": k})).collect::<Vec<_>>(),
         "aes": {"cleanup_level": level, "pins": s.pins, "pins_no_stub": s.pins_no_stub, "stub_ends": s.stubs_used, "short_stubs": s.short_stubs, "fallback_ends": s.fallback_ends, "aligned": s.aligned, "align_failed": s.align_failed, "pulls": s.pulls, "mitered": s.mitered, "miter_kept_90": s.miter_failed, "stub_end_shifts": s.shifted, "axis_jogs": s.jogs, "kept90_by_cause": {"clearance": s.kept90[0], "L_between_stubs": s.kept90[1], "shift_blocked": s.kept90[2], "Z_U_too_short": s.kept90[3], "short_legs": s.kept90[4]}, "exact_fail": s.exact_fail},
         "drc": drc, "search_s": check::round2(dt),
         "failed": res.failed.iter().map(|(n, l)| json!([c.board.nets[*n], l])).collect::<Vec<_>>(),
@@ -1172,24 +1172,31 @@ fn cmd_opens(a: &Args) -> CmdResult {
         net_filter(a, &c.board.nets).as_ref(),
     );
     if !a.json() {
-        for (n, k) in &per {
+        for (n, k, _) in &per {
             println!("{n}\t{k}");
         }
         println!("OPENS\t{total}");
     }
-    Ok(
-        json!({"opens": total, "per_net": per.iter().map(|(n, k)| json!({"net": n, "opens": k})).collect::<Vec<_>>()}),
-    )
+    // islands: the pads of each copper component (largest first); --max-islands caps the list
+    let cap = a.u("max-islands", 50);
+    Ok(json!({"opens": total, "per_net": per
+        .iter()
+        .map(|(n, k, isl)| json!({"net": n, "opens": k, "islands": isl.iter().take(cap).collect::<Vec<_>>()}))
+        .collect::<Vec<_>>()}))
 }
 
-/// unconnected connections (copper components - 1) per routable net
+/// unconnected connections (copper components - 1) per routable net (plus the nets named in
+/// the filter, e.g. plane nets), and the islands (pad names per component, largest first)
+type OpenNets = Vec<(String, usize, Vec<Vec<String>>)>;
+
 fn count_opens(
     c: &Ctx,
     region: Option<geom::BBox>,
     filt: Option<&std::collections::HashSet<usize>>,
-) -> (usize, Vec<(String, usize)>) {
+) -> (usize, OpenNets) {
     let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
-    let pins = model::pins_by_net(&m);
+    let sel = |n: usize| m.routable[n] || filt.is_some_and(|f| f.contains(&n));
+    let (pins, _) = model::pins_and_copper_of(&m, &sel);
     let mut total = 0;
     let mut per = Vec::new();
     let mut keys: Vec<&usize> = pins.keys().collect();
@@ -1198,16 +1205,25 @@ fn count_opens(
         if filt.is_some_and(|f| !f.contains(&n)) {
             continue;
         }
-        let mut comps: Vec<usize> = pins[&n]
+        let mut isl: std::collections::BTreeMap<usize, Vec<String>> = Default::default();
+        for p in pins[&n]
             .iter()
             .filter(|p| region.map(|r| r.contains(p.at)).unwrap_or(true))
-            .map(|p| p.comp)
-            .collect();
-        comps.sort();
-        comps.dedup();
-        if comps.len() > 1 {
-            total += comps.len() - 1;
-            per.push((c.board.nets[n].clone(), comps.len() - 1));
+        {
+            let f = &c.board.fps[p.fp];
+            isl.entry(p.comp)
+                .or_default()
+                .push(format!("{}.{}", f.refd, f.pads[p.pad].num));
+        }
+        if isl.len() > 1 {
+            total += isl.len() - 1;
+            let mut v: Vec<Vec<String>> = isl.into_values().collect();
+            for i in v.iter_mut() {
+                i.sort();
+                i.dedup();
+            }
+            v.sort_by_key(|i| std::cmp::Reverse(i.len()));
+            per.push((c.board.nets[n].clone(), v.len() - 1, v));
         }
     }
     (total, per)
