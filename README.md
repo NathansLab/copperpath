@@ -94,7 +94,10 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 - **Model.** Grid of 0.05 mm cells on every copper layer of the board, 8 directions plus through
   vias. Legality is exact at cell centres: a track centre may sit in a cell when its half width
   plus the clearance from the net-pair matrix (net classes + DRU rules, outer/inner layer
-  conditions, hole clearances, rule areas, board edge) keeps it off every foreign object. Tracks
+  conditions, hole clearances, rule areas, board edge) keeps it off every foreign object. Solder
+  mask apertures on the outer layers (F/B.Mask graphics, pad mask expansions from the pad,
+  footprint or `pad_to_mask_clearance`) admit only the nets of the pads and locked zones inside
+  them, so no copper of another net is exposed next to a pad (KiCad `solder_mask_bridge`). Tracks
   use the DRU/net-class optimal width; within 1.5 mm of own pads the minimum width is allowed
   (neck-down for fine pitch).
 - **Search.** Windowed multi-target A\* per net; nets are routed in parallel per iteration.
