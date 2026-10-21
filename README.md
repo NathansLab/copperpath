@@ -170,7 +170,8 @@ one commit (`begin_commit`, `remove_items` / `create_items`, `push_commit`) inst
 file. It works together with `--out` or instead of it (without `--out` no board file and no
 `OUT_route.json` are written; `--drc` needs `--out`). `--delta-json -` prints the delta to stdout
 (not together with `--json`). `--pcb -` reads the board text from stdin; give `--pro` / `--dru`
-explicitly then. The `--json` result reports `delta_json` (path) and `out` (`null` without `--out`).
+explicitly then (stdin is read to the end, so cancel with `--cancel-file`, not
+`--cancel-on-stdin-eof`). The `--json` result reports `delta_json` (path) and `out` (`null` without `--out`).
 
 ```json
 {"v": 1, "units": "nm",

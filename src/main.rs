@@ -894,6 +894,9 @@ fn cmd_route(a: &Args) -> CmdResult {
     {
         return Err("--out must differ from --pcb (the input board is never overwritten)".into());
     }
+    if c.pcb == "-" && a.get("cancel-on-stdin-eof").is_some() {
+        return Err("--pcb - reads stdin to the end: use --cancel-file to cancel".into());
+    }
     if a.get("drc").is_some() && (!write_board || c.pcb == "-") {
         return Err("--drc needs board files: give --pcb FILE and --out".into());
     }
