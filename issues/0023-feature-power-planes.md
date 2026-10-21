@@ -1,7 +1,10 @@
 # 0023 Feature request: power planning (pours, plane splits, stitching, power-aware routing)
 
 GitHub: https://github.com/NathansLab/copperpath/issues/10
-Status: open (feature request). Related: #6 (wide power tracks).
+Status: open (feature request, epic). Related: #6 (wide power tracks).
+Sub-issues (in order): #29 detection/config, #30 single-net plane zone, #31 pad-to-plane fanout
+(first-step acceptance), #32 vias per pin from current, #33 split planes, #34 stitching and
+return vias, #35 pour-fragmentation metric, #36 pour-aware routing cost. Proposal 5 lives in #6.
 
 Seen on public benchmark boards: humans route power with wide tracks or pours and put far fewer
 vias on power nets; copperpath routes power like signals at class width.
