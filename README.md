@@ -211,6 +211,12 @@ same placed input):
 Run the `pcbnew` scripts with KiCad's bundled Python (e.g. on macOS
 `/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3`).
 
+## KiCad plugin
+
+[`kicad-plugin/`](kicad-plugin/README.md) adds a **Route with copperpath** button to the KiCad
+9/10 PCB editor (IPC API). It routes the open board and pushes the result as one commit, so one
+Ctrl+Z undoes it and no file is reloaded.
+
 ## Contributing and issues
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Report bad results with the "Bad routing result" issue
