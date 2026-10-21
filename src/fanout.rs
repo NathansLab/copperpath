@@ -45,6 +45,10 @@ pub struct FanoutIsland {
     pub via: Option<[f64; 2]>,
     /// why no pad worked (per pad, first few)
     pub why: Vec<String>,
+    /// failed islands: the other-net copper closest to violating its clearance around the
+    /// island's pads (what to move)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<Blocker>,
 }
 
 #[derive(Debug, Default)]
@@ -162,6 +166,21 @@ pub fn fanout(m: &Model, p: &FanoutParams) -> Result<FanoutResult, String> {
                     }
                 }
             }
+        }
+        if fi.pad.is_none() {
+            // nearest blockers around the island's pads on their layers (3 per island)
+            let mut bl: Vec<Blocker> = Vec::new();
+            for pn in &isl {
+                let f = &m.b.fps[pn.fp];
+                let pd = &f.pads[pn.pad];
+                for sh in f.pad_shapes(pd) {
+                    bl.extend(nearest_blockers(m, net, &sh, pd.layers, p.reach, 3));
+                }
+            }
+            bl.sort_by(|a, b| (a.dist_mm - a.need_mm).total_cmp(&(b.dist_mm - b.need_mm)));
+            bl.dedup_by(|a, b| a.at == b.at && a.net == b.net);
+            bl.truncate(3);
+            fi.blockers = bl;
         }
         res.islands.push(fi);
     }

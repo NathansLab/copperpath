@@ -21,11 +21,28 @@ fn board(dir: &std::path::Path) -> std::path::PathBuf {
         (pad \"2\" smd rect (at 0 -0.9) (size 1 1) (layers \"F.Cu\") (net \"SIG\")) \
         (pad \"3\" smd rect (at 0 0.9) (size 1 1) (layers \"F.Cu\") (net \"SIG\")) \
         (pad \"4\" smd rect (at -1 0) (size 0.6 2.8) (layers \"F.Cu\") (net \"SIG\")))";
+    // R4: walled in by a SIG ring, no room for a via inside: fails and reports the ring
+    let c = [
+        (19.0, 4.0),
+        (21.0, 4.0),
+        (21.0, 6.0),
+        (19.0, 6.0),
+        (19.0, 4.0),
+    ];
+    let ring: String = c
+        .windows(2)
+        .map(|w| {
+            format!(
+                "(segment (start {} {}) (end {} {}) (width 0.3) (layer \"F.Cu\") (net \"SIG\"))",
+                w[0].0, w[0].1, w[1].0, w[1].1
+            )
+        })
+        .collect();
     let text = format!(
         "(kicad_pcb (version 20260206) (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" signal) \
          (6 \"In2.Cu\" signal) (2 \"B.Cu\" signal) (25 \"Edge.Cuts\" user)) \
          (gr_rect (start 0 0) (end 40 20) (stroke (width 0.1)) (layer \"Edge.Cuts\")) \
-         {u1}{}{} \
+         {u1}{}{}{}{ring} \
          (segment (start 30 15) (end 32 15) (width 0.4) (layer \"F.Cu\") (net \"GND\")) \
          (via (at 32 15) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net \"GND\")) \
          (zone (net \"GND\") (layers \"In1.Cu\") (name \"PLANE\") \
@@ -33,6 +50,7 @@ fn board(dir: &std::path::Path) -> std::path::PathBuf {
            (filled_polygon (layer \"In1.Cu\") (pts (xy 1 1) (xy 39 1) (xy 39 19) (xy 1 19)))))",
         smd("R2", 30.0, 8.0, 1.0, "GND"),
         smd("R3", 30.0, 15.0, 1.0, "GND"),
+        smd("R4", 20.0, 5.0, 1.0, "GND"),
     );
     std::fs::write(&pcb, text).unwrap();
     std::fs::write(
@@ -62,8 +80,17 @@ fn open_islands_get_track_and_via() {
     let v: serde_json::Value = serde_json::from_slice(&o.stdout)
         .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&o.stderr)));
     // R3 reaches the plane through its via: not open
-    assert_eq!(v["open_islands"], 2, "{v}");
+    assert_eq!(v["open_islands"], 3, "{v}");
     assert_eq!(v["connected"], 2, "{v}");
+    let failed: Vec<&serde_json::Value> = v["islands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["pad"].is_null())
+        .collect();
+    assert_eq!(failed[0]["pads"][0], "R4.1", "{v}");
+    assert_eq!(failed[0]["blockers"][0]["net"], "SIG", "{v}");
+    assert_eq!(failed[0]["blockers"][0]["kind"], "track", "{v}");
     let text = std::fs::read_to_string(&out).unwrap();
     // neck-down inside U1's courtyard: the rule says 0.15, the board minimum (0.2) floors it
     assert!(
@@ -71,7 +98,7 @@ fn open_islands_get_track_and_via() {
         "neck-down inside U1's courtyard"
     );
     assert!(text.contains("(width 0.4)\n"), "net width outside");
-    // the result is connected: opens of GND on the output = 0
+    // the fanned-out islands are connected, only R4 stays open
     let o = Command::new(env!("CARGO_BIN_EXE_copperpath"))
         .args(["opens", "--json", "--nets", "GND", "--pcb"])
         .arg(&out)
@@ -79,5 +106,5 @@ fn open_islands_get_track_and_via() {
         .output()
         .expect("run copperpath");
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!(v["opens"], 0, "{v}");
+    assert_eq!(v["opens"], 1, "{v}");
 }

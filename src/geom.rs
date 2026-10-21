@@ -40,6 +40,13 @@ impl P {
         self.dot(self).sqrt()
     }
     /// KiCad rotation (degrees, y axis down, positive = counter-clockwise on screen)
+    /// the point of `pts` closest to self (self if empty)
+    pub fn min_by_dist(self, pts: &[P]) -> P {
+        pts.iter()
+            .copied()
+            .min_by(|a, b| (*a - self).len().total_cmp(&(*b - self).len()))
+            .unwrap_or(self)
+    }
     pub fn rot(self, deg: f64) -> P {
         if deg == 0.0 {
             return self;
