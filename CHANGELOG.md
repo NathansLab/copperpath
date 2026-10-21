@@ -21,6 +21,10 @@ All notable changes to this project are documented here. The format follows
 - Pad drill offsets shift the pad copper (#0014).
 - New vias and tracks of different nets keep the minimum hole clearance (#0015).
 - Multi-line copper texts are obstacles over their full height.
+- Faster negotiation: A* skips stale heap entries and caches its heuristic per cell (same
+  result, demo 5.5 s -> 2.8 s); nets with non-interacting windows route in parallel; the
+  negotiation stops after 3 iterations without progress (`--stall-iters`) instead of 6
+  (public benchmark boards: 114 s -> 79 s and 162 s -> 74 s).
 
 ### Added
 - `--yield-pours` / config `yield_pours`: locked pours that yield like unlocked ones (#0009).

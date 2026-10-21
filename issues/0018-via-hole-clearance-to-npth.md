@@ -1,5 +1,6 @@
 # 0018 New vias violate hole clearance to NPTH mounting holes
 
+GitHub: https://github.com/NathansLab/copperpath/issues/5
 Status: open
 
 **What was bad**

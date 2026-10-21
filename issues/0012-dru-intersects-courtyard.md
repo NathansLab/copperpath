@@ -1,5 +1,6 @@
 # 0012 DRU `intersectsCourtyard` relaxations are not applied
 
+GitHub: https://github.com/NathansLab/copperpath/issues/2
 Status: open
 
 **What was bad**

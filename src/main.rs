@@ -842,6 +842,9 @@ fn cmd_route(a: &Args) -> CmdResult {
     p.max_expand = a.f("max-expand", p.max_expand as f64) as u64;
     p.job_margin = a.f("job-margin", p.job_margin);
     p.nego_iters = a.f("iters", p.nego_iters as f64) as usize;
+    p.par_nets = a.u("par-nets", p.par_nets);
+    p.stall_iters = a.u("stall-iters", p.stall_iters);
+    p.par_conn = a.u("par-conn", p.par_conn);
     p.bend_cost = a.f("bend-cost", p.bend_cost as f64) as f32;
     p.bend90 = a.f("bend90", p.bend90 as f64) as f32;
     p.stub_ext = a.f("stub-ext", p.stub_ext);

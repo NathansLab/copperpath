@@ -1,5 +1,6 @@
 # 0017 Track shorts a net-less SMD pad
 
+GitHub: https://github.com/NathansLab/copperpath/issues/4
 Status: open
 
 **What was bad**

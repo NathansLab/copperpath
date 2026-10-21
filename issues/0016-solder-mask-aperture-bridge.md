@@ -1,5 +1,6 @@
 # 0016 Tracks run through solder mask apertures of other nets (solder_mask_bridge)
 
+GitHub: https://github.com/NathansLab/copperpath/issues/3
 Status: open
 
 **What was bad**

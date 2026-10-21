@@ -1,5 +1,6 @@
 # 0019 Feature request: wider tracks for power nets (current-aware width)
 
+GitHub: https://github.com/NathansLab/copperpath/issues/6
 Status: open (feature request)
 
 **Problem**

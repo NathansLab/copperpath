@@ -76,6 +76,9 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `--max-expand` | 4e6 | node budget per search (at least half the nodes of the net's window) |
 | `--iters` | 25 | negotiation iterations |
 | `--job-margin` | 6 | per-net search window margin in mm |
+| `--stall-iters` | 3 | stop negotiating after this many iterations without fewer conflict cells, then rip up and reroute the conflicting nets |
+| `--par-nets` | 1 | 1 = nets whose windows cannot interact route in parallel (same result as serial); N > 1 = blocks of N nets against one snapshot (experimental) |
+| `--par-conn` | 1 | experimental: parallel connection searches inside a multi-pin net (0 = all threads); slower on the benchmark boards so far |
 | `--no-stubs` / `--no-clean` | | disable straight pad exits / the cleanup |
 | `--stub-ext` / `--stub-ext-long` | 0.6 / 0.6 | exit stub length beyond the pad (mm) |
 | `--own-pad-cost` / `--stub-side-cost` | 40 / 20 | cost of crossing own pads / of side exits on long pads |

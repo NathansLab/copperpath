@@ -1,5 +1,6 @@
 # 0020 Low completion and many vias on dense two-layer boards
 
+GitHub: https://github.com/NathansLab/copperpath/issues/7
 Status: open
 
 **What was bad**

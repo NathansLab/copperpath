@@ -33,6 +33,14 @@ pub struct DParams {
     pub pres_mul: f32,
     pub hist_inc: f32,
     pub nego_iters: usize,
+    /// nets routed in parallel against the same snapshot even if their windows overlap
+    /// (1 = only non-overlapping nets in parallel: result identical to serial routing)
+    pub par_nets: usize,
+    /// iterations without a new minimum of conflict cells before the negotiation stops
+    pub stall_iters: usize,
+    /// experimental: parallel connection searches inside a multi-pin net (0 = number of threads,
+    /// 1 = serial; parallel was slower and not shorter on the public benchmark boards)
+    pub par_conn: usize,
     /// per-net window: bbox of the net's pins + this margin (mm); maps and searches stay inside
     pub job_margin: f64,
     /// A* heuristic weight (1 = optimal, larger = greedier and faster)
@@ -74,6 +82,9 @@ impl Default for DParams {
             pres_mul: 1.6,
             hist_inc: 3.0,
             nego_iters: 25,
+            par_nets: 1,
+            stall_iters: 3,
+            par_conn: 1,
             job_margin: 6.0,
             hweight: 1.02,
             max_expand: 4_000_000,
@@ -172,6 +183,8 @@ pub struct RNet {
 }
 
 /// result of routing one net: copper, routes made, stub ends (pin, stub, short), unreached components
+/// a found connection: path cells (layer, cell) and the component it reached
+type Found = (Vec<(usize, usize)>, usize);
 type NetRouteResult = (RNet, usize, Vec<(usize, usize, bool)>, Vec<usize>);
 
 pub struct NetJob {
@@ -613,6 +626,70 @@ impl<'a> Router<'a> {
     /// copper as a growing cost (present factor x occupancy + history); nets with conflicts are
     /// rerouted until none are left. Remaining conflicts: the net with the most conflict cells is
     /// ripped and rerouted with routed copper as a hard obstacle.
+    /// up to `m` open components closest to the tree (centre of the component to the nearest
+    /// sampled tree cell, Manhattan)
+    fn nearest_comps(
+        &self,
+        k: usize,
+        tree: &[(usize, usize)],
+        open: &[usize],
+        comp_cells: &[Vec<(usize, usize)>],
+        m: usize,
+    ) -> Vec<usize> {
+        let _ = k;
+        let nx = self.gs.nx as i64;
+        let step = (tree.len() / 2000).max(1);
+        let mut d: Vec<(i64, usize)> = open
+            .iter()
+            .map(|&c| {
+                let cc = &comp_cells[c];
+                let (sx, sy) = cc.iter().fold((0i64, 0i64), |a, x| {
+                    (a.0 + x.1 as i64 % nx, a.1 + x.1 as i64 / nx)
+                });
+                let (cx, cy) = (sx / cc.len() as i64, sy / cc.len() as i64);
+                let dm = tree
+                    .iter()
+                    .step_by(step)
+                    .map(|t| (t.1 as i64 % nx - cx).abs() + (t.1 as i64 / nx - cy).abs())
+                    .min()
+                    .unwrap_or(0);
+                (dm, c)
+            })
+            .collect();
+        d.sort();
+        d.into_iter().take(m).map(|x| x.1).collect()
+    }
+
+    /// list scheduling of `need` into waves: a net goes one wave after the latest earlier net whose
+    /// window (plus the owner-map reach) overlaps its own
+    fn waves(&self, need: &[usize]) -> Vec<Vec<usize>> {
+        let bb: Vec<BBox> = need
+            .iter()
+            .map(|&k| self.maps[k].g.bbox().inflate(3.0 + self.p.margin + 0.5))
+            .collect();
+        let mut wv = vec![0usize; need.len()];
+        let mut out: Vec<Vec<usize>> = Vec::new();
+        let relax = self.p.par_nets.max(1);
+        if relax > 1 {
+            // relaxed: blocks of `relax` nets in order, each block against the same snapshot
+            // (stale view of each other; the negotiation removes the resulting conflicts)
+            return need.chunks(relax).map(|c| c.to_vec()).collect();
+        }
+        for i in 0..need.len() {
+            let w = (0..i)
+                .filter(|&j| bb[j].overlaps(&self.maps[need[i]].g.bbox()))
+                .map(|j| wv[j] + 1)
+                .max()
+                .unwrap_or(0);
+            wv[i] = w;
+            if out.len() <= w {
+                out.resize(w + 1, Vec::new());
+            }
+            out[w].push(need[i]);
+        }
+        out
+    }
+
     pub fn run(&self) -> DResult {
         let nj = self.jobs.len();
         let n = self.gs.n();
@@ -640,32 +717,52 @@ impl<'a> Router<'a> {
         let mut nst: Vec<AesStats> = vec![AesStats::default(); nj];
         loop {
             let t_it = std::time::Instant::now();
-            for &k in &need {
-                let t_net = std::time::Instant::now();
-                let e0 = self.expanded.load(std::sync::atomic::Ordering::Relaxed);
-                let o = self.owner_maps(k, &routed);
-                let fr = self.foreign(k, &routed);
-                nst[k] = AesStats::default();
-                let r = self.route_net(k, &o, Some((pres, &hist)), &ck, &fr, &mut nst[k]);
-                let dt = t_net.elapsed().as_secs_f64();
-                if dt > 2.0 {
-                    let mp = &self.maps[k];
-                    eprintln!(
-                        "[droute]   slow net {}: {:.1} s, {} pins, window {}x{}, {:.1} M nodes, left {}",
-                        self.m.b.nets[self.jobs[k].net],
-                        dt,
-                        self.jobs[k].pins.len(),
-                        mp.g.nx,
-                        mp.g.ny,
-                        (self.expanded.load(std::sync::atomic::Ordering::Relaxed) - e0) as f64 / 1e6,
-                        r.1
-                    );
+            // nets whose windows cannot see each other's copper route in parallel; a net waits for
+            // every earlier net (in `need` order) it can see, so the result equals the serial order
+            let waves = self.waves(&need);
+            for wave in &waves {
+                let hist_ref = &hist;
+                let routed_ref = &routed;
+                let rs: Vec<(usize, NetRouteResult, AesStats, f64)> = wave
+                    .par_iter()
+                    .map(|&k| {
+                        let t_net = std::time::Instant::now();
+                        let o = self.owner_maps(k, routed_ref);
+                        let fr = self.foreign(k, routed_ref);
+                        let mut st = AesStats::default();
+                        let r = self.route_net(k, &o, Some((pres, hist_ref)), &ck, &fr, &mut st);
+                        (k, r, st, t_net.elapsed().as_secs_f64())
+                    })
+                    .collect();
+                for (k, r, st, dt) in rs {
+                    if dt > 2.0 {
+                        let mp = &self.maps[k];
+                        eprintln!(
+                            "[droute]   slow net {}: {:.1} s, {} pins, window {}x{}, wave of {}, left {}",
+                            self.m.b.nets[self.jobs[k].net],
+                            dt,
+                            self.jobs[k].pins.len(),
+                            mp.g.nx,
+                            mp.g.ny,
+                            wave.len(),
+                            r.1
+                        );
+                    }
+                    nst[k] = st;
+                    routed[k] = r.0;
+                    left[k] = r.1;
+                    cells[k] = r.2;
+                    vias[k] = r.3;
+                    routes += 1;
                 }
-                routed[k] = r.0;
-                left[k] = r.1;
-                cells[k] = r.2;
-                vias[k] = r.3;
-                routes += 1;
+            }
+            if dbg {
+                eprintln!(
+                    "[dbg] {} nets in {} waves (largest {})",
+                    need.len(),
+                    waves.len(),
+                    waves.iter().map(|w| w.len()).max().unwrap_or(0)
+                );
             }
             // conflicts of every net against all others
             let conf: Vec<Vec<(usize, usize)>> = (0..nj)
@@ -697,9 +794,11 @@ impl<'a> Router<'a> {
                 eprintln!("[dbg] nego iter {it}: pres {pres:.2}, {} nets rerouted, conflict cells {total}, nets in conflict {}", need.len(), conf.iter().filter(|c| !c.is_empty()).count());
             }
             best_hist.push(total);
-            let stalled = best_hist.len() > 6
-                && best_hist[best_hist.len() - 6..].iter().min().unwrap()
-                    >= best_hist[..best_hist.len() - 6].iter().min().unwrap();
+            // no new best for `stall_iters` iterations: stop negotiating, rip and reroute hard
+            let sw = self.p.stall_iters.max(1);
+            let stalled = best_hist.len() > sw
+                && best_hist[best_hist.len() - sw..].iter().min().unwrap()
+                    >= best_hist[..best_hist.len() - sw].iter().min().unwrap();
             if total == 0 || it + 1 >= self.p.nego_iters || stalled {
                 if total > 0 && dbg {
                     for (k, ck) in conf.iter().enumerate() {
@@ -1115,27 +1214,100 @@ impl<'a> Router<'a> {
         let mut cells = Vec::new();
         let mut vias = Vec::new();
         let mut left = nc - 1;
+        let par = if self.p.par_conn == 0 {
+            rayon::current_num_threads()
+        } else {
+            self.p.par_conn
+        };
+        let mut dead = vec![false; nc];
+        let mut found: Vec<Found> = Vec::new();
         loop {
             let open: Vec<usize> = (0..nc)
-                .filter(|c| !in_tree[*c] && !comp_cells[*c].is_empty())
+                .filter(|c| !in_tree[*c] && !dead[*c] && !comp_cells[*c].is_empty())
                 .collect();
-            if open.is_empty() {
+            if open.is_empty() && found.is_empty() {
                 break;
             }
-            let Some((path, ci)) = self.astar(
-                k,
-                &tree,
-                &src_info,
-                &tmark,
-                &tinfo,
-                &tree_mark,
-                &open,
-                &comp_cells,
-                o,
-                nego,
-            ) else {
-                break;
-            };
+            if found.is_empty() {
+                if par > 1 && open.len() >= 3 {
+                    // several searches from the same tree in parallel, each guided to one of the
+                    // components nearest to the tree; accepted in order below (a search may end
+                    // at another component than its guide, duplicates are dropped)
+                    let near = self.nearest_comps(k, &tree, &open, &comp_cells, par);
+                    let rs: Vec<Option<Found>> = near
+                        .par_iter()
+                        .map(|&c| {
+                            self.astar(
+                                k,
+                                &tree,
+                                &src_info,
+                                &tmark,
+                                &tinfo,
+                                &tree_mark,
+                                &[c],
+                                &comp_cells,
+                                o,
+                                nego,
+                            )
+                        })
+                        .collect();
+                    // keep a result only if it stays clear of the results kept before it (else the
+                    // two would likely share a corridor: redundant copper); dropped ones re-search
+                    let nxg = self.gs.nx;
+                    let gap = (2.0 / self.gs.res) as usize;
+                    let mut kept: Vec<(usize, usize, usize, usize)> = Vec::new();
+                    for (r, &c) in rs.into_iter().zip(&near) {
+                        match r {
+                            Some(f) => {
+                                let (mut x0, mut y0, mut x1, mut y1) =
+                                    (usize::MAX, usize::MAX, 0, 0);
+                                for &(_, i) in &f.0 {
+                                    let (x, y) = (i % nxg, i / nxg);
+                                    (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                                }
+                                let b = (
+                                    x0.saturating_sub(gap),
+                                    y0.saturating_sub(gap),
+                                    x1 + gap,
+                                    y1 + gap,
+                                );
+                                if kept
+                                    .iter()
+                                    .all(|q| b.2 < q.0 || q.2 < b.0 || b.3 < q.1 || q.3 < b.1)
+                                {
+                                    kept.push(b);
+                                    found.push(f);
+                                }
+                            }
+                            None => dead[c] = true,
+                        }
+                    }
+                    found.reverse(); // pop() takes them in guide order
+                    if found.is_empty() {
+                        continue;
+                    }
+                } else {
+                    let Some(f) = self.astar(
+                        k,
+                        &tree,
+                        &src_info,
+                        &tmark,
+                        &tinfo,
+                        &tree_mark,
+                        &open,
+                        &comp_cells,
+                        o,
+                        nego,
+                    ) else {
+                        break;
+                    };
+                    found.push(f);
+                }
+            }
+            let (path, ci) = found.pop().unwrap();
+            if in_tree[ci] {
+                continue; // reached a component an earlier search of the batch already joined
+            }
             in_tree[ci] = true;
             left -= 1;
             for cc in &comp_cells[ci] {
@@ -1308,14 +1480,24 @@ impl<'a> Router<'a> {
         let mut g = vec![f32::INFINITY; total];
         let mut par = vec![u32::MAX; total];
         let mut indir = vec![8u8; total];
+        // key of the newest heap entry per node: older entries are stale and skipped (lazy deletion)
+        let mut fkey = vec![u32::MAX; total];
+        // heuristic per (x, y), shared by all layers, computed on first use
+        let hc = std::cell::RefCell::new(vec![f32::NAN; wn]);
         let h = |i: usize| -> f32 {
             let (x, y) = ((i as i32) % nxg, (i as i32) / nxg);
+            let ci = ((y - y0) as usize) * wx + (x - x0) as usize;
+            let mut hc = hc.borrow_mut();
+            if !hc[ci].is_nan() {
+                return hc[ci];
+            }
             let mut best = i32::MAX as f32;
             for b in bbs {
                 let dx = (b.0 - x).max(0).max(x - b.2) as f32;
                 let dy = (b.1 - y).max(0).max(y - b.3) as f32;
                 best = best.min(dx.max(dy) + (std::f32::consts::SQRT_2 - 1.0) * dx.min(dy));
             }
+            hc[ci] = best;
             best
         };
         let inside = |i: usize| {
@@ -1333,7 +1515,8 @@ impl<'a> Router<'a> {
             if c0 < g[ln] {
                 g[ln] = c0;
                 indir[ln] = d0;
-                heap.push(Reverse((key(c0 + self.p.hweight * h(i)), ln as u32)));
+                fkey[ln] = key(c0 + self.p.hweight * h(i));
+                heap.push(Reverse((fkey[ln], ln as u32)));
             }
         }
         let dirpref = &self.m.cfg.layer_dir;
@@ -1389,8 +1572,12 @@ impl<'a> Router<'a> {
         let (jx1, jy1) = (jx0 + mp.g.nx as i32 - 1, jy0 + mp.g.ny as i32 - 1);
         let clipped = mp.g.nx < self.gs.nx || mp.g.ny < self.gs.ny;
         let mut edge = false;
-        while let Some(Reverse((_, ln))) = heap.pop() {
+        while let Some(Reverse((fk, ln))) = heap.pop() {
             let ln = ln as usize;
+            if fk != fkey[ln] {
+                continue;
+            }
+            fkey[ln] = u32::MAX - 1; // expanded; a later improvement pushes it again
             let (l, i) = glob(ln);
             let node = l * n + mp.li(self.gs.nx, i).unwrap();
             expanded += 1;
@@ -1451,7 +1638,8 @@ impl<'a> Router<'a> {
                     g[nn] = ng;
                     par[nn] = ln as u32;
                     indir[nn] = d as u8;
-                    heap.push(Reverse((key(ng + hw * h(j)), nn as u32)));
+                    fkey[nn] = key(ng + hw * h(j));
+                    heap.push(Reverse((fkey[nn], nn as u32)));
                 }
             }
             // through via: legal for this net's via, landing cell must be legal on the new layer
@@ -1483,7 +1671,8 @@ impl<'a> Router<'a> {
                         g[nn] = ng;
                         par[nn] = ln as u32;
                         indir[nn] = 8;
-                        heap.push(Reverse((key(ng + hw * h(i)), nn as u32)));
+                        fkey[nn] = key(ng + hw * h(i));
+                        heap.push(Reverse((fkey[nn], nn as u32)));
                     }
                 }
             }

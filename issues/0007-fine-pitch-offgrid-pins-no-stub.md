@@ -1,5 +1,6 @@
 # 0007 Fine-pitch pins off the 0.05 mm grid get no legal stub
 
+GitHub: https://github.com/NathansLab/copperpath/issues/1
 Status: open
 
 **What was bad**
