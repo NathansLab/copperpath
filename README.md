@@ -86,8 +86,22 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `--stub-ext` / `--stub-ext-long` | 0.6 / 0.6 | exit stub length beyond the pad (mm) |
 | `--own-pad-cost` / `--stub-side-cost` | 40 / 20 | cost of crossing own pads / of side exits on long pads |
 | `--yield-pours PATTERNS` | | locked pours (zone name wildcards) that do not block (KiCad refills them); also `yield_pours` in the config |
-| `--ignore-unlocked` | | ignore unlocked tracks/vias of the input (old behaviour; by default all existing copper blocks other nets) |
+| `--ignore-unlocked` | | the router does not see unlocked tracks, vias and zones of the input, but they stay in the output (route never removes copper), so new copper can overlap or short them. Only for experiments where the old copper is deleted afterwards; rip up instead (see below) |
 | `--dbg-net NAME` | | verbose trace of one net |
+
+### Existing copper, "route the rest" and rip-up
+
+`route` never removes or moves existing copper: every track, via and zone of the input stays in
+the output with its UUID, and the delta's `remove` list is empty. Existing tracks and vias of a
+net count as connectivity for that net and as obstacles for all other nets, locked or not
+(unlocked zones yield, KiCad refills them). So routing
+again after manual work only adds the missing connections ("route the rest"); a separate
+`--lock-all-existing` option is not needed, it is the default. New copper is written unlocked
+with fresh UUIDs (seeded from the input board, so a second run never repeats the first run's
+UUIDs).
+
+To redo nets, rip them up first: delete their unlocked tracks and vias (in KiCad, or with the
+plugin's **Rip up selected nets**), then route them with `--nets`.
 
 ## How routing works
 
@@ -186,6 +200,7 @@ explicitly then (stdin is read to the end, so cancel with `--cancel-file`, not
   to rounding; `v` is the schema version.
 - `remove`: UUIDs of input items that were ripped up or replaced. `route` keeps all existing
   copper today, so the list is empty; the field is there for the incremental modes.
+- `add` items carry no UUID; KiCad assigns one when the plugin creates them.
 - `add`: new items in output order. The router emits `track` and through `via` items; `arc` is
   part of the schema for later cleanup steps.
 - Applying the delta to the input board (`copperpath::delta::apply`) gives the same copper as
@@ -245,7 +260,9 @@ Run the `pcbnew` scripts with KiCad's bundled Python (e.g. on macOS
 
 [`kicad-plugin/`](kicad-plugin/README.md) adds a **Route with copperpath** button to the KiCad
 9/10 PCB editor (IPC API). It routes the open board and pushes the result as one commit, so one
-Ctrl+Z undoes it and no file is reloaded.
+Ctrl+Z undoes it and no file is reloaded. Further actions work on the selection: **Route selected
+nets**, **Route region** (a rectangle on a User layer), **Rip up selected nets** and **Rip up and
+reroute selected nets**.
 
 ## Contributing and issues
 

@@ -147,6 +147,26 @@ def removed_items(board, uuids):
     return found
 
 
+def check_scope(delta, nets=None):
+    """A route run keeps all existing copper and, with `nets`, only adds copper of those nets.
+
+    Rip-up is a separate commit, so a route delta that removes anything, or adds copper to a net
+    outside the selection, is refused before the board is touched.
+    """
+    if delta["remove"]:
+        raise DeltaError(
+            f"copperpath wants to remove {len(delta['remove'])} existing item(s); "
+            "routing keeps existing copper, rip it up first"
+        )
+    if nets is not None:
+        other = sorted({d.get("net") or "" for d in delta["add"]} - set(nets))
+        if other:
+            raise DeltaError(
+                "the route would add copper to nets outside the selection: "
+                + ", ".join(repr(n) for n in other[:5])
+            )
+
+
 def apply(board, delta, api, message="copperpath route"):
     """Apply the delta to the board as one commit, so one Ctrl+Z undoes all of it.
 
@@ -157,6 +177,11 @@ def apply(board, delta, api, message="copperpath route"):
     nets = {n.name: n for n in board.get_nets()}
     items = to_items(api, nets, delta)
     gone = removed_items(board, delta["remove"])
+    return commit_items(board, gone, items, message)
+
+
+def commit_items(board, gone, items, message):
+    """Remove `gone` and create `items` in one commit (none if both are empty)."""
     if not items and not gone:
         return 0, 0
     commit = board.begin_commit()

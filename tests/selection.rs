@@ -35,7 +35,14 @@ fn copper(b: &board::Board) -> std::collections::BTreeMap<String, (Vec<i64>, Str
     let nm = delta::nm;
     let mut m = std::collections::BTreeMap::new();
     for t in &b.tracks {
-        let g = vec![nm(t.a.x), nm(t.a.y), nm(t.b.x), nm(t.b.y), nm(t.w), t.layer as i64];
+        let g = vec![
+            nm(t.a.x),
+            nm(t.a.y),
+            nm(t.b.x),
+            nm(t.b.y),
+            nm(t.w),
+            t.layer as i64,
+        ];
         m.insert(t.uuid.clone(), (g, b.nets[t.net].clone()));
     }
     for v in &b.vias {
@@ -62,7 +69,11 @@ fn route_the_rest_keeps_manual_copper_and_selected_nets_stay_selected() {
     let manual = d.join("manual.kicad_pcb");
     let dv = route(DEMO.as_ref(), &manual, &["--nets", "SDA,SCL"]);
     let want: std::collections::BTreeSet<String> = ["SDA", "SCL"].map(String::from).into();
-    assert_eq!(nets_of(&dv), want, "selected nets: only their copper is added");
+    assert_eq!(
+        nets_of(&dv),
+        want,
+        "selected nets: only their copper is added"
+    );
     assert_eq!(dv["remove"].as_array().map(|r| r.len()), Some(0));
     let before = copper(&board::load(manual.to_str().unwrap()).unwrap());
     assert!(before.len() > 2 && before.keys().all(|u| !u.is_empty()));
@@ -75,6 +86,10 @@ fn route_the_rest_keeps_manual_copper_and_selected_nets_stay_selected() {
     assert!(!added.is_empty() && added.is_disjoint(&want), "{added:?}");
     let after = copper(&board::load(rest.to_str().unwrap()).unwrap());
     for (uuid, item) in &before {
-        assert_eq!(after.get(uuid), Some(item), "manual item {uuid} changed or vanished");
+        assert_eq!(
+            after.get(uuid),
+            Some(item),
+            "manual item {uuid} changed or vanished"
+        );
     }
 }
