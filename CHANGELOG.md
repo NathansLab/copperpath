@@ -29,6 +29,9 @@ All notable changes to this project are documented here. The format follows
   (all nets of a 6-layer board with 217 fills in about 1 s; per-net opens equal KiCad's DRC).
 
 ### Fixed
+- Router: a DRU `track_width` rule scoped by `intersectsCourtyard('REF')` sets the neck-down width
+  inside that courtyard (power net with a wide class on a fine-pitch part gets its stubs); the
+  neck-down of such a net then applies inside those courtyards only (#2, width part).
 - A pin whose own pad already sits closer to another net than the rule (LV pins of an isolator
   next to its HV pins) gets its stub: the track inside the own pad, up to where its centre leaves
   the pad plus the half width, is the pad's own copper and is not checked (#53).

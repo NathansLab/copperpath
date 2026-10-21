@@ -210,7 +210,8 @@ same placed input):
   zones are obstacles (locked) or ignored (unlocked or listed in `yield_pours`, refilled later by
   KiCad). Existing tracks and vias, locked or not, are kept and block other nets.
 - DRU conditions that depend on position (`intersectsCourtyard`, `insideArea`) are not evaluated by
-  the router and the clearance matrix; `fanout` evaluates `intersectsCourtyard` for track widths.
+  the clearance matrix (a clearance relaxed inside a courtyard is not used); `track_width` rules
+  with `intersectsCourtyard` set the neck-down width inside that courtyard (`route`, `fanout`).
 - Through vias only; no differential pairs, no length tuning; DRU max-length rules are only used by
   `place`.
 - Very long multi-pin nets are slow (millions of nodes per search); restrict with `--region`/`--nets`.
