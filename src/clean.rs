@@ -118,6 +118,12 @@ impl<'a> Checker<'a> {
         if m.net_layers[net] & (1 << l) == 0 {
             return false;
         }
+        // copper that lies inside an own pad adds nothing: only the part outside is checked (a
+        // stub from the centre of a pad that already sits closer to another net than the rule,
+        // e.g. LV pins of an isolator next to its HV pins, #53)
+        let Some((a, b)) = self.clip_own_pads(net, a, b, hw, l) else {
+            return true;
+        };
         let cl = Shape::Capsule { a, b, r: 0.0 };
         let mut bb = cl.bbox().inflate(self.reach + hw);
         bb.x0 -= 0.0;
@@ -186,6 +192,57 @@ impl<'a> Checker<'a> {
             return false;
         }
         true
+    }
+
+    /// the part of a-b that is checked against other copper when an end lies inside a pad of
+    /// `net` on layer l (the track's disk there inside the pad): the track from that end until
+    /// its centre leaves the pad, plus its half width, is the pad's own copper. None when the
+    /// whole track lies inside own pads
+    fn clip_own_pads(&self, net: usize, a: P, b: P, hw: f64, l: usize) -> Option<(P, P)> {
+        let len = (b - a).len();
+        if net == 0 || len < 1e-12 {
+            return Some((a, b));
+        }
+        let mut cand = Vec::new();
+        // largest t in [0, 1] up to which the centre stays in an own pad (pads are convex: one
+        // interval from the end), plus the half width
+        let covered = |from: P, to: P, cand: &mut Vec<u32>| -> f64 {
+            self.near(&BBox::empty_at(from), cand);
+            let mut best: f64 = 0.0;
+            for &k in cand.iter() {
+                let o = &self.objs[k as usize];
+                if o.net != net || o.layers & (1 << l) == 0 || !matches!(o.kind, Kind::Pad { .. }) {
+                    continue;
+                }
+                if depth(&o.shape, from) < hw {
+                    continue;
+                }
+                let at = |t: f64| from + (to - from) * t;
+                if depth(&o.shape, to) >= hw {
+                    return 1.0;
+                }
+                let (mut lo, mut hi) = (0.0, 1.0);
+                for _ in 0..30 {
+                    let mid = 0.5 * (lo + hi);
+                    if depth(&o.shape, at(mid)) >= 0.0 {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                best = best.max(lo + hw / len);
+            }
+            best.min(1.0)
+        };
+        let ta = covered(a, b, &mut cand);
+        if ta >= 1.0 {
+            return None;
+        }
+        let tb = covered(b, a, &mut cand);
+        if ta + tb >= 1.0 {
+            return None;
+        }
+        Some((a + (b - a) * ta, b + (a - b) * tb))
     }
 
     /// through via (radius vr incl. margin, drill radius dr) legal for `net` against fixed objects

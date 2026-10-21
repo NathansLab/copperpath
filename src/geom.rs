@@ -125,6 +125,12 @@ impl BBox {
             y1: f64::NEG_INFINITY,
         }
     }
+    /// the box of one point
+    pub fn empty_at(q: P) -> BBox {
+        let mut b = BBox::empty();
+        b.add(q);
+        b
+    }
     pub fn add(&mut self, q: P) {
         self.x0 = self.x0.min(q.x);
         self.y0 = self.y0.min(q.y);
@@ -238,6 +244,24 @@ impl Shape {
                 pts: pts.iter().rev().map(|q| p(q.x, -q.y)).collect(),
                 r: *r,
             },
+        }
+    }
+}
+
+/// how deep `q` lies inside the shape (distance to its outline, negative outside)
+pub fn depth(s: &Shape, q: P) -> f64 {
+    match s {
+        Shape::Capsule { a, b, r } => r - dist_seg(q, *a, *b),
+        Shape::Poly { pts, r } => {
+            let n = pts.len();
+            let d = (0..n)
+                .map(|i| dist_seg(q, pts[i], pts[(i + 1) % n]))
+                .fold(f64::INFINITY, f64::min);
+            if n >= 3 && point_in_poly(q, pts) {
+                r + d
+            } else {
+                r - d
+            }
         }
     }
 }

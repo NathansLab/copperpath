@@ -29,6 +29,9 @@ All notable changes to this project are documented here. The format follows
   (all nets of a 6-layer board with 217 fills in about 1 s; per-net opens equal KiCad's DRC).
 
 ### Fixed
+- A pin whose own pad already sits closer to another net than the rule (LV pins of an isolator
+  next to its HV pins) gets its stub: the track inside the own pad, up to where its centre leaves
+  the pad plus the half width, is the pad's own copper and is not checked (#53).
 - A plated pad with `remove_unused_layers` (outer pad + inner barrel) is one piece of copper for
   connectivity; before, copper touching only its outer pad left it as a separate island.
 
