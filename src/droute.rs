@@ -196,6 +196,9 @@ pub struct NetJob {
     pub pins: Vec<Pin>, // pins inside the region
     pub hw: f64,        // opt half width
     pub hn: f64,        // min half width (neck-down)
+    /// footprints whose courtyard allows a narrower neck-down width (DRU `track_width` rule with
+    /// `intersectsCourtyard`): the neck-down then applies inside these courtyards only
+    pub neck_fps: Vec<usize>,
     pub vr: f64,
     pub dr: f64,
     /// existing tracks, vias and zone fills of the pin components: a connection may start or
@@ -584,11 +587,30 @@ impl<'a> Router<'a> {
                         .collect()
                 })
                 .unwrap_or_default();
+            // courtyard neck-down rules of the pins' footprints (issue #2)
+            let mut hn = wmin.min(w) / 2.0;
+            let mut fps: Vec<usize> = ps.iter().map(|pn| pn.fp).collect();
+            fps.sort_unstable();
+            fps.dedup();
+            let cw: Vec<(usize, f64)> = fps
+                .into_iter()
+                .filter(|&fi| m.b.fps[fi].crtyd.len() >= 3)
+                .map(|fi| {
+                    let refs = [m.b.fps[fi].refd.clone()];
+                    (fi, m.r.track_width_at(net, Some(&refs)).0)
+                })
+                .filter(|(_, mn)| *mn < hn * 2.0 - 1e-9)
+                .collect();
+            let neck_fps: Vec<usize> = cw.iter().map(|(fi, _)| *fi).collect();
+            if let Some(mn) = cw.iter().map(|(_, mn)| *mn).reduce(f64::max) {
+                hn = mn / 2.0;
+            }
             jobs.push(NetJob {
                 net,
                 pins: ps,
                 hw: w / 2.0,
-                hn: wmin.min(w) / 2.0,
+                hn,
+                neck_fps,
                 vr: vd / 2.0,
                 dr: vdr / 2.0,
                 copper: cu,
@@ -662,7 +684,12 @@ impl<'a> Router<'a> {
                     .collect();
                 let v = via_map(m, &g, j.net, j.vr + p.margin, j.dr, objs);
                 let mut neck = vec![false; g.n()];
-                for pn in &j.pins {
+                // courtyard neck-down rule: narrow width inside those courtyards only
+                for &fi in &j.neck_fps {
+                    let c = m.b.fps[fi].crtyd_world();
+                    g.fill_poly(&c, &mut |x, y| neck[g.idx(x, y)] = true);
+                }
+                for pn in j.pins.iter().filter(|_| j.neck_fps.is_empty()) {
                     let f = &m.b.fps[pn.fp];
                     for s in f.pad_shapes(&f.pads[pn.pad]) {
                         g.stamp(&s, p.neck, |x, y| neck[g.idx(x, y)] = true);
