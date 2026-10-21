@@ -279,11 +279,35 @@ pub struct Hotspot {
     pub layer: &'static str,
 }
 
-/// set by SIGTERM / SIGINT: the router stops negotiating and writes the best result so far
+/// set by SIGTERM / SIGINT / Ctrl+C / Ctrl+Break or a cancel request (--cancel-file,
+/// --cancel-on-stdin-eof): the router stops negotiating and writes the best result so far
 pub static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// route SIGTERM and SIGINT to `STOP` (Unix; elsewhere a no-op)
+/// route SIGTERM and SIGINT (Unix) or Ctrl+C and Ctrl+Break (Windows console) to `STOP`
 pub fn install_stop_handler() {
+    #[cfg(windows)]
+    {
+        extern "system" fn on_ctrl(kind: u32) -> i32 {
+            // CTRL_C_EVENT = 0, CTRL_BREAK_EVENT = 1; close/logoff/shutdown keep the default
+            // (Windows ends the process as soon as the handler returns)
+            if kind <= 1 {
+                STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+                1
+            } else {
+                0
+            }
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetConsoleCtrlHandler(
+                handler: Option<extern "system" fn(u32) -> i32>,
+                add: i32,
+            ) -> i32;
+        }
+        unsafe {
+            SetConsoleCtrlHandler(Some(on_ctrl), 1);
+        }
+    }
     #[cfg(unix)]
     {
         extern "C" fn on_signal(_: i32) {

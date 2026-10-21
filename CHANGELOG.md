@@ -40,6 +40,9 @@ All notable changes to this project are documented here. The format follows
 - `--time-limit S`, SIGTERM and Ctrl+C write the best result so far; `--json` gains `stopped`
   and `hotspots`, the log prints the conflict hotspots; the fallback ladder is skipped when
   out of time (#8).
+- `route --cancel-file PATH` and `--cancel-on-stdin-eof`: cancel paths that work on Windows,
+  Linux and macOS and write the best result so far like `--time-limit`; Ctrl+C / Ctrl+Break
+  do the same on Windows. `--json` reports `stopped: "cancel"` (#19).
 - `--yield-pours` / config `yield_pours`: locked pours that yield like unlocked ones (#0009).
 
 ## [0.1.0] - 2026-10-21
