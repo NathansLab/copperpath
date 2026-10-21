@@ -250,6 +250,9 @@ struct Owners {
     t: Vec<Vec<u16>>,
     tn: Vec<Vec<u16>>,
     v: Vec<u16>,
+    /// negotiated cell cost per (layer, map cell), INFINITY = blocked; built on the first
+    /// negotiated search (an Owners serves one route_net call, so one negotiation state)
+    cost: std::sync::OnceLock<Vec<f32>>,
 }
 
 pub struct DResult {
@@ -597,6 +600,7 @@ impl<'a> Router<'a> {
             t: vec![vec![0u16; n]; NL],
             tn: vec![vec![0u16; n]; NL],
             v: vec![0u16; n],
+            cost: std::sync::OnceLock::new(),
         };
         let mut lt = vec![vec![0u16; n]; NL];
         let mut ltn = vec![vec![0u16; n]; NL];
@@ -1731,28 +1735,50 @@ impl<'a> Router<'a> {
         let dirpref = &self.m.cfg.layer_dir;
         let opc = self.p.own_pad_cost;
         // the search window lies inside the net's map: w = map index of global cell i
-        let cell_ok = |l: usize, w: usize, i: usize| -> (bool, f32) {
-            let own = if mp.own[w] & (1 << l) != 0 { opc } else { 0.0 };
-            match nego {
-                Some((pres, hist)) => {
-                    let fw = mp.t[l][w] == R_FREE;
-                    let fnr = mp.neck[w] && mp.tn[l][w] == R_FREE;
-                    if !fw && !fnr {
-                        return (false, 0.0);
+        // negotiated cost of every cell of the net's map, computed once per route_net call: one
+        // load per neighbour instead of seven
+        let mn = mp.g.n();
+        let cc: &[f32] = match nego {
+            Some((pres, hist)) => o.cost.get_or_init(|| {
+                let mut cc = vec![f32::INFINITY; NL * mn];
+                let mnx = mp.g.nx;
+                for l in 0..NL {
+                    for my in 0..mp.g.ny {
+                        let row = (my + mp.oy) * self.gs.nx + mp.ox;
+                        for mx in 0..mnx {
+                            let w = my * mnx + mx;
+                            let fw = mp.t[l][w] == R_FREE;
+                            let fnr = mp.neck[w] && mp.tn[l][w] == R_FREE;
+                            if !fw && !fnr {
+                                continue;
+                            }
+                            let own = if mp.own[w] & (1 << l) != 0 { opc } else { 0.0 };
+                            let cw = if fw {
+                                pres * o.t[l][w] as f32
+                            } else {
+                                f32::INFINITY
+                            };
+                            let cn = if fnr {
+                                self.p.narrow_cost + pres * o.tn[l][w] as f32
+                            } else {
+                                f32::INFINITY
+                            };
+                            cc[l * mn + w] = cw.min(cn) + hist[l][row + mx] + own;
+                        }
                     }
-                    let cw = if fw {
-                        pres * o.t[l][w] as f32
-                    } else {
-                        f32::INFINITY
-                    };
-                    let cn = if fnr {
-                        self.p.narrow_cost + pres * o.tn[l][w] as f32
-                    } else {
-                        f32::INFINITY
-                    };
-                    (true, cw.min(cn) + hist[l][i] + own)
+                }
+                cc
+            }),
+            None => &[],
+        };
+        let cell_ok = |l: usize, w: usize| -> (bool, f32) {
+            match nego {
+                Some(_) => {
+                    let c = cc[l * mn + w];
+                    (c != f32::INFINITY, c)
                 }
                 None => {
+                    let own = if mp.own[w] & (1 << l) != 0 { opc } else { 0.0 };
                     if mp.t[l][w] == R_FREE && o.t[l][w] == 0 {
                         (true, own)
                     } else if mp.neck[w] && mp.tn[l][w] == R_FREE && o.tn[l][w] == 0 {
@@ -1790,7 +1816,6 @@ impl<'a> Router<'a> {
             let r = ln - l * wn;
             let ry = r / wx;
             let (x, y) = ((r - ry * wx) as i32 + x0, ry as i32 + y0);
-            let i = (y * nxg + x) as usize;
             let wv = ((y - moy) * mnx + (x - mox)) as usize;
             let node = l * n + wv;
             expanded += 1;
@@ -1814,9 +1839,8 @@ impl<'a> Router<'a> {
                 if t > 2 {
                     continue; // no acute turns
                 }
-                let j = (yy * nxg + xx) as usize;
                 let wj = ((yy - moy) * mnx + (xx - mox)) as usize;
-                let (okj, extra) = cell_ok(l, wj, j);
+                let (okj, extra) = cell_ok(l, wj);
                 if !okj {
                     continue;
                 }
@@ -1865,7 +1889,7 @@ impl<'a> Router<'a> {
                     if l2 == l {
                         continue;
                     }
-                    let (okj, extra) = cell_ok(l2, wv, i);
+                    let (okj, extra) = cell_ok(l2, wv);
                     if !okj {
                         continue;
                     }

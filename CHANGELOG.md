@@ -31,6 +31,8 @@ All notable changes to this project are documented here. The format follows
   (public benchmark boards: 114 s -> 79 s and 162 s -> 74 s).
 - A* uses a 4-ary heap of packed u64 keys and window-local indices without divisions; the
   routed boards are byte-identical (public boards: 85 -> 58 s, 68 -> 37 s, 51 -> 33 s).
+- Negotiated searches read one precomputed cost per cell (built once per net and iteration)
+  instead of seven maps per neighbour; byte-identical, public board bikedar 57 -> 44 s CPU.
 - The two fallback levels (no slide, no cleanup) run at the same time instead of one after
   the other; the chosen result is the same.
 
