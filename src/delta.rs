@@ -40,8 +40,10 @@ pub fn route_delta(nets: &[String], res: &DResult, remove: &[String]) -> Value {
     for &net in keys {
         let rn = &res.routed[&net];
         for s in &rn.segs {
-            add.push(json!({"type": "track", "net": nets[net], "layer": CU[s.l], "width": nm(s.w),
-                "start": [nm(s.a.x), nm(s.a.y)], "end": [nm(s.b.x), nm(s.b.y)]}));
+            add.push(
+                json!({"type": "track", "net": nets[net], "layer": CU[s.l], "width": nm(s.w),
+                "start": [nm(s.a.x), nm(s.a.y)], "end": [nm(s.b.x), nm(s.b.y)]}),
+            );
         }
         for v in &rn.vias {
             add.push(json!({"type": "via", "net": nets[net], "at": [nm(v.at.x), nm(v.at.y)],
@@ -75,7 +77,9 @@ pub fn apply(text: &str, delta: &Value) -> Result<String, String> {
         o.push_str(&text[at..s]);
         at = e;
     }
-    let close = text[at..].rfind(')').ok_or("board text without a closing ')'")?;
+    let close = text[at..]
+        .rfind(')')
+        .ok_or("board text without a closing ')'")?;
     let end = at + close;
     o.push_str(&text[at..end]);
     let add = delta["add"].as_array().map(Vec::as_slice).unwrap_or(&[]);
