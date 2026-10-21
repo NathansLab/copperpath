@@ -2688,7 +2688,11 @@ pub fn write_pcb(text: &str, nets: &[String], res: &DResult, out: &str) -> std::
 
 /// the board text with the routed copper appended (what `write_pcb` writes)
 pub fn pcb_text(text: &str, nets: &[String], res: &DResult) -> String {
-    let mut seed = 0x1234_5678_9abc_def1u64;
+    // seeded from the input (FNV-1a): reproducible, but a run on an already routed board does
+    // not hand out the UUIDs of the earlier run's copper again
+    let mut seed = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+    }) | 1;
     let mut add = String::new();
     let mut keys: Vec<&usize> = res.routed.keys().collect();
     keys.sort();
