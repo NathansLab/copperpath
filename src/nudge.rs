@@ -555,9 +555,10 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
                 rr.push(a);
             }
         }
-        // the current rotation first: the start candidate
-        if let Some(k) = rr.iter().position(|x| norm(x - f.rot).abs() < 1e-6) {
-            rr.swap(0, k);
+        // the current rotation first: the start candidate (the board as it is)
+        match rr.iter().position(|x| norm(x - f.rot).abs() < 1e-6) {
+            Some(k) => rr.swap(0, k),
+            None => rr.insert(0, norm(f.rot)),
         }
         parts.push(Part {
             refd: f.refd.clone(),
