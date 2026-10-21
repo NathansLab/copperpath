@@ -34,6 +34,48 @@ common options:
 
 see README.md for the options of each command";
 
+/// set together with `droute::STOP` by --cancel-file / --cancel-on-stdin-eof (reported as
+/// `stopped: "cancel"` instead of "signal")
+static CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn cancel() {
+    CANCELLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    droute::STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// cancel paths that work on every platform (a GUI on Windows can only kill the process
+/// otherwise): the cancel file appears (polled once per second), or stdin reaches EOF (the
+/// parent closed it or died)
+fn watch_cancel(file: Option<&str>, stdin_eof: bool) {
+    if let Some(f) = file {
+        let f = std::path::PathBuf::from(f);
+        std::thread::spawn(move || loop {
+            if f.exists() {
+                eprintln!("[route] cancel file {} found", f.display());
+                cancel();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+    }
+    if stdin_eof {
+        std::thread::spawn(|| {
+            use std::io::Read;
+            let mut buf = [0u8; 256];
+            let mut inp = std::io::stdin();
+            loop {
+                match inp.read(&mut buf) {
+                    Ok(0) => break,
+                    Err(e) if e.kind() != std::io::ErrorKind::Interrupted => break,
+                    _ => {}
+                }
+            }
+            eprintln!("[route] stdin closed");
+            cancel();
+        });
+    }
+}
+
 /// command result: JSON summary, or an error message (exit code 1)
 type CmdResult = Result<Value, String>;
 
@@ -860,6 +902,7 @@ fn cmd_route(a: &Args) -> CmdResult {
         p.deadline = Some(t_start + std::time::Duration::from_secs_f64(limit));
     }
     droute::install_stop_handler();
+    watch_cancel(a.get("cancel-file"), a.get("cancel-on-stdin-eof").is_some());
     p.stall_iters = a.u("stall-iters", p.stall_iters);
     p.par_conn = a.u("par-conn", p.par_conn);
     p.bend_cost = a.f("bend-cost", p.bend_cost as f64) as f32;
@@ -881,7 +924,9 @@ fn cmd_route(a: &Args) -> CmdResult {
         droute::STOP.load(std::sync::atomic::Ordering::Relaxed)
             || p.deadline.is_some_and(|d| Instant::now() > d)
     };
-    let stopped = if droute::STOP.load(std::sync::atomic::Ordering::Relaxed) {
+    let stopped = if CANCELLED.load(std::sync::atomic::Ordering::Relaxed) {
+        Some("cancel")
+    } else if droute::STOP.load(std::sync::atomic::Ordering::Relaxed) {
         Some("signal")
     } else if halted() {
         Some("time-limit")
