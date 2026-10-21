@@ -44,6 +44,9 @@ All notable changes to this project are documented here. The format follows
   Linux and macOS and write the best result so far like `--time-limit`; Ctrl+C / Ctrl+Break
   do the same on Windows. `--json` reports `stopped: "cancel"` (#19).
 - `--yield-pours` / config `yield_pours`: locked pours that yield like unlocked ones (#0009).
+- `route --delta-json FILE` (or `-` for stdout): added and removed items in integer nanometres
+  for the KiCad IPC API, with or instead of `--out`; `--pcb -` reads the board from stdin.
+  `copperpath::delta::apply` applies a delta to board text (#20).
 
 ## [0.1.0] - 2026-10-21
 

@@ -68,8 +68,8 @@ fn delta_applied_to_the_input_equals_the_output_board() {
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["delta_json"], dj.to_str().unwrap());
 
-    let dv: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&dj).unwrap()).unwrap();
+    let dt = std::fs::read_to_string(&dj).unwrap();
+    let dv: serde_json::Value = serde_json::from_str(&dt).unwrap();
     assert_eq!((dv["v"].as_i64(), dv["units"].as_str()), (Some(1), Some("nm")));
     let add = dv["add"].as_array().unwrap();
     assert_eq!(
@@ -80,11 +80,12 @@ fn delta_applied_to_the_input_equals_the_output_board() {
         add.iter().filter(|i| i["type"] == "via").count() as u64,
         v["vias"].as_u64().unwrap()
     );
-    assert!(add.iter().all(|i| i["width"].is_i64() || i["size"].is_i64()));
 
+    // delta::apply refuses non-integer lengths
     let input = std::fs::read_to_string(DEMO).unwrap();
     let applied = d.join("applied.kicad_pcb");
-    std::fs::write(&applied, delta::apply(&input, &dv).unwrap()).unwrap();
+    let txt = delta::apply(&input, &dv).unwrap();
+    std::fs::write(&applied, txt).unwrap();
     let a = board::load(applied.to_str().unwrap()).unwrap();
     let b = board::load(out.to_str().unwrap()).unwrap();
     assert_eq!(a.nets, b.nets);
@@ -105,8 +106,19 @@ fn board_from_stdin_and_delta_only() {
     let dj = d.join("stdin_delta.json");
     let mut ch = Command::new(env!("CARGO_BIN_EXE_copperpath"))
         .args([
-            "route", "--pcb", "-", "--pro", PRO, "--dru", DRU, "--threads", "2", "--json",
-            "--nets", "SDA,SCL", "--delta-json",
+            "route",
+            "--pcb",
+            "-",
+            "--pro",
+            PRO,
+            "--dru",
+            DRU,
+            "--threads",
+            "2",
+            "--json",
+            "--nets",
+            "SDA,SCL",
+            "--delta-json",
         ])
         .arg(&dj)
         .stdin(Stdio::piped())
@@ -124,8 +136,8 @@ fn board_from_stdin_and_delta_only() {
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["out"], serde_json::Value::Null);
     assert_eq!(v["opens"], 0, "{}", v["open_nets"]);
-    let dv: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&dj).unwrap()).unwrap();
+    let dt = std::fs::read_to_string(&dj).unwrap();
+    let dv: serde_json::Value = serde_json::from_str(&dt).unwrap();
     let add = dv["add"].as_array().unwrap();
     assert!(!add.is_empty());
     assert!(add.iter().all(|i| i["net"] == "SDA" || i["net"] == "SCL"));

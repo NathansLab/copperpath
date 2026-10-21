@@ -75,9 +75,11 @@ pub fn apply(text: &str, delta: &Value) -> Result<String, String> {
         o.push_str(&text[at..s]);
         at = e;
     }
-    let end = text[at..].rfind(')').ok_or("board text has no closing parenthesis")? + at;
+    let close = text[at..].rfind(')').ok_or("board text without a closing ')'")?;
+    let end = at + close;
     o.push_str(&text[at..end]);
-    for it in delta["add"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+    let add = delta["add"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    for it in add {
         let net = sexpr::q(it["net"].as_str().unwrap_or(""));
         match it["type"].as_str() {
             Some(t @ ("track" | "arc")) => {
