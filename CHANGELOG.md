@@ -17,6 +17,9 @@ All notable changes to this project are documented here. The format follows
 - Plated pads with `remove_unused_layers` block only with their barrel on inner layers (#0010).
 - Failed nets report why the search stopped (node cap, job window, no path); the node cap grows
   with the net's search window (#0011).
+- Vias respect the Board Setup minimum diameter, drill and annular width (#0013).
+- Pad drill offsets shift the pad copper (#0014).
+- New vias and tracks of different nets keep the minimum hole clearance (#0015).
 
 ### Added
 - `--yield-pours` / config `yield_pours`: locked pours that yield like unlocked ones (#0009).

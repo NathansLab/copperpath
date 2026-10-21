@@ -274,7 +274,8 @@ impl<'a> Checker<'a> {
                     c = c.max(self.m.r.clr(net, f.net, is_outer(l)).max(0.0));
                 }
             }
-            if f.sh.dist(at) <= c + vr {
+            // copper clearance, and the new hole's clearance to foreign copper
+            if f.sh.dist(at) <= (c + vr).max(dr + self.m.r.min_hole_clearance) {
                 return false;
             }
             if f.drill_r > 0.0 {
@@ -312,6 +313,14 @@ impl<'a> Checker<'a> {
             }
             if shape_dist(&cl, &f.sh) <= c + hw {
                 return false;
+            }
+            if f.drill_r > 0.0 {
+                // hole clearance to a foreign via's drill
+                if let Shape::Capsule { a: ca, .. } = &f.sh {
+                    if dist_seg(*ca, a, b) <= f.drill_r + self.m.r.min_hole_clearance + hw {
+                        return false;
+                    }
+                }
             }
         }
         true

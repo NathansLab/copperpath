@@ -282,6 +282,15 @@ fn parse_pad(l: &List, b: &mut Board, fp_rot: f64) -> Pad {
         "trapezoid" => shapes.push(rect_shape(o, w, h, 0.0, 0.0)),
         _ => shapes.push(rect_shape(o, w, h, 0.0, 0.0)),
     }
+    // (drill d (offset x y)): the copper shape is shifted against the hole (pad frame)
+    if let Some(off) = l.child("drill").and_then(|d| d.xy("offset")) {
+        if off.0 != 0.0 || off.1 != 0.0 {
+            shapes = shapes
+                .iter()
+                .map(|s| s.xform(p(off.0, off.1), 0.0))
+                .collect();
+        }
+    }
     let inner_barrel_only = kind == "thru_hole" && l.flag("remove_unused_layers");
     if kind == "np_thru_hole" && shapes.is_empty() {
         shapes.push(Shape::circle(o, drill / 2.0));
@@ -906,6 +915,19 @@ mod tests {
             (a.x - 30.0).abs() < 1e-6 && (a.y - 28.0).abs() < 1e-6,
             "{a:?}"
         );
+    }
+
+    #[test]
+    fn drill_offset_shifts_the_pad_copper() {
+        let b = parse_board(mini(
+            "(footprint \"J\" (layer \"F.Cu\") (at 10 10) (pad \"1\" thru_hole oval (at 0 0) \
+             (size 1.5 2) (drill 1 (offset 0 0.5)) (layers \"*.Cu\") (net \"A\")))",
+        ))
+        .unwrap();
+        let f = &b.fps[0];
+        let s = &f.pad_shapes(&f.pads[0])[0];
+        // copper spans y 9.5..11.5 (centre 10.5), the hole stays at 10
+        assert!(s.dist(p(10.0, 11.4)) == 0.0 && s.dist(p(10.0, 9.4)) > 0.0);
     }
 
     #[test]

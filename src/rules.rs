@@ -339,6 +339,8 @@ pub struct Rules {
     pub min_clearance: f64,
     /// board setup minimum track width (hard floor, also for neck-down)
     pub min_track: f64,
+    /// board setup via minimums: diameter, annular width, drill
+    pub min_via: (f64, f64, f64),
     pub min_edge: f64,
     pub min_hole_to_hole: f64,
     pub min_hole_clearance: f64,
@@ -440,6 +442,11 @@ impl Rules {
             class_idx,
             min_clearance: rs["min_clearance"].as_f64().unwrap_or(0.2),
             min_track: rs["min_track_width"].as_f64().unwrap_or(0.2),
+            min_via: (
+                rs["min_via_diameter"].as_f64().unwrap_or(0.0),
+                rs["min_via_annular_width"].as_f64().unwrap_or(0.0),
+                rs["min_through_hole_diameter"].as_f64().unwrap_or(0.0),
+            ),
             min_edge: rs["min_copper_edge_clearance"].as_f64().unwrap_or(0.5),
             min_hole_to_hole: rs["min_hole_to_hole"].as_f64().unwrap_or(0.25),
             min_hole_clearance: rs["min_hole_clearance"].as_f64().unwrap_or(0.25),
@@ -581,9 +588,12 @@ impl Rules {
         (mn, opt.max(mn))
     }
 
+    /// via diameter and drill of the net class, raised to the board setup minimums
     pub fn via(&self, net: usize) -> (f64, f64) {
         let c = self.class_of(net);
-        (c.via_d, c.via_drill)
+        let (md, ma, mh) = self.min_via;
+        let drill = c.via_drill.max(mh);
+        (c.via_d.max(md).max(drill + 2.0 * ma), drill)
     }
 
     pub fn max_length(&self, net: usize) -> Option<f64> {
@@ -639,6 +649,10 @@ mod tests {
         let mut r = r;
         r.min_track = 0.3;
         assert_eq!(r.track_width(1), (0.3, 0.3));
+        // class via 0.6 / 0.3; a 0.2 mm annular minimum makes it 0.7 / 0.3
+        assert_eq!(r.via(1), (0.6, 0.3));
+        r.min_via = (0.0, 0.2, 0.0);
+        assert!((r.via(1).0 - 0.7).abs() < 1e-9);
     }
 
     fn demo_rules() -> Rules {

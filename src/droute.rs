@@ -516,7 +516,9 @@ impl<'a> Router<'a> {
                 let c = self.m.r.clr(job.net, oj.net, is_outer(s.l)).max(0.0);
                 Self::stamp_owner(g, &mut o.t[s.l], &mut lt[s.l], &sh, c + job.hw + mg, id);
                 Self::stamp_owner(g, &mut o.tn[s.l], &mut ltn[s.l], &sh, c + job.hn + mg, id);
-                Self::stamp_owner(g, &mut o.v, &mut lv, &sh, c + job.vr + mg, id);
+                // a new via also keeps the hole clearance from this track
+                let cv = (c + job.vr).max(job.dr + self.m.r.min_hole_clearance);
+                Self::stamp_owner(g, &mut o.v, &mut lv, &sh, cv + mg, id);
             }
             for v in &rn.vias {
                 let sh = Shape::circle(v.at, v.d / 2.0);
@@ -524,8 +526,10 @@ impl<'a> Router<'a> {
                     continue;
                 }
                 let mut cm: f64 = 0.0;
+                // tracks keep the hole clearance from the via's drill (can exceed the copper clearance)
+                let ch = v.drill / 2.0 + self.m.r.min_hole_clearance - v.d / 2.0;
                 for l in 0..NL {
-                    let c = self.m.r.clr(job.net, oj.net, is_outer(l)).max(0.0);
+                    let c = self.m.r.clr(job.net, oj.net, is_outer(l)).max(0.0).max(ch);
                     cm = cm.max(c);
                     Self::stamp_owner(g, &mut o.t[l], &mut lt[l], &sh, c + job.hw + mg, id);
                     Self::stamp_owner(g, &mut o.tn[l], &mut ltn[l], &sh, c + job.hn + mg, id);
