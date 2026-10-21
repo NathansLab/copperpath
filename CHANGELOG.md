@@ -36,6 +36,10 @@ All notable changes to this project are documented here. The format follows
   (all nets of a 6-layer board with 217 fills in about 1 s; per-net opens equal KiCad's DRC).
 
 ### Fixed
+- `fanout --plane REGEX`: when the pattern also matches outer-layer pours of the net (F/B
+  pours named like the plane), only the inner-layer fills count as the plane. A pad in an
+  isolated outer pour fragment without a via is now an open island (before, every pad touching
+  any matching fill counted as connected, e.g. 6 instead of 18 open islands).
 - Router: a DRU `track_width` rule scoped by `intersectsCourtyard('REF')` sets the neck-down width
   inside that courtyard (power net with a wide class on a fine-pitch part gets its stubs); the
   neck-down of such a net then applies inside those courtyards only (#2, width part).

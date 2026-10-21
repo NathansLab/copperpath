@@ -63,9 +63,16 @@ pub fn fanout(m: &Model, p: &FanoutParams) -> Result<FanoutResult, String> {
     let pins = pins.get(&net).cloned().unwrap_or_default();
     // plane fills of the net and the components that touch one
     let no = m.objs.len();
-    let plane_fill: Vec<usize> = (0..m.fills.len())
+    let mut plane_fill: Vec<usize> = (0..m.fills.len())
         .filter(|&k| m.fills[k].net == net && p.plane.is_match(&m.b.zones[m.fill_zone[k]].name))
         .collect();
+    // the plane is on the inner layers when the pattern matches inner fills: outer pour
+    // fragments of the same net that the pattern also matches (F/B pours named like the plane)
+    // count only through their own connection to it, never as the plane itself
+    const INNER: u8 = 0x1e;
+    if plane_fill.iter().any(|&k| m.fills[k].layers & INNER != 0) {
+        plane_fill.retain(|&k| m.fills[k].layers & INNER != 0);
+    }
     if plane_fill.is_empty() {
         return Err(format!(
             "no saved fill in a --plane zone of net {}: refill a copy first (kicad-cli pcb drc --refill-zones --save-board)",
