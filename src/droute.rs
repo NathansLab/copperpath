@@ -1186,156 +1186,185 @@ impl<'a> Router<'a> {
                 None => (0.0, 8),
             }
         };
-        let mut used: Vec<Option<P>> = vec![None; stubs.len()];
-        let mut tmark = vec![0u16; n * NL];
-        let mut tree_mark = vec![false; n * NL];
-        let mut tinfo: HashMap<usize, (f32, u8)> = HashMap::new();
-        let start = (0..nc).max_by_key(|c| comp_cells[*c].len()).unwrap_or(0);
-        let mut in_tree = vec![false; nc];
-        in_tree[start] = true;
-        let mut tree: Vec<(usize, usize)> = comp_cells[start].clone();
-        let mut src_info: HashMap<(usize, usize), (f32, u8)> = HashMap::new();
-        for c in &tree {
-            tree_mark[c.0 * n + self.wi(k, c.1).unwrap()] = true;
-            src_info.insert(*c, info(c, &used));
+        // grow the tree from the largest component; if nothing can be joined to it (an isolated
+        // start pin), retry from the next components so the rest of the net is still routed
+        let mut starts: Vec<usize> = (0..nc).filter(|c| !comp_cells[*c].is_empty()).collect();
+        // ties: the last component first, as max_by_key picked it before
+        starts.sort_by_key(|c| std::cmp::Reverse((comp_cells[*c].len(), *c)));
+        starts.truncate(3);
+        if starts.is_empty() {
+            starts.push(0);
         }
-        for (c, ccs) in comp_cells.iter().enumerate().take(nc) {
-            if c != start {
-                for cc in ccs {
-                    let node = cc.0 * n + self.wi(k, cc.1).unwrap();
-                    tmark[node] = (c + 1) as u16;
-                    if let Some(&si) = node_stub.get(cc) {
-                        tinfo.insert(node, (s_cost[si], (stubs[si].d + 4) % 8));
-                    }
-                }
+        let mut best: Option<NetRouteResult> = None;
+        let mut best_in_tree = vec![false; nc];
+        for &start in &starts {
+            let mut used: Vec<Option<P>> = vec![None; stubs.len()];
+            let mut tmark = vec![0u16; n * NL];
+            let mut tree_mark = vec![false; n * NL];
+            let mut tinfo: HashMap<usize, (f32, u8)> = HashMap::new();
+            let mut in_tree = vec![false; nc];
+            in_tree[start] = true;
+            let mut tree: Vec<(usize, usize)> = comp_cells[start].clone();
+            let mut src_info: HashMap<(usize, usize), (f32, u8)> = HashMap::new();
+            for c in &tree {
+                tree_mark[c.0 * n + self.wi(k, c.1).unwrap()] = true;
+                src_info.insert(*c, info(c, &used));
             }
-        }
-        let mut rn = RNet::default();
-        let mut cells = Vec::new();
-        let mut vias = Vec::new();
-        let mut left = nc - 1;
-        let par = if self.p.par_conn == 0 {
-            rayon::current_num_threads()
-        } else {
-            self.p.par_conn
-        };
-        let mut dead = vec![false; nc];
-        let mut found: Vec<Found> = Vec::new();
-        loop {
-            let open: Vec<usize> = (0..nc)
-                .filter(|c| !in_tree[*c] && !dead[*c] && !comp_cells[*c].is_empty())
-                .collect();
-            if open.is_empty() && found.is_empty() {
-                break;
-            }
-            if found.is_empty() {
-                if par > 1 && open.len() >= 3 {
-                    // several searches from the same tree in parallel, each guided to one of the
-                    // components nearest to the tree; accepted in order below (a search may end
-                    // at another component than its guide, duplicates are dropped)
-                    let near = self.nearest_comps(k, &tree, &open, &comp_cells, par);
-                    let rs: Vec<Option<Found>> = near
-                        .par_iter()
-                        .map(|&c| {
-                            self.astar(
-                                k,
-                                &tree,
-                                &src_info,
-                                &tmark,
-                                &tinfo,
-                                &tree_mark,
-                                &[c],
-                                &comp_cells,
-                                o,
-                                nego,
-                            )
-                        })
-                        .collect();
-                    // keep a result only if it stays clear of the results kept before it (else the
-                    // two would likely share a corridor: redundant copper); dropped ones re-search
-                    let nxg = self.gs.nx;
-                    let gap = (2.0 / self.gs.res) as usize;
-                    let mut kept: Vec<(usize, usize, usize, usize)> = Vec::new();
-                    for (r, &c) in rs.into_iter().zip(&near) {
-                        match r {
-                            Some(f) => {
-                                let (mut x0, mut y0, mut x1, mut y1) =
-                                    (usize::MAX, usize::MAX, 0, 0);
-                                for &(_, i) in &f.0 {
-                                    let (x, y) = (i % nxg, i / nxg);
-                                    (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
-                                }
-                                let b = (
-                                    x0.saturating_sub(gap),
-                                    y0.saturating_sub(gap),
-                                    x1 + gap,
-                                    y1 + gap,
-                                );
-                                if kept
-                                    .iter()
-                                    .all(|q| b.2 < q.0 || q.2 < b.0 || b.3 < q.1 || q.3 < b.1)
-                                {
-                                    kept.push(b);
-                                    found.push(f);
-                                }
-                            }
-                            None => dead[c] = true,
+            for (c, ccs) in comp_cells.iter().enumerate().take(nc) {
+                if c != start {
+                    for cc in ccs {
+                        let node = cc.0 * n + self.wi(k, cc.1).unwrap();
+                        tmark[node] = (c + 1) as u16;
+                        if let Some(&si) = node_stub.get(cc) {
+                            tinfo.insert(node, (s_cost[si], (stubs[si].d + 4) % 8));
                         }
                     }
-                    found.reverse(); // pop() takes them in guide order
-                    if found.is_empty() {
-                        continue;
+                }
+            }
+            let mut rn = RNet::default();
+            let mut cells = Vec::new();
+            let mut vias = Vec::new();
+            let mut left = nc - 1;
+            let par = if self.p.par_conn == 0 {
+                rayon::current_num_threads()
+            } else {
+                self.p.par_conn
+            };
+            let mut dead = vec![false; nc];
+            let mut found: Vec<Found> = Vec::new();
+            loop {
+                let open: Vec<usize> = (0..nc)
+                    .filter(|c| !in_tree[*c] && !dead[*c] && !comp_cells[*c].is_empty())
+                    .collect();
+                if open.is_empty() && found.is_empty() {
+                    break;
+                }
+                if found.is_empty() {
+                    if par > 1 && open.len() >= 3 {
+                        // several searches from the same tree in parallel, each guided to one of the
+                        // components nearest to the tree; accepted in order below (a search may end
+                        // at another component than its guide, duplicates are dropped)
+                        let near = self.nearest_comps(k, &tree, &open, &comp_cells, par);
+                        let rs: Vec<Option<Found>> = near
+                            .par_iter()
+                            .map(|&c| {
+                                self.astar(
+                                    k,
+                                    &tree,
+                                    &src_info,
+                                    &tmark,
+                                    &tinfo,
+                                    &tree_mark,
+                                    &[c],
+                                    &comp_cells,
+                                    o,
+                                    nego,
+                                )
+                            })
+                            .collect();
+                        // keep a result only if it stays clear of the results kept before it (else the
+                        // two would likely share a corridor: redundant copper); dropped ones re-search
+                        let nxg = self.gs.nx;
+                        let gap = (2.0 / self.gs.res) as usize;
+                        let mut kept: Vec<(usize, usize, usize, usize)> = Vec::new();
+                        for (r, &c) in rs.into_iter().zip(&near) {
+                            match r {
+                                Some(f) => {
+                                    let (mut x0, mut y0, mut x1, mut y1) =
+                                        (usize::MAX, usize::MAX, 0, 0);
+                                    for &(_, i) in &f.0 {
+                                        let (x, y) = (i % nxg, i / nxg);
+                                        (x0, y0, x1, y1) =
+                                            (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                                    }
+                                    let b = (
+                                        x0.saturating_sub(gap),
+                                        y0.saturating_sub(gap),
+                                        x1 + gap,
+                                        y1 + gap,
+                                    );
+                                    if kept
+                                        .iter()
+                                        .all(|q| b.2 < q.0 || q.2 < b.0 || b.3 < q.1 || q.3 < b.1)
+                                    {
+                                        kept.push(b);
+                                        found.push(f);
+                                    }
+                                }
+                                None => dead[c] = true,
+                            }
+                        }
+                        found.reverse(); // pop() takes them in guide order
+                        if found.is_empty() {
+                            continue;
+                        }
+                    } else {
+                        let Some(f) = self.astar(
+                            k,
+                            &tree,
+                            &src_info,
+                            &tmark,
+                            &tinfo,
+                            &tree_mark,
+                            &open,
+                            &comp_cells,
+                            o,
+                            nego,
+                        ) else {
+                            break;
+                        };
+                        found.push(f);
                     }
-                } else {
-                    let Some(f) = self.astar(
-                        k,
-                        &tree,
-                        &src_info,
-                        &tmark,
-                        &tinfo,
-                        &tree_mark,
-                        &open,
-                        &comp_cells,
-                        o,
-                        nego,
-                    ) else {
-                        break;
-                    };
-                    found.push(f);
+                }
+                let (path, ci) = found.pop().unwrap();
+                if in_tree[ci] {
+                    continue; // reached a component an earlier search of the batch already joined
+                }
+                in_tree[ci] = true;
+                left -= 1;
+                for cc in &comp_cells[ci] {
+                    let node = cc.0 * n + self.wi(k, cc.1).unwrap();
+                    tmark[node] = 0;
+                    tree_mark[node] = true;
+                    tree.push(*cc);
+                }
+                let added = self.emit(
+                    k, o, nego, &path, &pad_of, &node_stub, &mut used, &mut rn, &mut cells,
+                    &mut vias, ck, foreign, st,
+                );
+                for cc in &comp_cells[ci] {
+                    src_info.insert(*cc, info(cc, &used));
+                }
+                for c in [path[0], path[path.len() - 1]] {
+                    if node_stub.contains_key(&c) {
+                        src_info.insert(c, info(&c, &used));
+                    }
+                }
+                for (l, i) in added {
+                    let Some(w) = self.wi(k, i) else { continue };
+                    if !tree_mark[l * n + w] {
+                        tree_mark[l * n + w] = true;
+                        tree.push((l, i));
+                    }
                 }
             }
-            let (path, ci) = found.pop().unwrap();
-            if in_tree[ci] {
-                continue; // reached a component an earlier search of the batch already joined
+            if best.as_ref().is_none_or(|b| left < b.1) {
+                best = Some((rn, left, cells, vias));
+                best_in_tree = in_tree;
             }
-            in_tree[ci] = true;
-            left -= 1;
-            for cc in &comp_cells[ci] {
-                let node = cc.0 * n + self.wi(k, cc.1).unwrap();
-                tmark[node] = 0;
-                tree_mark[node] = true;
-                tree.push(*cc);
-            }
-            let added = self.emit(
-                k, o, nego, &path, &pad_of, &node_stub, &mut used, &mut rn, &mut cells, &mut vias,
-                ck, foreign, st,
-            );
-            for cc in &comp_cells[ci] {
-                src_info.insert(*cc, info(cc, &used));
-            }
-            for c in [path[0], path[path.len() - 1]] {
-                if node_stub.contains_key(&c) {
-                    src_info.insert(c, info(&c, &used));
-                }
-            }
-            for (l, i) in added {
-                let Some(w) = self.wi(k, i) else { continue };
-                if !tree_mark[l * n + w] {
-                    tree_mark[l * n + w] = true;
-                    tree.push((l, i));
-                }
+            if left + 1 < nc || left == 0 {
+                break; // joined something (or done): keep this tree
             }
         }
+        let (rn, left, cells, vias) = best.unwrap_or_else(|| {
+            (
+                RNet::default(),
+                nc.saturating_sub(1),
+                Vec::new(),
+                Vec::new(),
+            )
+        });
+        let in_tree = best_in_tree;
         if left > 0 && std::env::var("DROUTE_DEBUG").is_ok() {
             for c in 0..nc {
                 if !in_tree[c] {
