@@ -29,6 +29,8 @@ All notable changes to this project are documented here. The format follows
   result, demo 5.5 s -> 2.8 s); nets with non-interacting windows route in parallel; the
   negotiation stops after 3 iterations without progress (`--stall-iters`) instead of 6
   (public benchmark boards: 114 s -> 79 s and 162 s -> 74 s).
+- The two fallback levels (no slide, no cleanup) run at the same time instead of one after
+  the other; the chosen result is the same.
 
 ### Added
 - `--time-limit S`, SIGTERM and Ctrl+C write the best result so far; `--json` gains `stopped`
