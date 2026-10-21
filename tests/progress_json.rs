@@ -92,7 +92,7 @@ fn progress_done_reports_errors() {
         .unwrap();
     assert!(!o.status.success());
     let err = String::from_utf8_lossy(&o.stderr);
-    let last = err.lines().filter(|l| l.starts_with('{')).last().unwrap();
+    let last = err.lines().rfind(|l| l.starts_with('{')).unwrap();
     let done: serde_json::Value = serde_json::from_str(last).unwrap();
     assert_eq!(done["ev"], "done");
     assert_eq!(done["ok"], false);

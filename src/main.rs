@@ -249,7 +249,7 @@ fn main() {
             Ok(v) => {
                 let failed = v["failed"].as_array().map_or(0, |f| f.len());
                 json!({"ev": "done", "v": progress::VERSION, "ok": true,
-                    "routed": v["nets"].as_u64().unwrap_or(0) as usize - failed, "failed": failed,
+                    "routed": (v["nets"].as_u64().unwrap_or(0) as usize).saturating_sub(failed), "failed": failed,
                     "opens": v["opens"], "stopped": v["stopped"], "out": v["out"], "delta_json": v["delta_json"]})
             }
             Err(e) => json!({"ev": "done", "v": progress::VERSION, "ok": false, "error": e}),
