@@ -65,9 +65,7 @@ impl Obj {
 /// it on its layer (further nets beyond four are dropped: such an aperture bridges already)
 fn mask_nets(objs: &mut [Obj]) {
     let copper: Vec<usize> = (0..objs.len())
-        .filter(|&j| {
-            objs[j].net != 0 && matches!(objs[j].kind, Kind::Pad { .. } | Kind::Zone)
-        })
+        .filter(|&j| objs[j].net != 0 && matches!(objs[j].kind, Kind::Pad { .. } | Kind::Zone))
         .collect();
     for i in 0..objs.len() {
         if !matches!(objs[i].kind, Kind::Mask { .. }) {
