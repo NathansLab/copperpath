@@ -1,7 +1,12 @@
 # 0024 Feature request: more hard and soft rules (rule engine)
 
 GitHub: https://github.com/NathansLab/copperpath/issues/11
-Status: open (feature request). Related: #2 (DRU intersectsCourtyard).
+Status: open (feature request, epic). Related: #2 (DRU intersectsCourtyard).
+Sub-issues (in order): #41 rule table + soft-rule report, #42 allowed_layers / max_vias and #43
+diff pairs (together the first-step acceptance), #44 item-level DRU conditions, #45 courtyard/area
+conditions and class keep-outs (fixes #2), #46 length/skew with meanders, #47 HV clearance and
+creepage by voltage, #48 net ties, #49 soft rules separation / reference plane / power vias
+(builds on #10), #50 Kelvin connections and channel symmetry.
 
 copperpath reads net classes and part of the KiCad DRU language. Real boards need more, and some
 rules are preferences, not legality.
