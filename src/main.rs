@@ -1,0 +1,1105 @@
+//! placeroute command line: check, place, route, opens, hints, pads, netclass (see README.md).
+
+use placeroute::{board, check, droute, geom, groute, model, place, rules, sch, sites};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::time::Instant;
+
+/// version + git hash (set by build.rs)
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("PLACEROUTE_GIT_HASH"),
+    ")"
+);
+
+const USAGE: &str = "usage: placeroute <command> --pcb BOARD.kicad_pcb [options]
+
+commands:
+  check     routability report (via sites, global-route congestion, hotspots)
+  place     simulated-annealing placement inside zones (--zones zones.json)
+  route     detailed router for a region (--region x0,y0,x1,y1 --out OUT.kicad_pcb)
+  opens     unconnected connections per net, counted from the copper
+  hints     near-collinear pad pairs that force jogs between straight pad exits
+  pads      pad world positions, sizes and nets (tab separated)
+  netclass  net -> net class table (tab separated)
+
+common options:
+  --cfg config.json   board configuration (optional, see examples/config.json)
+  --board NAME        entry under \"boards\" in the config
+  --pro / --dru       project / custom rules file (default: next to the board)
+  --threads N         worker threads (default: all cores)
+  --json              print one JSON result object to stdout (logs stay on stderr)
+  --version           print version and git hash
+
+see README.md for the options of each command";
+
+/// command result: JSON summary, or an error message (exit code 1)
+type CmdResult = Result<Value, String>;
+
+pub struct Args {
+    pub cmd: String,
+    pub kv: HashMap<String, String>,
+}
+
+impl Args {
+    pub fn parse() -> Args {
+        let a: Vec<String> = std::env::args().skip(1).collect();
+        let cmd = a.first().cloned().unwrap_or_default();
+        let mut kv = HashMap::new();
+        let mut i = 1;
+        while i < a.len() {
+            if let Some(k) = a[i].strip_prefix("--") {
+                if i + 1 < a.len() && !a[i + 1].starts_with("--") {
+                    kv.insert(k.to_string(), a[i + 1].clone());
+                    i += 2;
+                } else {
+                    kv.insert(k.to_string(), "1".into());
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        Args { cmd, kv }
+    }
+    pub fn get(&self, k: &str) -> Option<&str> {
+        self.kv.get(k).map(|s| s.as_str())
+    }
+    pub fn s(&self, k: &str, d: &str) -> String {
+        self.get(k).unwrap_or(d).to_string()
+    }
+    pub fn f(&self, k: &str, d: f64) -> f64 {
+        self.get(k).and_then(|v| v.parse().ok()).unwrap_or(d)
+    }
+    pub fn u(&self, k: &str, d: usize) -> usize {
+        self.get(k).and_then(|v| v.parse().ok()).unwrap_or(d)
+    }
+    /// machine-readable mode: stdout carries only the final JSON object
+    pub fn json(&self) -> bool {
+        self.get("json").is_some()
+    }
+}
+
+pub struct Ctx {
+    pub board: board::Board,
+    pub rules: rules::Rules,
+    pub cfg: model::BoardCfg,
+    pub pcb: String,
+    pub pro: String,
+    pub dru: String,
+}
+
+pub fn load_ctx(a: &Args) -> Result<Ctx, String> {
+    let pcb = a
+        .get("pcb")
+        .ok_or("missing --pcb BOARD.kicad_pcb")?
+        .to_string();
+    if !std::path::Path::new(&pcb).is_file() {
+        return Err(format!("{pcb}: board file not found"));
+    }
+    let base = pcb.trim_end_matches(".kicad_pcb").to_string();
+    let pro = a.s("pro", &format!("{base}.kicad_pro"));
+    let dru = a.s("dru", &format!("{base}.kicad_dru"));
+    let t0 = Instant::now();
+    let board = board::load(&pcb)?;
+    if !std::path::Path::new(&pro).is_file() {
+        return Err(format!(
+            "{pro}: project file not found (net classes are read from it; set --pro)"
+        ));
+    }
+    let rules = rules::Rules::load(
+        &pro,
+        if std::path::Path::new(&dru).exists() {
+            &dru
+        } else {
+            ""
+        },
+        &board.nets,
+    )?;
+    // board configuration: optional JSON (see examples/config.json), built-in defaults otherwise
+    let cfg = match a.get("cfg") {
+        Some(path) => model::load_cfg(path, a.get("board"))?,
+        None => model::BoardCfg::default(),
+    };
+    eprintln!(
+        "[load] {} footprints, {} tracks, {} vias, {} zones, {} nets, {} DRU rules in {:.2} s",
+        board.fps.len(),
+        board.tracks.len(),
+        board.vias.len(),
+        board.zones.len(),
+        board.nets.len(),
+        rules.dru.len(),
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(Ctx {
+        board,
+        rules,
+        cfg,
+        pcb,
+        pro,
+        dru,
+    })
+}
+
+fn main() {
+    let a = Args::parse();
+    if matches!(a.cmd.as_str(), "--version" | "-V" | "version") || a.get("version").is_some() {
+        println!("placeroute {VERSION}");
+        return;
+    }
+    if matches!(a.cmd.as_str(), "--help" | "-h" | "help") {
+        println!("{USAGE}");
+        return;
+    }
+    let threads = a.u(
+        "threads",
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4),
+    );
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .ok();
+    let t0 = Instant::now();
+    let res: CmdResult = match a.cmd.as_str() {
+        "check" => cmd_check(&a),
+        "place" => cmd_place(&a),
+        "route" => cmd_route(&a),
+        "opens" => cmd_opens(&a),
+        "pads" => cmd_pads(&a),
+        "hints" => cmd_hints(&a),
+        "netclass" => cmd_netclass(&a),
+        "" => Err(format!("no command given\n{USAGE}")),
+        c => Err(format!("unknown command '{c}'\n{USAGE}")),
+    };
+    let secs = t0.elapsed().as_secs_f64();
+    match res {
+        Ok(mut v) => {
+            eprintln!("[done] {} in {:.2} s ({} threads)", a.cmd, secs, threads);
+            if a.json() {
+                if !v.is_object() {
+                    v = json!({ "result": v });
+                }
+                v["ok"] = json!(true);
+                v["command"] = json!(a.cmd);
+                v["version"] = json!(VERSION);
+                v["threads"] = json!(threads);
+                v["total_s"] = json!(check::round2(secs));
+                if v.get("warnings").is_none() {
+                    v["warnings"] = json!([]);
+                }
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            if a.json() {
+                println!(
+                    "{}",
+                    json!({"ok": false, "command": a.cmd, "version": VERSION, "error": e})
+                );
+            }
+            std::process::exit(if a.cmd.is_empty() || !KNOWN.contains(&a.cmd.as_str()) {
+                2
+            } else {
+                1
+            });
+        }
+    }
+}
+
+const KNOWN: [&str; 7] = [
+    "check", "place", "route", "opens", "pads", "hints", "netclass",
+];
+
+fn write_file(path: &str, data: &str) -> Result<(), String> {
+    if let Some(d) = std::path::Path::new(path).parent() {
+        if !d.as_os_str().is_empty() {
+            std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+        }
+    }
+    std::fs::write(path, data).map_err(|e| format!("{path}: {e}"))
+}
+
+/// pads --pcb B: pad world positions, world bounding-box size and net
+fn cmd_pads(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let mut rows = Vec::new();
+    for f in &c.board.fps {
+        for pd in &f.pads {
+            let (q, ang) = f.pad_world(pd);
+            let mut bb = geom::BBox::empty();
+            for s in f.pad_shapes(pd) {
+                let b2 = s.bbox();
+                bb.add(geom::p(b2.x0, b2.y0));
+                bb.add(geom::p(b2.x1, b2.y1));
+            }
+            let net = &c.board.nets[pd.net];
+            if !a.json() {
+                println!(
+                    "{}\t{}\t{:.4}\t{:.4}\t{:.2}\t{:.4}\t{:.4}\t{}",
+                    f.refd,
+                    pd.num,
+                    q.x,
+                    q.y,
+                    ang.rem_euclid(360.0),
+                    bb.x1 - bb.x0,
+                    bb.y1 - bb.y0,
+                    net
+                );
+            }
+            rows.push(json!({"ref": f.refd, "pad": pd.num, "x": geom_r(q.x), "y": geom_r(q.y), "rot": geom_r(ang.rem_euclid(360.0)),
+                "w": geom_r(bb.x1 - bb.x0), "h": geom_r(bb.y1 - bb.y0), "net": net}));
+        }
+    }
+    Ok(json!({ "pads": rows }))
+}
+
+/// netclass --pcb B: net -> class table
+fn cmd_netclass(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let mut map = serde_json::Map::new();
+    for (i, n) in c.board.nets.iter().enumerate() {
+        let cls = &c.rules.class_of(i).name;
+        if !a.json() {
+            println!("{}\t{}", n, cls);
+        }
+        if !n.is_empty() {
+            map.insert(n.clone(), json!(cls));
+        }
+    }
+    Ok(json!({ "net_class": map }))
+}
+
+fn cmd_check(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let mode = if a.s("copper", "locked") == "all" {
+        model::CopperMode::All
+    } else {
+        model::CopperMode::LockedOnly
+    };
+    let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), mode);
+    let out = a.s("out", "pr_check");
+    std::fs::create_dir_all(&out).ok();
+    let res = a.f("res", 0.25);
+    let gs = geom::GridSpec::new(c.board.bbox, res);
+    let t = Instant::now();
+    let reps = sites::class_reps(&m);
+    let sm = sites::build(&m, gs, &reps);
+    eprintln!(
+        "[sites] {} classes on {}x{} grid in {:.2} s",
+        sm.cls.len(),
+        gs.nx,
+        gs.ny,
+        t.elapsed().as_secs_f64()
+    );
+    // region report
+    let regions = check::sheet_regions(&c.board);
+    let mut rep_regions = serde_json::Map::new();
+    for (name, (bb, idx)) in &regions {
+        // class of the region: most common routable class among its nets
+        let mut cnt: HashMap<usize, usize> = HashMap::new();
+        for &fi in idx {
+            for pd in &c.board.fps[fi].pads {
+                if m.routable[pd.net] {
+                    *cnt.entry(c.rules.net_class[pd.net]).or_default() += 1;
+                }
+            }
+        }
+        let Some((&cls, _)) = cnt.iter().max_by_key(|(_, n)| **n) else {
+            continue;
+        };
+        let Some(cs) = sm.for_class(cls) else {
+            continue;
+        };
+        let mut v = check::region_sites(&gs, &cs.via, bb);
+        v["class"] = json!(c.rules.classes[cls].name);
+        v["bbox"] = json!([bb.x0, bb.y0, bb.x1, bb.y1].map(check::round2));
+        rep_regions.insert(name.clone(), v);
+    }
+    // what-if ablation: via sites per region with one blocker category removed (tells the AI what to change)
+    let mut whatif = serde_json::Map::new();
+    if a.get("no-whatif").is_none() {
+        type Filter = fn(&model::Obj) -> Option<model::Obj>;
+        let cats: [(&str, Filter); 5] = [
+            ("no_inner_locked_zones", |o| {
+                if matches!(o.kind, model::Kind::Zone) {
+                    let mut o2 = o.clone();
+                    o2.layers &= 0b100001;
+                    if o2.layers == 0 {
+                        None
+                    } else {
+                        Some(o2)
+                    }
+                } else {
+                    Some(o.clone())
+                }
+            }),
+            ("no_via_keepout_courtyards", |o| {
+                if matches!(o.kind, model::Kind::ViaKeepout) {
+                    None
+                } else {
+                    Some(o.clone())
+                }
+            }),
+            ("no_locked_tracks_vias", |o| {
+                if matches!(o.kind, model::Kind::Track | model::Kind::Via) {
+                    None
+                } else {
+                    Some(o.clone())
+                }
+            }),
+            ("no_rule_areas", |o| {
+                if matches!(o.kind, model::Kind::Keepout { .. }) {
+                    None
+                } else {
+                    Some(o.clone())
+                }
+            }),
+            ("no_lanes_no_courtyards", |o| {
+                if matches!(o.kind, model::Kind::ViaKeepout) {
+                    return None;
+                }
+                if matches!(o.kind, model::Kind::Zone) {
+                    let mut o2 = o.clone();
+                    o2.layers &= 0b100001;
+                    if o2.layers == 0 {
+                        None
+                    } else {
+                        Some(o2)
+                    }
+                } else {
+                    Some(o.clone())
+                }
+            }),
+        ];
+        use rayon::prelude::*;
+        let gate_regions: Vec<(&String, &geom::BBox, usize)> = regions
+            .iter()
+            .filter_map(|(n, (bb, _))| {
+                let cls = rep_regions.get(n)?.get("class")?.as_str()?;
+                Some((n, bb, *c.rules.class_idx.get(cls)?))
+            })
+            .collect();
+        let rows: Vec<(String, serde_json::Value)> = cats
+            .par_iter()
+            .map(|(cname, f)| {
+                let objs: Vec<model::Obj> = m.objs.iter().filter_map(f).collect();
+                let mut per = serde_json::Map::new();
+                for (n, bb, ci) in &gate_regions {
+                    let Some(cs) = sm.for_class(*ci) else {
+                        continue;
+                    };
+                    let vm = sites::via_map(&m, &gs, cs.rep_net, cs.via_r, cs.drill_r, &objs);
+                    let v = check::region_sites(&gs, &vm, bb);
+                    per.insert((*n).clone(), json!(v["free_sites"]));
+                }
+                (cname.to_string(), serde_json::Value::Object(per))
+            })
+            .collect();
+        for (k, v) in rows {
+            whatif.insert(k, v);
+        }
+    }
+    let report = json!({
+        "whatif_via_sites": whatif,
+        "pcb": c.pcb,
+        "grid_mm": res,
+        "copper": a.s("copper", "locked"),
+        "classes": sm.cls.iter().map(|cs| {
+            let free = cs.via.iter().filter(|v| **v == sites::R_FREE).count();
+            json!({"class": c.rules.classes[cs.class].name, "rep_net": c.board.nets[cs.rep_net], "via_d": cs.via_r*2.0, "track_w": cs.track_hw*2.0,
+                   "via_sites": free, "via_site_area_mm2": free as f64 * res * res})
+        }).collect::<Vec<_>>(),
+        "regions": rep_regions,
+    });
+    write_file(
+        &format!("{out}/report.json"),
+        &serde_json::to_string_pretty(&report).unwrap_or_default(),
+    )?;
+    let mut summary = json!({"out_dir": out, "classes": report["classes"], "regions": report["regions"].as_object().map(|o| o.len()).unwrap_or(0)});
+    // images: via sites for selected classes
+    let t = Instant::now();
+    // --img-classes A,B (default: every class with routable nets)
+    let want = a.get("img-classes");
+    for cs in &sm.cls {
+        let name = &c.rules.classes[cs.class].name;
+        if want.is_some_and(|w| !w.split(',').any(|w| w == name)) {
+            continue;
+        }
+        let cv = check::layer_image(&m, gs, None, Some(&cs.via), None);
+        cv.save(&format!("{out}/via_sites_{name}.png"), 2)
+            .map_err(|e| format!("png: {e}"))?;
+    }
+    // high-resolution crops: --crop x0,y0,x1,y1 [--crop-class Default] [--img-res 0.05]
+    if let Some(cr) = a.get("crop") {
+        let v: Vec<f64> = cr.split(',').filter_map(|x| x.parse().ok()).collect();
+        let bb = geom::BBox {
+            x0: v[0],
+            y0: v[1],
+            x1: v[2],
+            y1: v[3],
+        };
+        let cgs = geom::GridSpec::new(bb, a.f("img-res", 0.05));
+        let cname = a.s("crop-class", "Default");
+        if let Some(&ci) = c.rules.class_idx.get(&cname) {
+            if let Some(cs) = sm.for_class(ci) {
+                let vm = sites::via_map(&m, &cgs, cs.rep_net, cs.via_r, cs.drill_r, &m.objs);
+                check::layer_image(&m, cgs, None, Some(&vm), None)
+                    .save(&format!("{out}/crop_via_{cname}.png"), 1)
+                    .map_err(|e| format!("png: {e}"))?;
+                for l in 0..board::NL {
+                    let tm = sites::track_map(&m, &cgs, cs.rep_net, cs.track_hw, l, &m.objs);
+                    check::layer_image(&m, cgs, Some(l), Some(&tm), None)
+                        .save(&format!("{out}/crop_track_{cname}_{}.png", board::CU[l]), 1)
+                        .map_err(|e| format!("png: {e}"))?;
+                }
+            }
+        }
+    }
+    eprintln!("[img] {:.2} s", t.elapsed().as_secs_f64());
+    // global routing / congestion
+    if a.get("no-groute").is_none() {
+        let t = Instant::now();
+        let pins = model::pins_by_net(&m);
+        let gp = groute::GParams {
+            tile: a.f("tile", 1.0),
+            iters: a.u("iters", 12),
+            ..Default::default()
+        };
+        let gr = groute::route(&m, &sm, &pins, &gp);
+        let util = groute::tile_util(&gr);
+        let hs = groute::hotspots(&m, &gr);
+        eprintln!(
+            "[groute] {} connections, {} failed, {} hotspots in {:.2} s",
+            gr.conns.len(),
+            gr.failed.len(),
+            hs.len(),
+            t.elapsed().as_secs_f64()
+        );
+        let tgs = geom::GridSpec {
+            x0: gr.x0,
+            y0: gr.y0,
+            res: gr.tile,
+            nx: gr.tx,
+            ny: gr.ty,
+        };
+        // per layer heat images on the fine grid
+        for (l, ul) in util.iter().enumerate().take(board::NL) {
+            let mut hm = vec![0f64; gs.n()];
+            for iy in 0..gs.ny {
+                for ix in 0..gs.nx {
+                    if let Some((tx, ty)) = tgs.cell_of(gs.center(ix, iy)) {
+                        hm[gs.idx(ix, iy)] = ul[ty * gr.tx + tx];
+                    }
+                }
+            }
+            let mut cv = check::layer_image(&m, gs, Some(l), None, Some(&hm));
+            for h in &hs {
+                let b = h.bbox;
+                if h.id <= 25 && h.layers.iter().any(|x| x == board::CU[l]) {
+                    cv.outline(
+                        &[
+                            geom::p(b[0], b[1]),
+                            geom::p(b[2], b[1]),
+                            geom::p(b[2], b[3]),
+                            geom::p(b[0], b[3]),
+                        ],
+                        [255, 255, 255],
+                    );
+                    cv.text(
+                        geom::p(b[0], b[1] - 2.0),
+                        &format!("{}", h.id),
+                        [255, 255, 255],
+                        2,
+                    );
+                }
+            }
+            cv.save(&format!("{out}/congestion_{}.png", board::CU[l]), 2)
+                .map_err(|e| format!("png: {e}"))?;
+        }
+        let failed: Vec<serde_json::Value> = gr.failed.iter().map(|&ci| {
+            let cn = &gr.conns[ci];
+            json!({"net": c.board.nets[cn.net], "from": [cn.pa.x, cn.pa.y], "to": [cn.pb.x, cn.pb.y]})
+        }).collect();
+        let layer_sum: Vec<serde_json::Value> = (0..board::NL).map(|l| {
+            let ovf_h: f32 = gr.h_used[l].iter().zip(&gr.h_cap[l]).map(|(u, c)| (u - c).max(0.0)).sum();
+            let ovf_v: f32 = gr.v_used[l].iter().zip(&gr.v_cap[l]).map(|(u, c)| (u - c).max(0.0)).sum();
+            let used: f32 = gr.h_used[l].iter().sum::<f32>() + gr.v_used[l].iter().sum::<f32>();
+            json!({"layer": board::CU[l], "overflow_mm": check::round2((ovf_h + ovf_v) as f64), "used_mm_pitch": check::round2(used as f64)})
+        }).collect();
+        let vias: f32 = gr.via_used.iter().sum();
+        let g = json!({
+            "tile_mm": gr.tile, "connections": gr.conns.len(), "failed": failed, "overflow_per_iter": gr.overflow_hist,
+            "layers": layer_sum, "vias": vias, "hotspots": hs,
+        });
+        write_file(
+            &format!("{out}/groute.json"),
+            &serde_json::to_string_pretty(&g).unwrap_or_default(),
+        )?;
+        // compact per-tile utilisation (percent, u8) for the AI / viewer
+        let cong: Vec<Vec<u8>> = util
+            .iter()
+            .map(|u| {
+                u.iter()
+                    .map(|v| (v * 100.0).round().min(255.0) as u8)
+                    .collect()
+            })
+            .collect();
+        write_file(&format!("{out}/congestion.json"), &json!({"tx": gr.tx, "ty": gr.ty, "tile": gr.tile, "x0": gr.x0, "y0": gr.y0, "layers": board::CU, "util_pct": cong}).to_string())?;
+        summary["groute"] = json!({"failed": g["failed"].as_array().map(|v| v.len()), "layers": g["layers"], "vias": vias, "hotspots_top": hs.iter().take(8).map(|h| json!({"id": h.id, "bbox": h.bbox, "ovf": h.overflow_mm, "vias_over": h.vias_over, "layers": h.layers, "nets": h.nets.iter().take(4).collect::<Vec<_>>()})).collect::<Vec<_>>()});
+    }
+    Ok(summary)
+}
+
+/// place --pcb B --zones z.json [--sch DIR] [--moves N] [--starts K] [--out DIR]
+/// writes place.json (ref, x, y, rot, side, old, why) for apply_place.py and terms before/after
+fn cmd_place(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let zpath = a
+        .get("zones")
+        .ok_or("missing --zones zones.json (see examples/zones.json)")?;
+    let ztext = std::fs::read_to_string(zpath).map_err(|e| format!("{zpath}: {e}"))?;
+    let zf: place::ZonesFile = serde_json::from_str(&ztext).map_err(|e| format!("{zpath}: {e}"))?;
+    let m = model::Model::new(
+        &c.board,
+        &c.rules,
+        c.cfg.clone(),
+        model::CopperMode::LockedOnly,
+    );
+    let t = Instant::now();
+    let pb = place::Problem::new(&m, &zf)?;
+    eprintln!(
+        "[place] {} movable parts, {} nets, {} fixed objects, setup {:.2} s",
+        pb.parts.len(),
+        pb.nets.len(),
+        pb.fixed.len(),
+        t.elapsed().as_secs_f64()
+    );
+    let cur: Vec<place::Pose> = pb
+        .parts
+        .iter()
+        .map(|s| {
+            let f = &c.board.fps[s.fi];
+            place::Pose {
+                at: f.at,
+                rot: f.rot,
+                back: f.back,
+            }
+        })
+        .collect();
+    let s0 = pb.init_state(cur.clone());
+    let t0 = pb.terms(&s0);
+    eprintln!("[place] start: {:?}", t0);
+    eprintln!(
+        "[place] via sites with all movable parts removed (upper bound): {}",
+        pb.base_count.iter().filter(|c| **c == 0).count()
+    );
+    let mut nc: Vec<(f64, usize)> = s0.net_c.iter().map(|(n, c)| (*c, *n)).collect();
+    nc.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for (cst, n) in nc.iter().take(6) {
+        eprintln!(
+            "[place]   net cost {:8.1}  {}  maxlen {:?}",
+            cst,
+            c.board.nets[*n],
+            pb.net_maxlen.get(n)
+        );
+    }
+    let init_mode = a.s("init", zf.init.as_deref().unwrap_or("keep"));
+    let mut inits = Vec::new();
+    if init_mode == "keep" || init_mode == "both" {
+        inits.push(s0.clone());
+    }
+    if init_mode == "schematic" || init_mode == "both" {
+        let pdir = std::path::Path::new(&c.pcb)
+            .parent()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let dir = a.s("sch", if pdir.is_empty() { "." } else { &pdir });
+        let sch = sch::load_dir(&dir);
+        let s = pb.init_state(place::schematic_init(&pb, &sch));
+        eprintln!(
+            "[place] schematic init ({} symbols): {:?}",
+            sch.len(),
+            pb.terms(&s)
+        );
+        inits.push(s);
+    }
+    let moves = a.u("moves", zf.moves.unwrap_or(20000));
+    let starts = a.u("starts", rayon::current_num_threads());
+    let t = Instant::now();
+    let (best, traces) = place::optimize(
+        &pb,
+        &inits,
+        moves,
+        zf.seed.unwrap_or(1),
+        starts,
+        a.f("t0", 1.0),
+    );
+    let t1 = pb.terms(&best);
+    let dt = t.elapsed().as_secs_f64();
+    eprintln!(
+        "[place] best: {:?}  ({} starts x {} moves in {:.2} s, {:.0} moves/s)",
+        t1,
+        starts,
+        moves,
+        dt,
+        (starts * moves) as f64 / dt
+    );
+    // only accept if violations did not increase vs the current board
+    let out = a.s("out", "pr_place");
+    std::fs::create_dir_all(&out).ok();
+    let mut rows = Vec::new();
+    for (k, s) in pb.parts.iter().enumerate() {
+        let f = &c.board.fps[s.fi];
+        let ps = best.poses[k];
+        if (ps.at - f.at).len() < 1e-6 && (ps.rot - f.rot).abs() < 1e-6 && ps.back == f.back {
+            continue;
+        }
+        let why = zf
+            .zones
+            .iter()
+            .find(|z| z.refs.iter().any(|pt| place::ref_match(f, pt)))
+            .map(|z| z.why.clone())
+            .unwrap_or_default();
+        rows.push(json!({"ref": f.refd, "x": geom_r(ps.at.x), "y": geom_r(ps.at.y), "rot": geom_r(ps.rot), "side": if ps.back {"B"} else {"F"},
+            "old": [geom_r(f.at.x), geom_r(f.at.y), geom_r(f.rot), if f.back {"B"} else {"F"}], "why": format!("placeroute SA: {why}")}));
+    }
+    write_file(
+        &format!("{out}/place.json"),
+        &serde_json::to_string_pretty(&rows).unwrap_or_default(),
+    )?;
+    write_file(&format!("{out}/place_report.json"), &serde_json::to_string_pretty(&json!({"start": t0, "best": t1, "moved": rows.len(),
+        "parts": pb.parts.len(), "moves": moves, "starts": starts, "seconds": dt, "traces": traces})).unwrap_or_default())?;
+    eprintln!("[place] {} parts moved -> {out}/place.json", rows.len());
+    Ok(
+        json!({"out_dir": out, "parts": pb.parts.len(), "moved": rows.len(), "start": t0, "best": t1, "moves": moves, "starts": starts, "search_s": check::round2(dt)}),
+    )
+}
+
+fn geom_r(v: f64) -> f64 {
+    (v * 10000.0).round() / 10000.0
+}
+
+fn parse_box(s: &str) -> Result<geom::BBox, String> {
+    let v: Vec<f64> = s
+        .split(',')
+        .map(|x| x.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| format!("bad box '{s}': expected x0,y0,x1,y1 in mm"))?;
+    if v.len() != 4 || v[2] <= v[0] || v[3] <= v[1] {
+        return Err(format!(
+            "bad box '{s}': expected x0,y0,x1,y1 with x1 > x0 and y1 > y0"
+        ));
+    }
+    Ok(geom::BBox {
+        x0: v[0],
+        y0: v[1],
+        x1: v[2],
+        y1: v[3],
+    })
+}
+
+/// nets matching --nets patterns (comma separated, wildcards), None = all
+fn net_filter(a: &Args, nets: &[String]) -> Option<std::collections::HashSet<usize>> {
+    a.get("nets").map(|pats| {
+        let pats: Vec<&str> = pats.split(',').collect();
+        (0..nets.len())
+            .filter(|i| pats.iter().any(|pt| rules::wild(&nets[*i], pt)))
+            .collect()
+    })
+}
+
+/// hints --pcb B [--region x0,y0,x1,y1] [--nets pats] [--tol 1.0]: placement hints for clean routing.
+/// Per net a Euclidean MST of its pads (the likely connections); an edge whose pads are almost but not
+/// exactly in one row or column (perpendicular offset 0.02 .. tol mm, run >= 0.5 mm) forces a jog or
+/// staircase between two straight exit stubs -> align the pads before routing.
+fn cmd_hints(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let region = a.get("region").map(parse_box).transpose()?;
+    let only = net_filter(a, &c.board.nets);
+    let tol: f64 = a.s("tol", "1.0").parse().unwrap_or(1.0);
+    let mut by_net: std::collections::BTreeMap<usize, Vec<(String, geom::P)>> = Default::default();
+    for f in &c.board.fps {
+        for pd in &f.pads {
+            if pd.net == 0 || only.as_ref().is_some_and(|o| !o.contains(&pd.net)) {
+                continue;
+            }
+            let (q, _) = f.pad_world(pd);
+            if region.is_some_and(|r| q.x < r.x0 || q.x > r.x1 || q.y < r.y0 || q.y > r.y1) {
+                continue;
+            }
+            by_net
+                .entry(pd.net)
+                .or_default()
+                .push((format!("{}.{}", f.refd, pd.num), q));
+        }
+    }
+    let mut hints = Vec::new();
+    if !a.json() {
+        println!("net\tfrom\tto\taxis\toffset_mm\trun_mm");
+    }
+    for (net, pins) in &by_net {
+        let n = pins.len();
+        if !(2..=40).contains(&n) {
+            continue;
+        }
+        // Prim MST
+        let mut inq = vec![false; n];
+        let mut best = vec![(f64::INFINITY, 0usize); n];
+        best[0].0 = 0.0;
+        for _ in 0..n {
+            let Some(u) = (0..n)
+                .filter(|i| !inq[*i])
+                .min_by(|x, y| best[*x].0.total_cmp(&best[*y].0))
+            else {
+                break;
+            };
+            inq[u] = true;
+            if u != 0 {
+                let v = best[u].1;
+                let d = pins[u].1 - pins[v].1;
+                let (ax, ay) = (d.x.abs(), d.y.abs());
+                let (off, run, axis) = if ax < ay {
+                    (ax, ay, "x")
+                } else {
+                    (ay, ax, "y")
+                };
+                if off > 0.02 && off < tol && run >= 0.5 {
+                    if !a.json() {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{:.3}\t{:.3}",
+                            c.board.nets[*net], pins[v].0, pins[u].0, axis, off, run
+                        );
+                    }
+                    hints.push(json!({"net": c.board.nets[*net], "from": pins[v].0, "to": pins[u].0, "axis": axis, "offset_mm": geom_r(off), "run_mm": geom_r(run)}));
+                }
+            }
+            for w in 0..n {
+                if !inq[w] {
+                    let d = (pins[w].1 - pins[u].1).len();
+                    if d < best[w].0 {
+                        best[w] = (d, u);
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[hints] {} near-collinear pad pairs (offset 0.02..{} mm): align them in placement",
+        hints.len(),
+        tol
+    );
+    Ok(json!({"tol_mm": tol, "count": hints.len(), "hints": hints}))
+}
+
+/// route --pcb B [--region x0,y0,x1,y1] [--nets pats] [--res 0.05] [--drc] --out OUT.kicad_pcb
+fn cmd_route(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let region = match a.get("region") {
+        Some(s) => parse_box(s)?,
+        None => {
+            // whole board: the outline's bounding box
+            let b = c.board.bbox;
+            if b.x1 <= b.x0 || b.y1 <= b.y0 {
+                return Err("the board has no Edge.Cuts outline: give --region x0,y0,x1,y1".into());
+            }
+            b
+        }
+    };
+    let out = a.s("out", "routed.kicad_pcb");
+    if !out.ends_with(".kicad_pcb") {
+        return Err(format!(
+            "--out {out}: the output file must end in .kicad_pcb"
+        ));
+    }
+    if std::path::Path::new(&out).canonicalize().ok()
+        == std::path::Path::new(&c.pcb).canonicalize().ok()
+    {
+        return Err("--out must differ from --pcb (the input board is never overwritten)".into());
+    }
+    let m = model::Model::new(
+        &c.board,
+        &c.rules,
+        c.cfg.clone(),
+        model::CopperMode::LockedOnly,
+    );
+    let mut p = droute::DParams::default();
+    p.res = a.f("res", p.res);
+    p.via_cost = a.f("via-cost", p.via_cost as f64) as f32;
+    p.hweight = a.f("hweight", p.hweight as f64) as f32;
+    p.max_expand = a.f("max-expand", p.max_expand as f64) as u64;
+    p.job_margin = a.f("job-margin", p.job_margin);
+    p.nego_iters = a.f("iters", p.nego_iters as f64) as usize;
+    p.bend_cost = a.f("bend-cost", p.bend_cost as f64) as f32;
+    p.bend90 = a.f("bend90", p.bend90 as f64) as f32;
+    p.stub_ext = a.f("stub-ext", p.stub_ext);
+    p.stub_ext_long = a.f("stub-ext-long", p.stub_ext_long);
+    p.own_pad_cost = a.f("own-pad-cost", p.own_pad_cost as f64) as f32;
+    p.stub_side_cost = a.f("stub-side-cost", p.stub_side_cost as f64) as f32;
+    p.stubs = a.get("no-stubs").is_none();
+    p.clean = a.get("no-clean").is_none();
+    let filt = net_filter(a, &c.board.nets);
+    let t = Instant::now();
+    let mut r = droute::Router::new(&m, region, p.clone(), filt.as_ref());
+    let mut res = r.run();
+    // fallback ladder when the cleanup's geometry costs completeness: no sliding, then no cleanup
+    // (completeness first; the level used is reported)
+    let mut level = "full";
+    if !res.failed.is_empty() && p.clean {
+        for (lv, slide, clean) in [("no-slide", false, true), ("no-clean", false, false)] {
+            let mut p2 = p.clone();
+            p2.slide = slide;
+            p2.clean = clean;
+            let r2 = droute::Router::new(&m, region, p2, filt.as_ref());
+            let res2 = r2.run();
+            eprintln!(
+                "[route] fallback {}: {} failed nets (was {})",
+                lv,
+                res2.failed.len(),
+                res.failed.len()
+            );
+            if res2.failed.len() < res.failed.len() {
+                r = r2;
+                res = res2;
+                level = lv;
+            }
+            if res.failed.is_empty() {
+                break;
+            }
+        }
+    }
+    eprintln!("[route] cleanup level {}", level);
+    let dt = t.elapsed().as_secs_f64();
+    let nseg: usize = res.routed.values().map(|x| x.segs.len()).sum();
+    let nvia: usize = res.routed.values().map(|x| x.vias.len()).sum();
+    let len: f64 = res
+        .routed
+        .values()
+        .flat_map(|x| x.segs.iter())
+        .map(|s| (s.b - s.a).len())
+        .sum();
+    eprintln!("[route] {} nets, {} connections: {} segments ({:.1} mm), {} vias, {} routes, {} rips, {:.1} M nodes expanded, search {:.2} s",
+        r.jobs.len(), res.conns, nseg, len, nvia, res.routes, res.rips, res.expanded as f64 * 1e-6, dt);
+    let s = &res.stats;
+    eprintln!("[aes] pins {} without legal stub {} {:?}; stub ends {}, short stubs {:?}, fallback pad ends {}; stub alignments {} (failed {}), pull-tights {}, mitered {} (kept 90: {} = clearance/L-stubs/shift-blocked/Z-U-short/short-legs {:?}, stub-end shifts {}), exact-check fails {}",
+        s.pins, s.pins_no_stub.len(), s.pins_no_stub, s.stubs_used, s.short_stubs, s.fallback_ends, s.aligned, s.align_failed, s.pulls, s.mitered, s.miter_failed, s.kept90, s.shifted, s.exact_fail);
+    let mut warnings: Vec<String> = Vec::new();
+    for (n, left) in &res.failed {
+        eprintln!(
+            "[route]   FAILED {} ({} components left)",
+            c.board.nets[*n], left
+        );
+        warnings.push(format!(
+            "net {} not completed ({} components left)",
+            c.board.nets[*n], left
+        ));
+    }
+    if level != "full" {
+        warnings.push(format!(
+            "cleanup fallback level '{level}' was needed for completeness"
+        ));
+    }
+    if !s.pins_no_stub.is_empty() {
+        warnings.push(format!(
+            "{} pins without a legal straight exit stub",
+            s.pins_no_stub.len()
+        ));
+    }
+    if s.exact_fail > 0 {
+        warnings.push(format!(
+            "{} exact-check failures in the cleanup",
+            s.exact_fail
+        ));
+    }
+    if let Some(dn) = a.get("dbg-net") {
+        if let Some(n) = c.board.net_id.get(dn) {
+            let d = std::path::Path::new(&out)
+                .parent()
+                .map(|d| d.to_string_lossy().to_string())
+                .unwrap_or_default();
+            r.debug_images(*n, &res, if d.is_empty() { "." } else { &d });
+        }
+    }
+    write_file(&out, "")?; // creates the output directory
+    droute::write_pcb(&c.board.text, &c.board.nets, &res, &out)
+        .map_err(|e| format!("{out}: {e}"))?;
+    for (src, ext) in [(&c.pro, "kicad_pro"), (&c.dru, "kicad_dru")] {
+        if std::path::Path::new(src).is_file() {
+            std::fs::copy(src, out.replace(".kicad_pcb", &format!(".{ext}")))
+                .map_err(|e| format!("{src}: {e}"))?;
+        }
+    }
+    // opens counted on the written board (all copper, routed region and nets only)
+    let mut a2 = Args {
+        cmd: a.cmd.clone(),
+        kv: a.kv.clone(),
+    };
+    a2.kv.insert("pcb".into(), out.clone());
+    a2.kv.remove("pro");
+    a2.kv.remove("dru");
+    let c2 = load_ctx(&a2)?;
+    let (opens, open_nets) = count_opens(&c2, Some(region), filt.as_ref());
+    let drc = if a.get("drc").is_some() {
+        Some(drc_delta(a, &c.pcb, &out)?)
+    } else {
+        None
+    };
+    if let Some(d) = &drc {
+        let (n, ne) = (
+            d["new_violations"].as_u64().unwrap_or(0),
+            d["new_errors"].as_u64().unwrap_or(0),
+        );
+        eprintln!(
+            "[drc] kicad-cli: {} new violations ({} errors), unconnected {} -> {}",
+            n, ne, d["unconnected_before"], d["unconnected_after"]
+        );
+        if n > 0 {
+            warnings.push(format!("kicad-cli DRC: {n} new violations ({ne} errors)"));
+        }
+    }
+    let summary = json!({
+        "out": out, "nets": r.jobs.len(), "connections": res.conns, "segments": nseg, "vias": nvia, "length_mm": check::round2(len),
+        "routes": res.routes, "rips": res.rips, "opens": opens,
+        "open_nets": open_nets.iter().map(|(n, k)| json!({"net": n, "opens": k})).collect::<Vec<_>>(),
+        "aes": {"cleanup_level": level, "pins": s.pins, "pins_no_stub": s.pins_no_stub, "stub_ends": s.stubs_used, "short_stubs": s.short_stubs, "fallback_ends": s.fallback_ends, "aligned": s.aligned, "align_failed": s.align_failed, "pulls": s.pulls, "mitered": s.mitered, "miter_kept_90": s.miter_failed, "stub_end_shifts": s.shifted, "axis_jogs": s.jogs, "kept90_by_cause": {"clearance": s.kept90[0], "L_between_stubs": s.kept90[1], "shift_blocked": s.kept90[2], "Z_U_too_short": s.kept90[3], "short_legs": s.kept90[4]}, "exact_fail": s.exact_fail},
+        "drc": drc, "search_s": check::round2(dt),
+        "failed": res.failed.iter().map(|(n, l)| json!([c.board.nets[*n], l])).collect::<Vec<_>>(),
+        "warnings": warnings,
+    });
+    write_file(
+        &out.replace(".kicad_pcb", "_route.json"),
+        &serde_json::to_string_pretty(&summary).unwrap_or_default(),
+    )?;
+    eprintln!("[route] {opens} opens -> {out}");
+    Ok(summary)
+}
+
+/// kicad-cli DRC on the input and the routed board; violations only the routed board has.
+/// kicad-cli: --kicad-cli PATH, else $KICAD_CLI, else `kicad-cli` on the PATH.
+fn drc_delta(a: &Args, before: &str, after: &str) -> Result<Value, String> {
+    let cli = a
+        .get("kicad-cli")
+        .map(String::from)
+        .or_else(|| std::env::var("KICAD_CLI").ok())
+        .unwrap_or_else(|| "kicad-cli".into());
+    let run = |pcb: &str, rep: &str| -> Result<Value, String> {
+        let st = std::process::Command::new(&cli)
+            .args([
+                "pcb",
+                "drc",
+                "--format",
+                "json",
+                "--severity-all",
+                "-o",
+                rep,
+                pcb,
+            ])
+            .output()
+            .map_err(|e| {
+                format!("--drc: cannot run '{cli}': {e} (set --kicad-cli or $KICAD_CLI)")
+            })?;
+        let txt = std::fs::read_to_string(rep).map_err(|_| {
+            format!(
+                "--drc: kicad-cli wrote no report for {pcb}: {}",
+                String::from_utf8_lossy(&st.stderr).trim()
+            )
+        })?;
+        serde_json::from_str(&txt).map_err(|e| format!("{rep}: {e}"))
+    };
+    let base = after.replace(".kicad_pcb", "_drc_before.json");
+    let new = after.replace(".kicad_pcb", "_drc_after.json");
+    let (b, n) = (run(before, &base)?, run(after, &new)?);
+    let keys = |d: &Value| -> HashMap<String, usize> {
+        let mut m = HashMap::new();
+        for v in d["violations"].as_array().into_iter().flatten() {
+            let mut items: Vec<String> = v["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|i| i["description"].as_str().unwrap_or("").to_string())
+                .collect();
+            items.sort();
+            *m.entry(format!(
+                "{} {} | {}",
+                v["severity"].as_str().unwrap_or(""),
+                v["type"].as_str().unwrap_or(""),
+                items.join(" / ")
+            ))
+            .or_insert(0) += 1;
+        }
+        m
+    };
+    let (kb, kn) = (keys(&b), keys(&n));
+    let mut added: Vec<String> = Vec::new();
+    for (k, cnt) in &kn {
+        for _ in kb.get(k).copied().unwrap_or(0)..*cnt {
+            added.push(k.clone());
+        }
+    }
+    added.sort();
+    let unc = |d: &Value| {
+        d["unconnected_items"]
+            .as_array()
+            .map(|v| v.len())
+            .unwrap_or(0)
+    };
+    Ok(json!({
+        "violations_before": kb.values().sum::<usize>(), "violations_after": kn.values().sum::<usize>(),
+        "new_violations": added.len(), "new_errors": added.iter().filter(|k| k.starts_with("error ")).count(),
+        "new": added.iter().take(50).collect::<Vec<_>>(),
+        "unconnected_before": unc(&b), "unconnected_after": unc(&n), "reports": [base, new],
+    }))
+}
+
+/// opens --pcb B [--region box] [--nets pats]: unconnected connections counted from copper (all copper)
+fn cmd_opens(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let (total, per) = count_opens(
+        &c,
+        a.get("region").map(parse_box).transpose()?,
+        net_filter(a, &c.board.nets).as_ref(),
+    );
+    if !a.json() {
+        for (n, k) in &per {
+            println!("{n}\t{k}");
+        }
+        println!("OPENS\t{total}");
+    }
+    Ok(
+        json!({"opens": total, "per_net": per.iter().map(|(n, k)| json!({"net": n, "opens": k})).collect::<Vec<_>>()}),
+    )
+}
+
+/// unconnected connections (copper components - 1) per routable net
+fn count_opens(
+    c: &Ctx,
+    region: Option<geom::BBox>,
+    filt: Option<&std::collections::HashSet<usize>>,
+) -> (usize, Vec<(String, usize)>) {
+    let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
+    let pins = model::pins_by_net(&m);
+    let mut total = 0;
+    let mut per = Vec::new();
+    let mut keys: Vec<&usize> = pins.keys().collect();
+    keys.sort();
+    for &n in keys {
+        if filt.is_some_and(|f| !f.contains(&n)) {
+            continue;
+        }
+        let mut comps: Vec<usize> = pins[&n]
+            .iter()
+            .filter(|p| region.map(|r| r.contains(p.at)).unwrap_or(true))
+            .map(|p| p.comp)
+            .collect();
+        comps.sort();
+        comps.dedup();
+        if comps.len() > 1 {
+            total += comps.len() - 1;
+            per.push((c.board.nets[n].clone(), comps.len() - 1));
+        }
+    }
+    (total, per)
+}
