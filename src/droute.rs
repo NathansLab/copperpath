@@ -15,8 +15,7 @@ use crate::geom::*;
 use crate::model::*;
 use crate::sites::{track_map, via_map, R_FREE};
 use rayon::prelude::*;
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
 pub struct DParams {
@@ -314,6 +313,62 @@ pub struct AesStats {
     pub jogs: usize,
     pub kept90: [usize; 5],
     pub exact_fail: usize,
+}
+
+/// min-heap of u64 with four children per node: same pop order as a binary heap, fewer levels
+/// and cache misses per pop (the A* queue)
+#[derive(Default)]
+struct QHeap {
+    v: Vec<u64>,
+}
+
+impl QHeap {
+    #[inline]
+    fn push(&mut self, e: u64) {
+        let mut i = self.v.len();
+        self.v.push(e);
+        while i > 0 {
+            let p = (i - 1) / 4;
+            if self.v[p] <= e {
+                break;
+            }
+            self.v[i] = self.v[p];
+            i = p;
+        }
+        self.v[i] = e;
+    }
+    #[inline]
+    fn pop(&mut self) -> Option<u64> {
+        let last = self.v.pop()?;
+        let n = self.v.len();
+        if n == 0 {
+            return Some(last);
+        }
+        let top = self.v[0];
+        let mut i = 0;
+        loop {
+            let c = 4 * i + 1;
+            if c >= n {
+                break;
+            }
+            let mut m = c;
+            let mut mv = self.v[c];
+            for cc in c + 1..(c + 4).min(n) {
+                let x = self.v[cc];
+                if x < mv {
+                    m = cc;
+                    mv = x;
+                }
+            }
+            if mv >= last {
+                break;
+            }
+            self.v[i] = mv;
+            i = m;
+        }
+        self.v[i] = last;
+        Some(top)
+    }
 }
 
 const DIRS: [(i32, i32); 8] = [
@@ -1637,8 +1692,7 @@ impl<'a> Router<'a> {
         let mut fkey = vec![u32::MAX; total];
         // heuristic per (x, y), shared by all layers, computed on first use
         let hc = std::cell::RefCell::new(vec![f32::NAN; wn]);
-        let h = |i: usize| -> f32 {
-            let (x, y) = ((i as i32) % nxg, (i as i32) / nxg);
+        let h = |x: i32, y: i32| -> f32 {
             let ci = ((y - y0) as usize) * wx + (x - x0) as usize;
             let mut hc = hc.borrow_mut();
             if !hc[ci].is_nan() {
@@ -1657,7 +1711,9 @@ impl<'a> Router<'a> {
             let (x, y) = ((i as i32) % nxg, (i as i32) / nxg);
             x >= x0 && x <= x1 && y >= y0 && y <= y1
         };
-        let mut heap: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::new();
+        // heap entry: key in the high half, window node in the low half (ties: lower node first)
+        let mut heap = QHeap::default();
+        let ent = |fk: u32, ln: usize| ((fk as u64) << 32) | ln as u64;
         let key = |f: f32| (f * 64.0) as u32;
         for &(l, i) in src {
             if !inside(i) {
@@ -1668,16 +1724,14 @@ impl<'a> Router<'a> {
             if c0 < g[ln] {
                 g[ln] = c0;
                 indir[ln] = d0;
-                fkey[ln] = key(c0 + self.p.hweight * h(i));
-                heap.push(Reverse((fkey[ln], ln as u32)));
+                fkey[ln] = key(c0 + self.p.hweight * h((i as i32) % nxg, (i as i32) / nxg));
+                heap.push(ent(fkey[ln], ln));
             }
         }
         let dirpref = &self.m.cfg.layer_dir;
         let opc = self.p.own_pad_cost;
-        let cell_ok = |l: usize, i: usize| -> (bool, f32) {
-            let Some(w) = mp.li(self.gs.nx, i) else {
-                return (false, 0.0);
-            };
+        // the search window lies inside the net's map: w = map index of global cell i
+        let cell_ok = |l: usize, w: usize, i: usize| -> (bool, f32) {
             let own = if mp.own[w] & (1 << l) != 0 { opc } else { 0.0 };
             match nego {
                 Some((pres, hist)) => {
@@ -1699,9 +1753,9 @@ impl<'a> Router<'a> {
                     (true, cw.min(cn) + hist[l][i] + own)
                 }
                 None => {
-                    if self.wide_ok(k, o, l, i) {
+                    if mp.t[l][w] == R_FREE && o.t[l][w] == 0 {
                         (true, own)
-                    } else if self.narrow_ok(k, o, l, i) {
+                    } else if mp.neck[w] && mp.tn[l][w] == R_FREE && o.tn[l][w] == 0 {
                         (true, self.p.narrow_cost + own)
                     } else {
                         (false, 0.0)
@@ -1725,14 +1779,20 @@ impl<'a> Router<'a> {
         let (jx1, jy1) = (jx0 + mp.g.nx as i32 - 1, jy0 + mp.g.ny as i32 - 1);
         let clipped = mp.g.nx < self.gs.nx || mp.g.ny < self.gs.ny;
         let mut edge = false;
-        while let Some(Reverse((fk, ln))) = heap.pop() {
-            let ln = ln as usize;
+        let (mox, moy, mnx) = (mp.ox as i32, mp.oy as i32, mp.g.nx as i32);
+        while let Some(e) = heap.pop() {
+            let (fk, ln) = ((e >> 32) as u32, (e & 0xffff_ffff) as usize);
             if fk != fkey[ln] {
                 continue;
             }
             fkey[ln] = u32::MAX - 1; // expanded; a later improvement pushes it again
-            let (l, i) = glob(ln);
-            let node = l * n + mp.li(self.gs.nx, i).unwrap();
+            let l = ln / wn;
+            let r = ln - l * wn;
+            let ry = r / wx;
+            let (x, y) = ((r - ry * wx) as i32 + x0, ry as i32 + y0);
+            let i = (y * nxg + x) as usize;
+            let wv = ((y - moy) * mnx + (x - mox)) as usize;
+            let node = l * n + wv;
             expanded += 1;
             if expanded > cap {
                 break;
@@ -1743,8 +1803,6 @@ impl<'a> Router<'a> {
                 break;
             }
             let gc = g[ln];
-            let x = (i as i32) % nxg;
-            let y = (i as i32) / nxg;
             edge |= x == jx0 || x == jx1 || y == jy0 || y == jy1;
             let din = indir[ln];
             for (d, (dx, dy)) in DIRS.iter().enumerate() {
@@ -1757,7 +1815,8 @@ impl<'a> Router<'a> {
                     continue; // no acute turns
                 }
                 let j = (yy * nxg + xx) as usize;
-                let (okj, extra) = cell_ok(l, j);
+                let wj = ((yy - moy) * mnx + (xx - mox)) as usize;
+                let (okj, extra) = cell_ok(l, wj, j);
                 if !okj {
                     continue;
                 }
@@ -1775,7 +1834,7 @@ impl<'a> Router<'a> {
                     }
                 }
                 c += bend(t) + extra;
-                let nj = l * n + mp.li(self.gs.nx, j).unwrap();
+                let nj = l * n + wj;
                 if tmark[nj] != 0 && !tree_mark[nj] {
                     if let Some(&(tc, td)) = tinfo.get(&nj) {
                         let t2 = tdir(d as u8, td);
@@ -1791,12 +1850,11 @@ impl<'a> Router<'a> {
                     g[nn] = ng;
                     par[nn] = ln as u32;
                     indir[nn] = d as u8;
-                    fkey[nn] = key(ng + hw * h(j));
-                    heap.push(Reverse((fkey[nn], nn as u32)));
+                    fkey[nn] = key(ng + hw * h(xx, yy));
+                    heap.push(ent(fkey[nn], nn));
                 }
             }
             // through via: legal for this net's via, landing cell must be legal on the new layer
-            let wv = mp.li(self.gs.nx, i).unwrap();
             let via_ok = mp.v[wv] == R_FREE && (nego.is_some() || o.v[wv] == 0);
             if via_ok {
                 let pen = match nego {
@@ -1807,11 +1865,11 @@ impl<'a> Router<'a> {
                     if l2 == l {
                         continue;
                     }
-                    let (okj, extra) = cell_ok(l2, i);
+                    let (okj, extra) = cell_ok(l2, wv, i);
                     if !okj {
                         continue;
                     }
-                    let nn = l2 * wn + (ln % wn);
+                    let nn = l2 * wn + r;
                     let nj = l2 * n + wv;
                     let mut tc = 0.0;
                     if tmark[nj] != 0 && !tree_mark[nj] {
@@ -1824,8 +1882,8 @@ impl<'a> Router<'a> {
                         g[nn] = ng;
                         par[nn] = ln as u32;
                         indir[nn] = 8;
-                        fkey[nn] = key(ng + hw * h(i));
-                        heap.push(Reverse((fkey[nn], nn as u32)));
+                        fkey[nn] = key(ng + hw * h(x, y));
+                        heap.push(ent(fkey[nn], nn));
                     }
                 }
             }
@@ -2527,6 +2585,28 @@ pub fn write_pcb(text: &str, nets: &[String], res: &DResult, out: &str) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qheap_pops_in_ascending_order() {
+        let mut h = QHeap::default();
+        let mut want = Vec::new();
+        let mut x = 12345u64;
+        for _ in 0..1000 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let e = x >> 40; // includes duplicates
+            h.push(e);
+            want.push(e);
+            if e.is_multiple_of(3) {
+                want.sort_unstable();
+                assert_eq!(h.pop(), Some(want.remove(0)));
+            }
+        }
+        want.sort_unstable();
+        let got: Vec<u64> = std::iter::from_fn(|| h.pop()).collect();
+        assert_eq!(got, want);
+    }
 
     fn seg(a: P, b: P) -> RSeg {
         RSeg {
