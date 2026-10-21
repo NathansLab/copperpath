@@ -241,11 +241,11 @@ fn edge_block(m: &Model, gs: &GridSpec, net: usize, r: f64, map: &mut [u8]) {
         );
     }
     // outside the outline
-    if let Some(outl) = m.b.edge.first() {
+    if !m.b.edge.is_empty() {
         for iy in 0..gs.ny {
             for ix in 0..gs.nx {
                 let i = gs.idx(ix, iy);
-                if map[i] == R_FREE && !point_in_poly(gs.center(ix, iy), outl) {
+                if map[i] == R_FREE && !m.b.inside(gs.center(ix, iy)) {
                     map[i] = K_EDGE;
                 }
             }

@@ -28,6 +28,7 @@ common options:
   --cfg config.json   board configuration (optional, see examples/config.json)
   --board NAME        entry under \"boards\" in the config
   --pro / --dru       project / custom rules file (default: next to the board)
+  --outline N         use only closed Edge.Cuts outline N (1-based, file order) of a panel
   --threads N         worker threads (default: all cores)
   --json              print one JSON result object to stdout (logs stay on stderr)
   --version           print version and git hash
@@ -144,7 +145,19 @@ pub fn load_ctx(a: &Args) -> Result<Ctx, String> {
     let pro = a.s("pro", &format!("{base}.kicad_pro"));
     let dru = a.s("dru", &format!("{base}.kicad_dru"));
     let t0 = Instant::now();
-    let board = board::load(&pcb)?;
+    let mut board = board::load(&pcb)?;
+    // panels: several closed outlines; each pin is judged against the outline containing it,
+    // --outline N restricts the board to one of them
+    let outer = board.outer_outlines().len();
+    if let Some(n) = a.get("outline") {
+        let n: usize = n
+            .parse()
+            .map_err(|_| format!("--outline {n}: expected a number from 1 to {outer}"))?;
+        board.select_outline(n)?;
+        eprintln!("[load] restricted to board outline {n} of {outer}");
+    } else if outer > 1 {
+        eprintln!("[load] {outer} board outlines (panel): each item is checked against the outline it lies in; --outline N selects one");
+    }
     // without a project file KiCad uses its default net class; do the same
     let pro = if std::path::Path::new(&pro).is_file() {
         pro

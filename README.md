@@ -194,7 +194,8 @@ same placed input):
 - Through vias only; no differential pairs, no length tuning; DRU max-length rules are only used by
   `place`.
 - Very long multi-pin nets are slow (millions of nodes per search); restrict with `--region`/`--nets`.
-- Panels with several board outlines must be split first.
+- Panels: every closed Edge.Cuts outline is its own board area (cut-outs inside an outline are
+  holes); `--outline N` (1-based, file order) restricts any command to one outline.
 - KiCad 6 or newer board files only; open and save older boards in KiCad first.
 - Uses more vias than Freerouting; tune `--via-cost` and `class_layers`.
 - Legality is exact at grid cell centres; off-grid pad centres are reached by stubs and verified

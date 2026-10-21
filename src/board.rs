@@ -595,8 +595,10 @@ fn courtyard(f: &List) -> Vec<P> {
         return polys.pop().unwrap();
     }
     if !lines.is_empty() && polys.is_empty() {
-        if let Some(ch) = chain(&lines) {
-            return ch;
+        let mut lp = chain(&lines);
+        // exactly one loop that uses every line
+        if lp.len() == 1 && lp[0].len() == lines.len() {
+            return lp.pop().unwrap();
         }
     }
     let mut all: Vec<P> = polys.into_iter().flatten().collect();
@@ -607,39 +609,100 @@ fn courtyard(f: &List) -> Vec<P> {
     hull(all)
 }
 
-/// chain line segments into one closed polygon if they form exactly one loop
-fn chain(lines: &[(P, P)]) -> Option<Vec<P>> {
+/// chain line segments into closed loops (several board outlines in one file, cut-outs);
+/// segments that close no loop are left out
+fn chain(lines: &[(P, P)]) -> Vec<Vec<P>> {
     let close = |a: P, b: P| (a - b).len() < 1e-4;
     let mut used = vec![false; lines.len()];
-    let mut poly = vec![lines[0].0, lines[0].1];
-    used[0] = true;
-    loop {
-        let last = *poly.last().unwrap();
-        let mut found = false;
-        for (i, (a, b)) in lines.iter().enumerate() {
-            if used[i] {
-                continue;
-            }
-            if close(*a, last) {
-                poly.push(*b);
-            } else if close(*b, last) {
-                poly.push(*a);
-            } else {
-                continue;
-            }
-            used[i] = true;
-            found = true;
-            break;
+    let mut loops = Vec::new();
+    for s0 in 0..lines.len() {
+        if used[s0] {
+            continue;
         }
-        if !found {
-            break;
+        let mut idx = vec![s0];
+        used[s0] = true;
+        let mut poly = vec![lines[s0].0, lines[s0].1];
+        loop {
+            if poly.len() > 2 && close(poly[0], *poly.last().unwrap()) {
+                break;
+            }
+            let last = *poly.last().unwrap();
+            let mut found = false;
+            for (i, (a, b)) in lines.iter().enumerate() {
+                if used[i] {
+                    continue;
+                }
+                if close(*a, last) {
+                    poly.push(*b);
+                } else if close(*b, last) {
+                    poly.push(*a);
+                } else {
+                    continue;
+                }
+                used[i] = true;
+                idx.push(i);
+                found = true;
+                break;
+            }
+            if !found {
+                break;
+            }
+        }
+        if poly.len() > 3 && close(poly[0], *poly.last().unwrap()) {
+            poly.pop();
+            loops.push(poly);
+        } else {
+            // open chain: release its segments (they stay plain edge segments)
+            for i in idx.into_iter().skip(1) {
+                used[i] = false;
+            }
         }
     }
-    if used.iter().all(|u| *u) && close(poly[0], *poly.last().unwrap()) {
-        poly.pop();
-        Some(poly)
-    } else {
-        None
+    loops
+}
+
+impl Board {
+    /// inside the board: inside an odd number of closed Edge.Cuts outlines (several outlines
+    /// side by side = a panel, an outline inside another = a cut-out); no outline = everywhere
+    pub fn inside(&self, q: P) -> bool {
+        self.edge.is_empty() || self.edge.iter().filter(|o| point_in_poly(q, o)).count() % 2 == 1
+    }
+    /// indices of the outer board outlines (closed outlines not inside another one), in file order
+    pub fn outer_outlines(&self) -> Vec<usize> {
+        (0..self.edge.len())
+            .filter(|&i| {
+                let q = self.edge[i][0];
+                !(0..self.edge.len()).any(|j| j != i && point_in_poly(q, &self.edge[j]))
+            })
+            .collect()
+    }
+    /// keep only outer outline `n` (1-based, see `outer_outlines`) and the cut-outs inside it;
+    /// edge segments and the board box shrink to it (`--outline N`)
+    pub fn select_outline(&mut self, n: usize) -> Result<(), String> {
+        let outer = self.outer_outlines();
+        let Some(&oi) = n.checked_sub(1).and_then(|k| outer.get(k)) else {
+            return Err(format!(
+                "--outline {n}: the board has {} closed Edge.Cuts outline(s)",
+                outer.len()
+            ));
+        };
+        let o = self.edge[oi].clone();
+        let mut bb = BBox::empty();
+        for q in &o {
+            bb.add(*q);
+        }
+        let near = bb.inflate(1e-3);
+        self.edge = self
+            .edge
+            .iter()
+            .enumerate()
+            .filter(|(i, pl)| *i == oi || point_in_poly(pl[0], &o))
+            .map(|(_, pl)| pl.clone())
+            .collect();
+        self.edge_segs
+            .retain(|(a, b)| near.contains(*a) && near.contains(*b));
+        self.bbox = bb;
+        Ok(())
     }
 }
 
@@ -875,9 +938,8 @@ pub fn parse_board(text: String) -> Result<Board, String> {
         }
     }
     if !b.edge_segs.is_empty() {
-        if let Some(ch) = chain(&b.edge_segs) {
-            b.edge.push(ch);
-        }
+        let loops = chain(&b.edge_segs);
+        b.edge.extend(loops);
     }
     let mut bb = BBox::empty();
     for poly in &b.edge {
