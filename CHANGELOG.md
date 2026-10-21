@@ -31,6 +31,9 @@ All notable changes to this project are documented here. The format follows
   (public benchmark boards: 114 s -> 79 s and 162 s -> 74 s).
 
 ### Added
+- `--time-limit S`, SIGTERM and Ctrl+C write the best result so far; `--json` gains `stopped`
+  and `hotspots`, the log prints the conflict hotspots; the fallback ladder is skipped when
+  out of time (#8).
 - `--yield-pours` / config `yield_pours`: locked pours that yield like unlocked ones (#0009).
 
 ## [0.1.0] - 2026-10-21
