@@ -20,6 +20,8 @@ use std::collections::{HashMap, HashSet};
 #[derive(Clone, Debug)]
 pub struct DParams {
     pub res: f64,
+    /// added to every required clearance of the maps and checks (mm); the default -EXACT_TOL lets
+    /// copper touch the clearance exactly
     pub margin: f64,
     pub neck: f64,
     pub via_cost: f32,
@@ -71,7 +73,7 @@ impl Default for DParams {
     fn default() -> Self {
         DParams {
             res: 0.05,
-            margin: 0.005,
+            margin: -EXACT_TOL,
             neck: 1.5,
             via_cost: 30.0,
             bend_cost: 4.0,
@@ -424,6 +426,85 @@ pub struct Router<'a> {
 }
 
 const OFF: [(f64, f64); 4] = [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)];
+/// float guard (mm) of the clearance checks: copper that touches the required clearance exactly is
+/// legal (KiCad flags only distances below it). Fine-pitch rows need this: a 0.2 mm track between
+/// 0.2 mm pads at 0.4 mm pitch (0.2 mm clearance) fits only exactly. Output is written in 1 nm steps.
+pub const EXACT_TOL: f64 = 1e-6;
+
+/// routing grid over `region` whose cell centres are shifted (less than one cell per axis) onto the
+/// pad axes of the tightest pin rows: an exit stub and the parallel tracks after it then run on cell
+/// centres. A pad votes with its coordinate across its long axis (both for square pads), weighted
+/// by 1 / pitch^2 to the nearest pad of its footprint; the default phase (region corner) stays
+/// unless another phase gets strictly more weight.
+fn phased_grid(m: &Model, region: BBox, res: f64, jobs: &[NetJob]) -> GridSpec {
+    let q = 1e-4; // phase bin (mm)
+    let nb = (res / q).round() as i64;
+    let bin = |phase: f64| ((phase / q).round() as i64).rem_euclid(nb);
+    let mut votes: [HashMap<i64, (f64, f64)>; 2] = [HashMap::new(), HashMap::new()];
+    for pn in jobs.iter().flat_map(|j| &j.pins) {
+        let f = &m.b.fps[pn.fp];
+        let pd = &f.pads[pn.pad];
+        let (c, a) = f.pad_world(pd);
+        let am = a.rem_euclid(90.0);
+        if am > 1e-6 && am < 90.0 - 1e-6 {
+            continue;
+        }
+        let pitch = f
+            .pads
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != pn.pad)
+            .map(|(_, o)| (f.pad_world(o).0 - c).len())
+            .filter(|d| *d > 1e-6)
+            .fold(f64::INFINITY, f64::min);
+        if !pitch.is_finite() {
+            continue;
+        }
+        let w = 1.0 / pitch.max(res).powi(2);
+        let (sw, sh) = pd.size;
+        let (wx, wy) = if (a.rem_euclid(180.0) - 90.0).abs() < 1.0 {
+            (sh, sw)
+        } else {
+            (sw, sh)
+        };
+        // [x matters, y matters]: across the long axis of an elongated pad, both for square ones
+        let lat = [wx < 1.2 * wy, wy < 1.2 * wx];
+        for (ax, coord) in [c.x, c.y].into_iter().enumerate() {
+            if lat[ax] {
+                let ph = (coord - 0.5 * res).rem_euclid(res);
+                votes[ax].entry(bin(ph)).or_insert((0.0, ph)).0 += w;
+            }
+        }
+    }
+    let score = |v: &HashMap<i64, (f64, f64)>, b: i64| -> f64 {
+        (-1..=1)
+            .filter_map(|d| v.get(&(b + d).rem_euclid(nb)))
+            .map(|e| e.0)
+            .sum()
+    };
+    let mut o = [region.x0, region.y0];
+    for (ax, v) in votes.iter().enumerate() {
+        let base = score(v, bin(o[ax].rem_euclid(res)));
+        let best = v
+            .iter()
+            .map(|(b, e)| (score(v, *b), *b, e.1))
+            .max_by(|x, y| x.0.total_cmp(&y.0).then(y.1.cmp(&x.1)));
+        if let Some((s, _, ph)) = best {
+            if s > base + 1e-9 {
+                o[ax] -= (o[ax] - ph).rem_euclid(res);
+            }
+        }
+    }
+    GridSpec::new(
+        BBox {
+            x0: o[0],
+            y0: o[1],
+            x1: region.x1,
+            y1: region.y1,
+        },
+        res,
+    )
+}
 
 #[inline]
 fn tdir(a: u8, b: u8) -> u8 {
@@ -438,18 +519,6 @@ impl<'a> Router<'a> {
         p: DParams,
         only_nets: Option<&HashSet<usize>>,
     ) -> Router<'a> {
-        let gs = GridSpec::new(region, p.res);
-        let gb = gs.bbox();
-        let mut maxd: f64 = 0.0;
-        for v in &m.r.mat[0] {
-            maxd = maxd.max(*v as f64);
-        }
-        let objs: Vec<Obj> = m
-            .objs
-            .iter()
-            .filter(|o| o.bbox.overlaps(&gb.inflate(maxd + 2.0)))
-            .cloned()
-            .collect();
         // connections: pins inside the region, nets with >= 2 copper components there
         let pins = pins_by_net(m);
         let mut jobs = Vec::new();
@@ -483,6 +552,18 @@ impl<'a> Router<'a> {
                 dr: vdr / 2.0,
             });
         }
+        let gs = phased_grid(m, region, p.res, &jobs);
+        let gb = gs.bbox();
+        let mut maxd: f64 = 0.0;
+        for v in &m.r.mat[0] {
+            maxd = maxd.max(*v as f64);
+        }
+        let objs: Vec<Obj> = m
+            .objs
+            .iter()
+            .filter(|o| o.bbox.overlaps(&gb.inflate(maxd + 2.0)))
+            .cloned()
+            .collect();
         let t = std::time::Instant::now();
         let jm = p.job_margin;
         let ck = Checker::new(m, &objs, maxd);
@@ -1221,7 +1302,7 @@ impl<'a> Router<'a> {
                 let job = &self.jobs[k];
                 let mut out = Vec::new();
                 for sg in &routed[k].segs {
-                    let hw = sg.w / 2.0;
+                    let hw = sg.w / 2.0 - EXACT_TOL;
                     if !ck.seg_ok_fixed(job.net, sg.a, sg.b, hw, sg.l)
                         || !ck.seg_ok_foreign(job.net, sg.a, sg.b, hw, sg.l, &fr)
                     {
