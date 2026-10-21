@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `movefp::move_footprints`: footprint move primitive for the board writer. Translates and rotates
+  footprints (about their origin) in the `.kicad_pcb` text: the footprint `at`, the absolute pad
+  and field angles and the board-coordinate outlines of rule areas inside the footprint change,
+  everything else stays byte for byte.
 - `route --reroute-blockers [--max-ripped 3] [--max-targets 10]`: for every net left open, the
   unlocked copper of other nets on its cheapest corridor (search with that copper passable at a
   high cost) is ripped and the net is rerouted together with the ripped nets; kept only if no
