@@ -13,9 +13,21 @@ use crate::board::*;
 use crate::clean::{self, Checker, End, FItem, Run};
 use crate::geom::{self, *};
 use crate::model::*;
-use crate::sites::{track_map, via_map, R_FREE};
+use crate::sites::{track_map, track_stamp, via_map, via_stamp, R_FREE};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+
+/// silences the router's progress lines (grid, iterations, hotspots) while set, e.g. while
+/// `nudge` routes thousands of small candidate windows
+pub static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+macro_rules! dlog {
+    ($($t:tt)*) => {
+        if !QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!($($t)*)
+        }
+    };
+}
 
 #[derive(Clone, Debug)]
 pub struct DParams {
@@ -532,12 +544,96 @@ fn tdir(a: u8, b: u8) -> u8 {
     d.min(8 - d)
 }
 
+/// blocker maps of the objects that stay while a few footprints move (`nudge`): one window per
+/// net (the region plus the job margin) on one grid, so a candidate placement only stamps the
+/// pads and mask apertures of the moving footprints into copies of these maps
+pub struct FixedMaps {
+    pub gs: GridSpec,
+    /// footprints (indices into the model's board) whose objects are stamped per candidate
+    pub moving: HashSet<usize>,
+    nets: HashMap<usize, FixedNet>,
+}
+
+struct FixedNet {
+    ox: usize,
+    oy: usize,
+    g: GridSpec,
+    t: Vec<Vec<u8>>,
+    tn: Vec<Vec<u8>>,
+    v: Vec<u8>,
+}
+
+fn is_moving(o: &Obj, mv: &HashSet<usize>) -> bool {
+    match o.kind {
+        Kind::Pad { fp, .. } | Kind::Mask { fp, .. } => mv.contains(&fp),
+        _ => false,
+    }
+}
+
 impl<'a> Router<'a> {
     pub fn new(
         m: &'a Model<'a>,
         region: BBox,
         p: DParams,
         only_nets: Option<&HashSet<usize>>,
+    ) -> Router<'a> {
+        Self::build(m, region, p, only_nets, None, None)
+    }
+
+    /// a router that reuses `fixed` (built by [`Router::fixed_maps`] on the same board with the
+    /// moving footprints elsewhere): only the moving footprints' objects are stamped anew
+    pub fn new_with(
+        m: &'a Model<'a>,
+        region: BBox,
+        p: DParams,
+        only_nets: Option<&HashSet<usize>>,
+        fixed: &FixedMaps,
+    ) -> Router<'a> {
+        Self::build(m, region, p, only_nets, Some(fixed), None)
+    }
+
+    /// the maps of everything but the `moving` footprints' pads and mask apertures, per net of
+    /// the region (see [`FixedMaps`])
+    pub fn fixed_maps(
+        m: &Model,
+        region: BBox,
+        p: DParams,
+        only_nets: Option<&HashSet<usize>>,
+        moving: HashSet<usize>,
+    ) -> FixedMaps {
+        let r = Router::build(m, region, p, only_nets, None, Some(&moving));
+        let nets = r
+            .jobs
+            .iter()
+            .zip(r.maps)
+            .map(|(j, mp)| {
+                (
+                    j.net,
+                    FixedNet {
+                        ox: mp.ox,
+                        oy: mp.oy,
+                        g: mp.g,
+                        t: mp.t,
+                        tn: mp.tn,
+                        v: mp.v,
+                    },
+                )
+            })
+            .collect();
+        FixedMaps {
+            gs: r.gs,
+            moving,
+            nets,
+        }
+    }
+
+    fn build(
+        m: &'a Model<'a>,
+        region: BBox,
+        p: DParams,
+        only_nets: Option<&HashSet<usize>>,
+        fixed: Option<&FixedMaps>,
+        exclude: Option<&HashSet<usize>>,
     ) -> Router<'a> {
         // connections: pins inside the region, nets with >= 2 copper components there
         let (pins, copper) = pins_and_copper(m);
@@ -616,7 +712,10 @@ impl<'a> Router<'a> {
                 copper: cu,
             });
         }
-        let gs = phased_grid(m, region, p.res, &jobs);
+        let gs = match fixed {
+            Some(f) => f.gs,
+            None => phased_grid(m, region, p.res, &jobs),
+        };
         let gb = gs.bbox();
         let mut maxd: f64 = 0.0;
         for v in &m.r.mat[0] {
@@ -634,9 +733,14 @@ impl<'a> Router<'a> {
         let ms: Vec<(NetMaps, Vec<Stub>)> = jobs
             .par_iter()
             .map(|j| {
+                let base = fixed.and_then(|f| f.nets.get(&j.net));
                 let mut bb = BBox::empty();
                 for pn in &j.pins {
                     bb.add(pn.at);
+                }
+                if exclude.is_some() {
+                    // fixed maps: one window for every placement of the moving parts
+                    bb = region;
                 }
                 // existing copper of the components (clipped to the region) can be a start too
                 for sd in j.copper.iter().filter(|s| !s.fill) {
@@ -653,13 +757,17 @@ impl<'a> Router<'a> {
                 let oy = (((bb.y0 - gs.y0) / gs.res).floor().max(0.0) as usize).min(gs.ny - 1);
                 let ex = (((bb.x1 - gs.x0) / gs.res).ceil().max(0.0) as usize).clamp(ox + 1, gs.nx);
                 let ey = (((bb.y1 - gs.y0) / gs.res).ceil().max(0.0) as usize).clamp(oy + 1, gs.ny);
-                let g = GridSpec {
+                let mut g = GridSpec {
                     x0: gs.x0 + ox as f64 * gs.res,
                     y0: gs.y0 + oy as f64 * gs.res,
                     res: gs.res,
                     nx: ex - ox,
                     ny: ey - oy,
                 };
+                let (mut ox, mut oy) = (ox, oy);
+                if let Some(nb) = base {
+                    (ox, oy, g) = (nb.ox, nb.oy, nb.g);
+                }
                 let wb = g.bbox().inflate(maxd + 2.0);
                 // locked pours of the net's own class (e.g. a guard pour of the same class) refill
                 // around this net's copper with their own clearance -> not an obstacle
@@ -668,6 +776,7 @@ impl<'a> Router<'a> {
                     .iter()
                     .filter(|o| {
                         o.bbox.overlaps(&wb)
+                            && !exclude.is_some_and(|mv| is_moving(o, mv))
                             && !(p.yield_same_class
                                 && matches!(o.kind, Kind::Zone)
                                 && o.net != 0 // net-less copper never refills
@@ -676,13 +785,32 @@ impl<'a> Router<'a> {
                     .cloned()
                     .collect();
                 let objs = &objs;
-                let t: Vec<Vec<u8>> = (0..NL)
-                    .map(|l| track_map(m, &g, j.net, j.hw + p.margin, l, objs))
-                    .collect();
-                let tn: Vec<Vec<u8>> = (0..NL)
-                    .map(|l| track_map(m, &g, j.net, j.hn + p.margin, l, objs))
-                    .collect();
-                let v = via_map(m, &g, j.net, j.vr + p.margin, j.dr, objs);
+                let (t, tn, v) = match (base, fixed) {
+                    (Some(nb), Some(f)) => {
+                        // stamp only the moving footprints into copies of the fixed maps
+                        let dynv: Vec<Obj> = objs
+                            .iter()
+                            .filter(|o| is_moving(o, &f.moving))
+                            .cloned()
+                            .collect();
+                        let (mut t, mut tn, mut v) = (nb.t.clone(), nb.tn.clone(), nb.v.clone());
+                        for l in 0..NL {
+                            track_stamp(m, &g, j.net, j.hw + p.margin, l, &dynv, &mut t[l]);
+                            track_stamp(m, &g, j.net, j.hn + p.margin, l, &dynv, &mut tn[l]);
+                        }
+                        via_stamp(m, &g, j.net, j.vr + p.margin, j.dr, &dynv, &mut v);
+                        (t, tn, v)
+                    }
+                    _ => (
+                        (0..NL)
+                            .map(|l| track_map(m, &g, j.net, j.hw + p.margin, l, objs))
+                            .collect(),
+                        (0..NL)
+                            .map(|l| track_map(m, &g, j.net, j.hn + p.margin, l, objs))
+                            .collect(),
+                        via_map(m, &g, j.net, j.vr + p.margin, j.dr, objs),
+                    ),
+                };
                 let mut neck = vec![false; g.n()];
                 // courtyard neck-down rule: narrow width inside those courtyards only
                 for &fi in &j.neck_fps {
@@ -726,7 +854,7 @@ impl<'a> Router<'a> {
             })
             .collect();
         let (maps, stubs): (Vec<NetMaps>, Vec<Vec<Stub>>) = ms.into_iter().unzip();
-        eprintln!(
+        dlog!(
             "[droute] grid {}x{} @ {} mm, {} objects, {} nets to route, window cells {:.1} M, fixed maps in {:.2} s",
             gs.nx,
             gs.ny,
@@ -1093,7 +1221,7 @@ impl<'a> Router<'a> {
                 for (k, r, st, dt) in rs {
                     if dt > 2.0 {
                         let mp = &self.maps[k];
-                        eprintln!(
+                        dlog!(
                             "[droute]   slow net {}: {:.1} s, {} pins, window {}x{}, wave of {}, left {}",
                             self.m.b.nets[self.jobs[k].net],
                             dt,
@@ -1123,7 +1251,7 @@ impl<'a> Router<'a> {
             // conflicts of every net against all others
             let conf = self.conflicts(&routed, &cells, &vias);
             let total: usize = conf.iter().map(|c| c.len()).sum();
-            eprintln!(
+            dlog!(
                 "[droute] iter {it}: {} nets in {:.1} s, conflict cells {total}, nets in conflict {}, unrouted comps {}",
                 need.len(),
                 t_it.elapsed().as_secs_f64(),
@@ -1154,7 +1282,7 @@ impl<'a> Router<'a> {
                 if let Some(b) = best.take() {
                     if b.0 < total {
                         (routed, cells, vias, left) = (b.1, b.2, b.3, b.4);
-                        eprintln!(
+                        dlog!(
                             "[droute] stopped: back to the best iteration ({} conflict cells)",
                             b.0
                         );
@@ -1175,9 +1303,13 @@ impl<'a> Router<'a> {
             if total == 0 || it + 1 >= self.p.nego_iters || stalled || out_of_time {
                 hotspots = self.hotspots(&conf);
                 for h in hotspots.iter().take(10) {
-                    eprintln!(
+                    dlog!(
                         "[droute] hotspot {}: {} conflict cells around ({:.2}, {:.2}) {}",
-                        self.m.b.nets[h.net], h.cells, h.x, h.y, h.layer
+                        self.m.b.nets[h.net],
+                        h.cells,
+                        h.x,
+                        h.y,
+                        h.layer
                     );
                 }
                 if total > 0 && dbg {

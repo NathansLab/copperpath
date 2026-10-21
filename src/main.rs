@@ -1,7 +1,8 @@
 //! copperpath command line: check, place, route, opens, hints, pads, netclass (see README.md).
 
 use copperpath::{
-    board, check, droute, fanout, geom, groute, model, place, reroute, rules, sch, sites, stitch,
+    board, check, droute, fanout, geom, groute, model, nudge, place, reroute, rules, sch, sites,
+    stitch,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -27,6 +28,7 @@ commands:
   netclass  net -> net class table (tab separated)
   stitch    stitching vias for pour islands of a plane net (--net --zones --plane --out)
   fanout    track + via from every open island of a plane net to its plane (--net --plane --out)
+  nudge     move small parts locally until their nets route (--parts R5,R7 | --spec | --auto --out)
 
 common options:
   --cfg config.json   board configuration (optional, see examples/config.json)
@@ -239,6 +241,7 @@ fn main() {
         "netclass" => cmd_netclass(&a),
         "stitch" => cmd_stitch(&a),
         "fanout" => cmd_fanout(&a),
+        "nudge" => cmd_nudge(&a),
         "" => Err(format!("no command given\n{USAGE}")),
         c => Err(format!("unknown command '{c}'\n{USAGE}")),
     };
@@ -278,8 +281,8 @@ fn main() {
     }
 }
 
-const KNOWN: [&str; 9] = [
-    "check", "place", "route", "opens", "pads", "hints", "netclass", "stitch", "fanout",
+const KNOWN: [&str; 10] = [
+    "check", "place", "route", "opens", "pads", "hints", "netclass", "stitch", "fanout", "nudge",
 ];
 
 fn write_file(path: &str, data: &str) -> Result<(), String> {
@@ -1616,4 +1619,242 @@ fn count_opens(
         }
     }
     (total, per)
+}
+
+/// comma separated numbers
+fn num_list(s: &str, what: &str) -> Result<Vec<f64>, String> {
+    s.split(',')
+        .filter(|x| !x.trim().is_empty())
+        .map(|x| x.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| format!("--{what} {s}: expected comma separated numbers"))
+}
+
+/// nudge --pcb B (--parts R5,R7 [--range 1] [--step 0.05] [--rots 0,90] | --spec moves.json |
+/// --auto [--auto-dist 3] [--auto-max 4]) [--nets pats] [--rip region|attached|none]
+/// [--region x0,y0,x1,y1] [--margin 2] [--time-limit 60] [--max-cands N] [--dry-run] [--drc]
+/// --out OUT.kicad_pcb
+fn cmd_nudge(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let mut spec: nudge::Spec = match a.get("spec") {
+        Some(f) => {
+            let t = std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?;
+            serde_json::from_str(&t).map_err(|e| format!("{f}: {e}"))?
+        }
+        None => nudge::Spec::default(),
+    };
+    if let Some(v) = a.get("range") {
+        spec.range = v.parse().map_err(|_| format!("--range {v}: expected mm"))?;
+    }
+    if let Some(v) = a.get("step") {
+        spec.step = v.parse().map_err(|_| format!("--step {v}: expected mm"))?;
+    }
+    if let Some(v) = a.get("rots") {
+        spec.drot = num_list(v, "rots")?;
+    }
+    if let Some(v) = a.get("margin") {
+        spec.margin = v
+            .parse()
+            .map_err(|_| format!("--margin {v}: expected mm"))?;
+    }
+    if a.get("move-locked").is_some() {
+        spec.move_locked = true;
+    }
+    if let Some(v) = a.get("rip") {
+        spec.rip = v.to_string();
+    }
+    if let Some(v) = a.get("nets") {
+        spec.nets = Some(v.split(',').map(String::from).collect());
+    }
+    if let Some(v) = a.get("region") {
+        let bb = parse_box(v)?;
+        spec.region = Some([bb.x0, bb.y0, bb.x1, bb.y1]);
+    }
+    let mut parts: Vec<String> = a
+        .get("parts")
+        .map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    if a.get("auto").is_some() {
+        let rg = spec.region.map(|r| geom::BBox {
+            x0: r[0],
+            y0: r[1],
+            x1: r[2],
+            y1: r[3],
+        });
+        let found = nudge::auto_parts(
+            &c.board,
+            &c.rules,
+            &c.cfg,
+            rg,
+            a.f("auto-dist", 3.0),
+            a.u("auto-max", 4),
+        );
+        eprintln!("[nudge] --auto picked {:?}", found);
+        parts.extend(found);
+    }
+    for r in parts {
+        if !spec.parts.iter().any(|p| p.refd == r) {
+            spec.parts.push(nudge::PartSpec {
+                refd: r,
+                ..Default::default()
+            });
+        }
+    }
+    if spec.parts.is_empty() {
+        return Err(if a.get("auto").is_some() {
+            "--auto found no 2-pad SMD part near an open connection".into()
+        } else {
+            "no movable parts: give --parts R5,R7, --spec moves.json or --auto".into()
+        });
+    }
+    let dry = a.get("dry-run").is_some();
+    let out = if dry {
+        String::new()
+    } else {
+        out_path(a, &c, "nudged.kicad_pcb")?
+    };
+    let mut o = nudge::Opts {
+        time_limit: a.f("time-limit", 60.0),
+        max_cands: a.u("max-cands", 20000),
+        coarse: a.u("coarse", 9),
+        clean_search: a.get("clean-search").is_some(),
+        ..Default::default()
+    };
+    let p = &mut o.params;
+    p.res = a.f("res", p.res);
+    p.via_cost = a.f("via-cost", p.via_cost as f64) as f32;
+    p.job_margin = a.f("job-margin", 3.0);
+    p.max_expand = a.f("max-expand", 400_000.0) as u64;
+    p.nego_iters = a.u("iters", 8);
+    droute::install_stop_handler();
+    eprintln!(
+        "[nudge] {} parts: {}",
+        spec.parts.len(),
+        spec.parts
+            .iter()
+            .map(|p| p.refd.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let res = nudge::run(&c.board, &c.rules, &c.cfg, &spec, &o)?;
+    let names =
+        |v: &[usize]| -> Vec<String> { v.iter().map(|n| c.board.nets[*n].clone()).collect() };
+    eprintln!(
+        "[nudge] region {:.2},{:.2},{:.2},{:.2}, {} nets {:?}, {} ripped items, {} opens before",
+        res.region.x0,
+        res.region.y0,
+        res.region.x1,
+        res.region.y1,
+        res.nets.len(),
+        names(&res.nets),
+        res.ripped.len(),
+        res.opens_before
+    );
+    eprintln!(
+        "[nudge] {} candidates routed ({} infeasible skipped), {:.1} ms per candidate (wall, {} threads), search {:.2} s{}",
+        res.evaluated,
+        res.infeasible,
+        res.route_ms,
+        rayon::current_num_threads(),
+        res.search_s,
+        res.stopped.map(|s| format!(", stopped: {s}")).unwrap_or_default()
+    );
+    let improved = res.improves();
+    let moves: Vec<Value> = res
+        .moves
+        .iter()
+        .map(|(r, a0, r0, a1, r1)| {
+            json!({"ref": r, "from": [geom_r(a0.x), geom_r(a0.y), geom_r(*r0)], "to": [geom_r(a1.x), geom_r(a1.y), geom_r(*r1)],
+                "dx": geom_r(a1.x - a0.x), "dy": geom_r(a1.y - a0.y), "drot": geom_r(copperpath::movefp::norm_angle(r1 - r0))})
+        })
+        .collect();
+    for m in &moves {
+        eprintln!("[nudge]   {}: {} -> {}", m["ref"], m["from"], m["to"]);
+    }
+    let best = res.best.as_ref();
+    let failed: HashMap<usize, usize> = best
+        .map(|b| b.failed.iter().copied().collect())
+        .unwrap_or_default();
+    let per_net: Vec<Value> = res
+        .nets
+        .iter()
+        .map(|n| json!({"net": c.board.nets[*n], "opens_before": res.open_before.get(n).copied().unwrap_or(0), "opens_after": failed.get(n).copied().unwrap_or(0)}))
+        .collect();
+    let mut summary = json!({
+        "improved": improved,
+        "opens_before": res.opens_before,
+        "score": best.map(|b| json!({"opens": b.opens, "length_mm": check::round2(b.length), "vias": b.vias, "moved_mm": geom_r(b.moved), "rotated": b.rotated, "cost": check::round2(b.cost)})),
+        "moves": moves,
+        "nets": per_net,
+        "ripped_items": res.ripped.len(),
+        "region": [geom_r(res.region.x0), geom_r(res.region.y0), geom_r(res.region.x1), geom_r(res.region.y1)],
+        "candidates": res.evaluated, "infeasible": res.infeasible,
+        "route_ms_per_candidate": check::round2(res.route_ms),
+        "search_s": check::round2(res.search_s),
+        "stopped": res.stopped,
+        "log": res.log,
+        "dry_run": dry,
+        "written": false,
+    });
+    if !improved {
+        eprintln!(
+            "[nudge] no candidate beats the board as it is ({} opens): nothing written",
+            res.opens_before
+        );
+        return Ok(summary);
+    }
+    if dry {
+        return Ok(summary);
+    }
+    let b = best.expect("improved implies a best candidate");
+    let text = nudge::apply(&c.board, &res)?;
+    write_file(&out, "")?;
+    droute::write_copper(&text, &c.board.nets, &b.routed, &out)
+        .map_err(|e| format!("{out}: {e}"))?;
+    for (src, ext) in [(&c.pro, "kicad_pro"), (&c.dru, "kicad_dru")] {
+        if std::path::Path::new(src).is_file() {
+            std::fs::copy(src, out.replace(".kicad_pcb", &format!(".{ext}")))
+                .map_err(|e| format!("{src}: {e}"))?;
+        }
+    }
+    // opens counted on the written board (region and routed nets)
+    let mut kv = a.kv.clone();
+    kv.insert("pcb".into(), out.clone());
+    if !c.pro.is_empty() {
+        kv.insert("pro".into(), c.pro.clone());
+    }
+    if std::path::Path::new(&c.dru).is_file() {
+        kv.insert("dru".into(), c.dru.clone());
+    }
+    let c2 = load_ctx(&Args {
+        cmd: "nudge".into(),
+        kv,
+    })?;
+    let filt: std::collections::HashSet<usize> = res
+        .nets
+        .iter()
+        .filter_map(|n| c2.board.net_id.get(&c.board.nets[*n]).copied())
+        .collect();
+    let (opens, open_nets) = count_opens(&c2, Some(res.region), Some(&filt));
+    summary["written"] = json!(true);
+    summary["out"] = json!(out);
+    summary["opens"] = json!(opens);
+    summary["open_nets"] = json!(open_nets
+        .iter()
+        .map(|(n, k, _)| json!({"net": n, "opens": k}))
+        .collect::<Vec<_>>());
+    if a.get("drc").is_some() {
+        summary["drc"] = drc_delta(a, &c.pcb, &out)?;
+    }
+    write_file(
+        &out.replace(".kicad_pcb", "_nudge.json"),
+        &serde_json::to_string_pretty(&summary).unwrap_or_default(),
+    )?;
+    eprintln!("[nudge] {} -> {} opens -> {out}", res.opens_before, opens);
+    Ok(summary)
 }

@@ -14,6 +14,7 @@ pub mod groute;
 pub mod img;
 pub mod model;
 pub mod movefp;
+pub mod nudge;
 pub mod place;
 pub mod reroute;
 pub mod rules;

@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `nudge`: local placement optimisation by real routing. Movable parts (`--parts`, `--spec` JSON
+  with per part offset ranges, grid step, rotations and keep-in, or `--auto` = unlocked 2-pad SMD
+  parts near open connections) are searched on a discrete grid (coarse scan + pattern search,
+  parallel candidates); each candidate passes the placement hard rules of `place` and is routed
+  for real in the region after ripping the unlocked copper of the affected nets. Score: opens,
+  then length + via/move/rotation penalties. Writes moved footprints + new copper (`--dry-run`
+  only reports), `--json` per part move, per net result, candidates and timing.
+- `Router::fixed_maps` / `Router::new_with`: blocker maps of everything that stays are built once
+  and only the moving footprints are stamped per candidate (about 10x faster router setup).
+- `sites::track_stamp` / `sites::via_stamp`: stamp objects into existing blocker maps.
+- `droute::QUIET` silences the router's progress lines.
 - `movefp::move_footprints`: footprint move primitive for the board writer. Translates and rotates
   footprints (about their origin) in the `.kicad_pcb` text: the footprint `at`, the absolute pad
   and field angles and the board-coordinate outlines of rule areas inside the footprint change,
