@@ -198,9 +198,23 @@ pub struct NetJob {
     pub hn: f64,        // min half width (neck-down)
     pub vr: f64,
     pub dr: f64,
-    /// existing tracks and vias of the pin components (shape, layers, component): a connection
-    /// may start or end on them, not only at the pads; vias carry their centre
-    pub copper: Vec<(Shape, u8, usize, Option<P>)>,
+    /// existing tracks, vias and zone fills of the pin components: a connection may start or
+    /// end on them, not only at the pads
+    pub copper: Vec<Seed>,
+}
+
+/// existing copper of a pin component that can start or end a connection
+#[derive(Debug, Clone)]
+pub struct Seed {
+    pub shape: Shape,
+    pub layers: u8,
+    /// component id ([`Pin::comp`])
+    pub comp: usize,
+    /// via centre (a via end is pulled to it)
+    pub via_at: Option<P>,
+    /// saved zone fill: seeds only inside the job window (it does not widen the window), the
+    /// interior sampled every 4th cell plus the rim
+    pub fill: bool,
 }
 
 struct NetMaps {
@@ -551,15 +565,21 @@ impl<'a> Router<'a> {
                 .map(|v| {
                     v.iter()
                         .filter(|(oi, c)| {
-                            comps.binary_search(c).is_ok() && m.objs[*oi].bbox.overlaps(&region)
+                            comps.binary_search(c).is_ok() && m.cu(*oi).bbox.overlaps(&region)
                         })
                         .map(|&(oi, c)| {
-                            let o = &m.objs[oi];
+                            let o = m.cu(oi);
                             let via_at = match (o.kind, &o.shape) {
                                 (Kind::Via, Shape::Capsule { a, .. }) => Some(*a),
                                 _ => None,
                             };
-                            (o.shape.clone(), o.layers, c, via_at)
+                            Seed {
+                                shape: o.shape.clone(),
+                                layers: o.layers,
+                                comp: c,
+                                via_at,
+                                fill: matches!(o.kind, Kind::Zone),
+                            }
                         })
                         .collect()
                 })
@@ -597,8 +617,8 @@ impl<'a> Router<'a> {
                     bb.add(pn.at);
                 }
                 // existing copper of the components (clipped to the region) can be a start too
-                for (sh, _, _, _) in &j.copper {
-                    let cb = sh.bbox();
+                for sd in j.copper.iter().filter(|s| !s.fill) {
+                    let cb = sd.shape.bbox();
                     for q in [P { x: cb.x0, y: cb.y0 }, P { x: cb.x1, y: cb.y1 }] {
                         bb.add(geom::p(
                             q.x.clamp(region.x0, region.x1),
@@ -1499,24 +1519,45 @@ impl<'a> Router<'a> {
         }
         // existing tracks and vias of each component: start/target cells too (a pad boxed in by
         // other copper still joins through its own via or a dangling track end)
-        for (sh, layers, comp, via_at) in &job.copper {
-            let Ok(ci) = comp_ids.binary_search(comp) else {
+        for sd in &job.copper {
+            let Ok(ci) = comp_ids.binary_search(&sd.comp) else {
                 continue;
             };
             for l in 0..NL {
-                if layers & (1 << l) == 0 {
+                if sd.layers & (1 << l) == 0 {
                     continue;
                 }
-                // a via end is pulled to the via centre (like a pad end)
-                self.gs.stamp(sh, 0.0, |x, y| {
-                    let i = self.gs.idx(x, y);
+                let mut add = |i: usize| {
                     if self.wi(k, i).is_some() && ok(l, i) && !node_stub.contains_key(&(l, i)) {
                         comp_cells[ci].push((l, i));
-                        if let Some(c) = via_at {
-                            pad_of.entry((l, i)).or_insert(*c);
+                        // a via end is pulled to the via centre (like a pad end)
+                        if let Some(c) = sd.via_at {
+                            pad_of.entry((l, i)).or_insert(c);
                         }
                     }
-                });
+                };
+                match (&sd.shape, sd.fill) {
+                    (Shape::Poly { pts, .. }, true) => {
+                        // fill: window cells only; rim + every 4th interior cell
+                        let g = mp.g;
+                        let gi = |x: usize, y: usize| (mp.oy + y) * self.gs.nx + mp.ox + x;
+                        g.fill_poly(pts, &mut |x, y| {
+                            if x % 4 == 0 && y % 4 == 0 {
+                                add(gi(x, y));
+                            }
+                        });
+                        let n = pts.len();
+                        for e in 0..n {
+                            let rim = Shape::Capsule {
+                                a: pts[e],
+                                b: pts[(e + 1) % n],
+                                r: 0.0,
+                            };
+                            g.stamp(&rim, g.res * 0.75, |x, y| add(gi(x, y)));
+                        }
+                    }
+                    _ => self.gs.stamp(&sd.shape, 0.0, |x, y| add(self.gs.idx(x, y))),
+                }
             }
         }
         for cc in comp_cells.iter_mut() {

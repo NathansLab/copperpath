@@ -194,6 +194,8 @@ pub struct Zone {
     pub priority: i64,
     /// owning footprint (rule areas inside footprints)
     pub fp: Option<String>,
+    /// saved zone fill (`filled_polygon`): (copper layer index, polygon); empty if never filled
+    pub fills: Vec<(usize, Vec<P>)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -545,6 +547,14 @@ fn parse_zone(z: &List, b: &mut Board, fp: Option<&str>, fp_at: Option<(P, f64)>
         ko_footprints: na("footprints"),
         priority: z.valf("priority").unwrap_or(0.0) as i64,
         fp: fp.map(|s| s.to_string()),
+        fills: z
+            .children("filled_polygon")
+            .filter_map(|fp| {
+                let l = fp.val("layer").and_then(layer_idx)?;
+                let pts = pts_of(fp);
+                (pts.len() >= 3).then_some((l, pts))
+            })
+            .collect(),
     }
 }
 

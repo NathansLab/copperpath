@@ -203,6 +203,14 @@ pub struct Model<'a> {
     pub r: &'a Rules,
     pub cfg: BoardCfg,
     pub objs: Vec<Obj>,
+    /// saved zone fills of all copper zones (locked or not), one object per fill polygon; they
+    /// count for connectivity only, never as obstacles
+    pub fills: Vec<Obj>,
+    /// edge index of every fill polygon (same order as `fills`)
+    pub fill_idx: Vec<PolyIndex>,
+    /// indices into `objs` of zone outlines whose zone has a saved fill (connectivity uses the
+    /// fill instead of the outline)
+    pub filled_outline: std::collections::HashSet<usize>,
     /// routable nets (have >= 2 pins, not skipped, not plane nets)
     pub routable: Vec<bool>,
     pub net_layers: Vec<u8>,
@@ -259,6 +267,29 @@ impl<'a> Model<'a> {
                 hole_r: v.drill / 2.0,
             });
         }
+        let mut filled_outline = std::collections::HashSet::new();
+        let fills: Vec<Obj> = b
+            .zones
+            .iter()
+            .filter(|z| !z.keepout && z.net != 0)
+            .flat_map(|z| {
+                z.fills.iter().map(move |(l, pts)| {
+                    let s = Shape::Poly {
+                        pts: pts.clone(),
+                        r: 0.0,
+                    };
+                    Obj {
+                        bbox: s.bbox(),
+                        shape: s,
+                        layers: 1 << l,
+                        net: z.net,
+                        kind: Kind::Zone,
+                        locked: z.locked,
+                        hole_r: 0.0,
+                    }
+                })
+            })
+            .collect();
         for z in &b.zones {
             if z.outline.len() < 3 {
                 continue;
@@ -289,6 +320,9 @@ impl<'a> Model<'a> {
             }
             if !z.locked || cfg.yield_pours.iter().any(|p| wild(&z.name, p)) {
                 continue; // router pours never block (they refill)
+            }
+            if !z.fills.is_empty() {
+                filled_outline.insert(objs.len());
             }
             objs.push(Obj {
                 bbox: s.bbox(),
@@ -345,11 +379,24 @@ impl<'a> Model<'a> {
                 class_layer_mask(&cfg.class_layers, cls).unwrap_or(0x3f) & b.cu_mask
             })
             .collect();
+        let fill_idx: Vec<PolyIndex> = {
+            use rayon::prelude::*;
+            fills
+                .par_iter()
+                .map(|o| match &o.shape {
+                    Shape::Poly { pts, .. } => PolyIndex::new(pts.clone()),
+                    _ => PolyIndex::new(Vec::new()),
+                })
+                .collect()
+        };
         Model {
             b,
             r,
             cfg,
             objs,
+            fills,
+            fill_idx,
+            filled_outline,
             routable,
             net_layers,
         }
@@ -436,6 +483,15 @@ impl<'a> Model<'a> {
         }
     }
 
+    /// copper item `i` of [`NetCopper`]: `objs[i]`, or `fills[i - objs.len()]`
+    pub fn cu(&self, i: usize) -> &Obj {
+        if i < self.objs.len() {
+            &self.objs[i]
+        } else {
+            &self.fills[i - self.objs.len()]
+        }
+    }
+
     pub fn is_mh(&self, fi: usize) -> bool {
         wild(&self.b.fps[fi].refd, &self.cfg.mh_pattern)
     }
@@ -490,22 +546,32 @@ pub fn class_layer_mask(cl: &[(String, u8)], cls: &str) -> Option<u8> {
 }
 
 /// pins of every net plus the copper components already formed by locked tracks/vias/zones
+/// and saved zone fills
 pub fn pins_by_net(m: &Model) -> HashMap<usize, Vec<Pin>> {
     pins_and_copper(m).0
 }
 
-/// existing tracks and vias of a net as (index into `Model::objs`, component id of
-/// [`Pin::comp`]); components without a pin are left out
+/// existing copper of a net as (copper index, component id of [`Pin::comp`]); the copper
+/// index points into `Model::objs` (tracks, vias) or, from `objs.len()` on, into
+/// `Model::fills` (see [`Model::cu`]); components without a pin are left out
 pub type NetCopper = HashMap<usize, Vec<(usize, usize)>>;
 
-/// [`pins_by_net`] plus the tracks and vias that belong to each pin component: a connection
-/// may start or end on any copper of a component, not only at its pads
+/// [`pins_by_net`] plus the tracks, vias and zone fills that belong to each pin component: a
+/// connection may start or end on any copper of a component, not only at its pads
 pub fn pins_and_copper(m: &Model) -> (HashMap<usize, Vec<Pin>>, NetCopper) {
+    pins_and_copper_of(m, &|n| m.routable[n])
+}
+
+/// [`pins_and_copper`] for the nets selected by `sel` (also plane nets that are not routable)
+pub fn pins_and_copper_of(
+    m: &Model,
+    sel: &(dyn Fn(usize) -> bool + Sync),
+) -> (HashMap<usize, Vec<Pin>>, NetCopper) {
     let mut copper: NetCopper = HashMap::new();
     let mut out: HashMap<usize, Vec<Pin>> = HashMap::new();
     for (fi, f) in m.b.fps.iter().enumerate() {
         for (pi, pd) in f.pads.iter().enumerate() {
-            if pd.net == 0 || pd.layers == 0 || !m.routable[pd.net] {
+            if pd.net == 0 || pd.layers == 0 || !sel(pd.net) {
                 continue;
             }
             let (c, _) = f.pad_world(pd);
@@ -518,7 +584,9 @@ pub fn pins_and_copper(m: &Model) -> (HashMap<usize, Vec<Pin>>, NetCopper) {
             });
         }
     }
-    // union-find over same-net objects that touch on a shared layer
+    // union-find over same-net copper that touches on a shared layer; a zone with a saved fill
+    // takes part with its fill polygons instead of its outline
+    let no = m.objs.len();
     let mut by_net: HashMap<usize, Vec<usize>> = HashMap::new();
     for (i, o) in m.objs.iter().enumerate() {
         if o.net != 0
@@ -526,51 +594,127 @@ pub fn pins_and_copper(m: &Model) -> (HashMap<usize, Vec<Pin>>, NetCopper) {
                 o.kind,
                 Kind::Pad { .. } | Kind::Track | Kind::Via | Kind::Zone
             )
+            && !m.filled_outline.contains(&i)
             && out.contains_key(&o.net)
         {
             by_net.entry(o.net).or_default().push(i);
         }
     }
-    for (net, pins) in out.iter_mut() {
-        let ids = by_net.get(net).cloned().unwrap_or_default();
-        let k = ids.len();
-        let mut par: Vec<usize> = (0..k).collect();
-        fn find(par: &mut [usize], x: usize) -> usize {
-            let mut x = x;
-            while par[x] != x {
-                par[x] = par[par[x]];
-                x = par[x];
-            }
-            x
+    for (i, o) in m.fills.iter().enumerate() {
+        if out.contains_key(&o.net) {
+            by_net.entry(o.net).or_default().push(no + i);
         }
-        for a in 0..k {
-            for c in a + 1..k {
-                let (oa, oc) = (&m.objs[ids[a]], &m.objs[ids[c]]);
-                if oa.layers & oc.layers == 0 || !oa.bbox.overlaps(&oc.bbox) {
-                    continue;
+    }
+    let mut nets: Vec<usize> = out.keys().copied().collect();
+    nets.sort();
+    // (net, component per pin, copper items with their component)
+    type NetRes = (usize, Vec<usize>, Vec<(usize, usize)>);
+    let res: Vec<NetRes> = {
+        use rayon::prelude::*;
+        nets.par_iter()
+            .map(|net| {
+                let pins = &out[net];
+                let ids = by_net.get(net).cloned().unwrap_or_default();
+                let comp = components(m, &ids);
+                let mut pad_pos: HashMap<(usize, usize), usize> = HashMap::new();
+                for (j, &i) in ids.iter().enumerate() {
+                    if i < no {
+                        if let Kind::Pad { fp, pad } = m.objs[i].kind {
+                            pad_pos.entry((fp, pad)).or_insert(j);
+                        }
+                    }
                 }
-                // pads of one footprint pad number are connected anyway via kind match below
-                if shape_dist(&oa.shape, &oc.shape) < 1e-3 {
-                    let (ra, rc) = (find(&mut par, a), find(&mut par, c));
-                    par[ra] = rc;
-                }
-            }
+                let pin_comp: Vec<usize> = pins
+                    .iter()
+                    .map(|pin| {
+                        pad_pos
+                            .get(&(pin.fp, pin.pad))
+                            .map(|&j| comp[j])
+                            .unwrap_or(usize::MAX)
+                    })
+                    .collect();
+                let pin_comps: std::collections::HashSet<usize> =
+                    pin_comp.iter().copied().collect();
+                let cu: Vec<(usize, usize)> = (0..ids.len())
+                    .filter(|&j| {
+                        ids[j] >= no || matches!(m.objs[ids[j]].kind, Kind::Track | Kind::Via)
+                    })
+                    .map(|j| (ids[j], comp[j]))
+                    .filter(|(_, c)| pin_comps.contains(c))
+                    .collect();
+                (*net, pin_comp, cu)
+            })
+            .collect()
+    };
+    for (net, pin_comp, cu) in res {
+        for (pin, c) in out.get_mut(&net).unwrap().iter_mut().zip(pin_comp) {
+            pin.comp = c;
         }
-        for pin in pins.iter_mut() {
-            let idx = ids.iter().position(|&i| matches!(m.objs[i].kind, Kind::Pad { fp, pad } if fp == pin.fp && pad == pin.pad));
-            pin.comp = idx.map(|j| find(&mut par, j)).unwrap_or(usize::MAX);
-        }
-        let pin_comps: std::collections::HashSet<usize> = pins.iter().map(|p| p.comp).collect();
-        let cu: Vec<(usize, usize)> = (0..k)
-            .filter(|&j| matches!(m.objs[ids[j]].kind, Kind::Track | Kind::Via))
-            .map(|j| (ids[j], find(&mut par, j)))
-            .filter(|(_, c)| pin_comps.contains(c))
-            .collect();
         if !cu.is_empty() {
-            copper.insert(*net, cu);
+            copper.insert(net, cu);
         }
     }
     (out, copper)
+}
+
+/// two copper items `i`, `j` (see [`Model::cu`]) of one net touch (shared layer, distance
+/// below 1 um); zone fills use their edge index
+fn touch(m: &Model, i: usize, j: usize) -> bool {
+    let (a, b) = (m.cu(i), m.cu(j));
+    if a.layers & b.layers == 0 || !a.bbox.overlaps(&b.bbox) {
+        return false;
+    }
+    let no = m.objs.len();
+    const EPS: f64 = 1e-3;
+    match (i >= no, j >= no) {
+        (true, true) => m.fill_idx[i - no].touches(&m.fill_idx[j - no], EPS),
+        (true, false) => m.fill_idx[i - no].dist(&b.shape, EPS) < EPS,
+        (false, true) => m.fill_idx[j - no].dist(&a.shape, EPS) < EPS,
+        (false, false) => shape_dist(&a.shape, &b.shape) < EPS,
+    }
+}
+
+/// component id (union-find root, index into `ids`) of every copper item `ids` (see
+/// [`Model::cu`]); bounding-box sweep along x
+pub fn components(m: &Model, ids: &[usize]) -> Vec<usize> {
+    let k = ids.len();
+    let mut par: Vec<usize> = (0..k).collect();
+    fn find(par: &mut [usize], x: usize) -> usize {
+        let mut x = x;
+        while par[x] != x {
+            par[x] = par[par[x]];
+            x = par[x];
+        }
+        x
+    }
+    // the objects of one pad (outer pad shape + inner barrel) are one piece of copper
+    let mut first: HashMap<(usize, usize), usize> = HashMap::new();
+    for (j, &i) in ids.iter().enumerate() {
+        if let Kind::Pad { fp, pad } = m.cu(i).kind {
+            let f = *first.entry((fp, pad)).or_insert(j);
+            let (ra, rc) = (find(&mut par, j), find(&mut par, f));
+            par[ra] = rc;
+        }
+    }
+    let mut order: Vec<usize> = (0..k).collect();
+    order.sort_by(|&a, &b| m.cu(ids[a]).bbox.x0.total_cmp(&m.cu(ids[b]).bbox.x0));
+    for (ai, &a) in order.iter().enumerate() {
+        let oa = m.cu(ids[a]);
+        for &c in &order[ai + 1..] {
+            let oc = m.cu(ids[c]);
+            if oc.bbox.x0 > oa.bbox.x1 {
+                break;
+            }
+            if find(&mut par, a) == find(&mut par, c) {
+                continue;
+            }
+            if touch(m, ids[a], ids[c]) {
+                let (ra, rc) = (find(&mut par, a), find(&mut par, c));
+                par[ra] = rc;
+            }
+        }
+    }
+    (0..k).map(|j| find(&mut par, j)).collect()
 }
 
 /// two-pin connections: minimum spanning tree over the copper components of each net

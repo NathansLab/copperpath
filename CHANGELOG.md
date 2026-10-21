@@ -5,6 +5,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Saved zone fills (`filled_polygon`) count as connected copper of their net, locked or not:
+  `opens` and the router's unrouted-component count see the real islands of a plane net instead
+  of one component per pad. `opens --json` lists the pads of every island (`--max-islands`);
+  `--nets` also counts plane nets. The router may start or end a connection on a fill inside the
+  net's search window. Connectivity uses a bounding-box sweep and an edge index per fill
+  (all nets of a 6-layer board with 217 fills in about 1 s; per-net opens equal KiCad's DRC).
+
+### Fixed
+- A plated pad with `remove_unused_layers` (outer pad + inner barrel) is one piece of copper for
+  connectivity; before, copper touching only its outer pad left it as a separate island.
+
 ### Fixed
 - A connection may start or end on any existing track or via of a component, not only at its
   pads: a pad boxed in by other copper (no stub, no room for a via) still joins through its own
