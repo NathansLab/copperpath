@@ -11,7 +11,7 @@
 
 use crate::board::*;
 use crate::clean::{self, Checker, End, FItem, Run};
-use crate::geom::*;
+use crate::geom::{self, *};
 use crate::model::*;
 use crate::sites::{track_map, via_map, R_FREE};
 use rayon::prelude::*;
@@ -198,6 +198,9 @@ pub struct NetJob {
     pub hn: f64,        // min half width (neck-down)
     pub vr: f64,
     pub dr: f64,
+    /// existing tracks and vias of the pin components (shape, layers, component): a connection
+    /// may start or end on them, not only at the pads; vias carry their centre
+    pub copper: Vec<(Shape, u8, usize, Option<P>)>,
 }
 
 struct NetMaps {
@@ -520,7 +523,7 @@ impl<'a> Router<'a> {
         only_nets: Option<&HashSet<usize>>,
     ) -> Router<'a> {
         // connections: pins inside the region, nets with >= 2 copper components there
-        let pins = pins_by_net(m);
+        let (pins, copper) = pins_and_copper(m);
         let mut jobs = Vec::new();
         let mut keys: Vec<&usize> = pins.keys().collect();
         keys.sort();
@@ -543,6 +546,24 @@ impl<'a> Router<'a> {
             }
             let (wmin, w) = m.r.track_width(net);
             let (vd, vdr) = m.r.via(net);
+            let cu = copper
+                .get(&net)
+                .map(|v| {
+                    v.iter()
+                        .filter(|(oi, c)| {
+                            comps.binary_search(c).is_ok() && m.objs[*oi].bbox.overlaps(&region)
+                        })
+                        .map(|&(oi, c)| {
+                            let o = &m.objs[oi];
+                            let via_at = match (o.kind, &o.shape) {
+                                (Kind::Via, Shape::Capsule { a, .. }) => Some(*a),
+                                _ => None,
+                            };
+                            (o.shape.clone(), o.layers, c, via_at)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             jobs.push(NetJob {
                 net,
                 pins: ps,
@@ -550,6 +571,7 @@ impl<'a> Router<'a> {
                 hn: wmin.min(w) / 2.0,
                 vr: vd / 2.0,
                 dr: vdr / 2.0,
+                copper: cu,
             });
         }
         let gs = phased_grid(m, region, p.res, &jobs);
@@ -573,6 +595,16 @@ impl<'a> Router<'a> {
                 let mut bb = BBox::empty();
                 for pn in &j.pins {
                     bb.add(pn.at);
+                }
+                // existing copper of the components (clipped to the region) can be a start too
+                for (sh, _, _, _) in &j.copper {
+                    let cb = sh.bbox();
+                    for q in [P { x: cb.x0, y: cb.y0 }, P { x: cb.x1, y: cb.y1 }] {
+                        bb.add(geom::p(
+                            q.x.clamp(region.x0, region.x1),
+                            q.y.clamp(region.y0, region.y1),
+                        ));
+                    }
                 }
                 let bb = bb.inflate(jm);
                 let ox = (((bb.x0 - gs.x0) / gs.res).floor().max(0.0) as usize).min(gs.nx - 1);
@@ -1464,6 +1496,32 @@ impl<'a> Router<'a> {
                     }
                 }
             }
+        }
+        // existing tracks and vias of each component: start/target cells too (a pad boxed in by
+        // other copper still joins through its own via or a dangling track end)
+        for (sh, layers, comp, via_at) in &job.copper {
+            let Ok(ci) = comp_ids.binary_search(comp) else {
+                continue;
+            };
+            for l in 0..NL {
+                if layers & (1 << l) == 0 {
+                    continue;
+                }
+                // a via end is pulled to the via centre (like a pad end)
+                self.gs.stamp(sh, 0.0, |x, y| {
+                    let i = self.gs.idx(x, y);
+                    if self.wi(k, i).is_some() && ok(l, i) && !node_stub.contains_key(&(l, i)) {
+                        comp_cells[ci].push((l, i));
+                        if let Some(c) = via_at {
+                            pad_of.entry((l, i)).or_insert(*c);
+                        }
+                    }
+                });
+            }
+        }
+        for cc in comp_cells.iter_mut() {
+            cc.sort_unstable();
+            cc.dedup();
         }
         let info = |c: &(usize, usize), used: &[Option<P>]| -> (f32, u8) {
             match node_stub.get(c) {

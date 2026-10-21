@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- A connection may start or end on any existing track or via of a component, not only at its
+  pads: a pad boxed in by other copper (no stub, no room for a via) still joins through its own
+  via or a dangling track end; via ends are pulled to the via centre.
 - Panel files with several closed Edge.Cuts outlines: each item is checked against the outline
   it lies in (even-odd: an outline inside another is a cut-out), instead of only the first
   outline; outlines drawn from lines chain into several loops. New option `--outline N` keeps
