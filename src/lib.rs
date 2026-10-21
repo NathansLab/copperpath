@@ -17,3 +17,4 @@ pub mod rules;
 pub mod sch;
 pub mod sexpr;
 pub mod sites;
+pub mod stitch;

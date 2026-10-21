@@ -576,6 +576,25 @@ impl PolyIndex {
         (d - r).max(0.0)
     }
 
+    /// distance from `q` to the polygon outline, exact up to `limit` (f64::INFINITY beyond)
+    pub fn boundary_dist(&self, q: P, limit: f64) -> f64 {
+        let mut bb = BBox::empty();
+        bb.add(q);
+        let mut es = Vec::new();
+        self.edges_near(&bb.inflate(limit + self.cs), &mut es);
+        es.iter()
+            .map(|&e| {
+                let (a, b) = self.edge(e);
+                dist_seg(q, a, b)
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// polygon area (absolute)
+    pub fn area(&self) -> f64 {
+        poly_area(&self.pts).abs()
+    }
+
     /// the two polygons overlap or come closer than `eps`
     pub fn touches(&self, o: &PolyIndex, eps: f64) -> bool {
         if !self.bbox.inflate(eps).overlaps(&o.bbox) {

@@ -2782,12 +2782,27 @@ fn uuid(seed: &mut u64) -> String {
 
 /// append routed copper to the board text (unlocked, so it can be ripped by later runs)
 pub fn write_pcb(text: &str, nets: &[String], res: &DResult, out: &str) -> std::io::Result<()> {
+    write_copper(text, nets, &res.routed, out)
+}
+
+/// append new copper per net (unlocked) to the board text and write it to `out`
+pub fn write_copper(
+    text: &str,
+    nets: &[String],
+    routed: &HashMap<usize, RNet>,
+    out: &str,
+) -> std::io::Result<()> {
+    // seed from the board text: copper added to an output of an earlier run gets new uuids
     let mut seed = 0x1234_5678_9abc_def1u64;
+    for b in text.bytes().step_by(97).chain(text.len().to_le_bytes()) {
+        seed = (seed ^ b as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    seed |= 1;
     let mut add = String::new();
-    let mut keys: Vec<&usize> = res.routed.keys().collect();
+    let mut keys: Vec<&usize> = routed.keys().collect();
     keys.sort();
     for &net in keys {
-        let rn = &res.routed[&net];
+        let rn = &routed[&net];
         let name = crate::sexpr::q(&nets[net]);
         for s in &rn.segs {
             add += &format!(
