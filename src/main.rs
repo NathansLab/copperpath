@@ -1,8 +1,8 @@
 //! copperpath command line: check, place, route, opens, hints, pads, netclass (see README.md).
 
 use copperpath::{
-    board, check, droute, fanout, geom, groute, model, nudge, place, reroute, rules, sch, sites,
-    stitch,
+    board, check, droute, fanout, geom, groute, model, nudge, place, render, reroute, rules, sch,
+    sites, stitch,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -29,6 +29,7 @@ commands:
   stitch    stitching vias for pour islands of a plane net (--net --zones --plane --out)
   fanout    track + via from every open island of a plane net to its plane (--net --plane --out)
   nudge     move small parts locally until their nets route (--parts R5,R7 | --spec | --auto --out)
+  render    PNG of a board region: layers, pads with labels, opens, DRC markers (--roi --out)
 
 common options:
   --cfg config.json   board configuration (optional, see examples/config.json)
@@ -242,6 +243,7 @@ fn main() {
         "stitch" => cmd_stitch(&a),
         "fanout" => cmd_fanout(&a),
         "nudge" => cmd_nudge(&a),
+        "render" => cmd_render(&a),
         "" => Err(format!("no command given\n{USAGE}")),
         c => Err(format!("unknown command '{c}'\n{USAGE}")),
     };
@@ -281,8 +283,9 @@ fn main() {
     }
 }
 
-const KNOWN: [&str; 10] = [
+const KNOWN: [&str; 11] = [
     "check", "place", "route", "opens", "pads", "hints", "netclass", "stitch", "fanout", "nudge",
+    "render",
 ];
 
 fn write_file(path: &str, data: &str) -> Result<(), String> {
@@ -1857,4 +1860,70 @@ fn cmd_nudge(a: &Args) -> CmdResult {
     )?;
     eprintln!("[nudge] {} -> {} opens -> {out}", res.opens_before, opens);
     Ok(summary)
+}
+
+/// render --pcb B [--roi x0,y0,x1,y1] [--layers F,In1,B] [--nets REGEX] [--hl-net N] [--fills]
+/// [--labels] [--courtyards] [--opens] [--drc drc.json] [--halo-min 1.0] [--per-layer]
+/// [--px 1200] --out roi.png
+fn cmd_render(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let out = a.s("out", "render.png");
+    if !out.to_ascii_lowercase().ends_with(".png") {
+        return Err(format!("--out {out}: the output file must end in .png"));
+    }
+    let hl_net = match a.get("hl-net") {
+        Some(n) => Some(
+            *c.board
+                .net_id
+                .get(n)
+                .ok_or(format!("--hl-net {n}: no such net"))?,
+        ),
+        None => None,
+    };
+    let drc = match a.get("drc") {
+        Some(f) => {
+            render::parse_drc(&std::fs::read_to_string(f).map_err(|e| format!("--drc {f}: {e}"))?)?
+        }
+        None => Vec::new(),
+    };
+    let o = render::Opts {
+        roi: a.get("roi").map(parse_box).transpose()?,
+        layers: render::parse_layers(&a.s("layers", "all"))?,
+        nets: a.get("nets").map(|_| full_regex(a, "nets")).transpose()?,
+        hl_net,
+        fills: a.get("fills").is_some(),
+        labels: a.get("labels").is_some(),
+        courtyards: a.get("courtyards").is_some(),
+        opens: a.get("opens").is_some(),
+        halo_min: a.f("halo-min", 1.0),
+        drc,
+        px: a.u("px", 1200).clamp(100, 8000),
+        per_layer: a.get("per-layer").is_some(),
+        title: std::path::Path::new(&c.pcb)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    };
+    let t = Instant::now();
+    let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
+    let r = render::render(&m, &o)?;
+    write_bytes(&out, &r.png)?;
+    eprintln!(
+        "[render] {}x{} px, {} labels, {} opens in the region in {:.2} s -> {out}",
+        r.w,
+        r.h,
+        r.labels,
+        r.rats.len(),
+        t.elapsed().as_secs_f64()
+    );
+    Ok(render::summary(&r, &out))
+}
+
+fn write_bytes(path: &str, data: &[u8]) -> Result<(), String> {
+    if let Some(d) = std::path::Path::new(path).parent() {
+        if !d.as_os_str().is_empty() {
+            std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+        }
+    }
+    std::fs::write(path, data).map_err(|e| format!("{path}: {e}"))
 }

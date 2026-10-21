@@ -63,6 +63,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `stitch --net GND --zones REGEX --plane REGEX [--grid G] --out OUT.kicad_pcb` | Stitching vias for a plane net from the saved zone fills: one via in every fill island of the `--zones` zones (zone name, full match) that has no via or plated hole of the net, optionally a via grid of pitch G per island. A via must lie on a fill of a `--plane` zone of the same net (fully on its copper), keep the DRU/net-class clearance to every other net on every layer (outer layers incl. creepage, last matching rule wins) plus `--margin` (0.05), 0.2 mm to every pad, the hole and edge rules, and stay out of no-via rule areas. Unlocked zones of other nets are ignored (they refill around the via), locked ones are copper. Options: `--via D,DRILL` (default: the net class via), `--min-clr` (floor on the clearance to other nets), `--min-area` (0.3 mm²), `--base B.kicad_pcb` (write the vias into this board instead of the input, e.g. the unfilled original). `--json` lists the vias, the islands without a legal spot (with the nearest blockers of a via there) and the rejection causes. |
 | `fanout --net GND --plane REGEX [--reach 6] --out OUT.kicad_pcb` | Connects every open island of a plane net (a copper island with pads that touches no fill of a `--plane` zone) with one short track and a via onto the plane: grid search (0.05 mm, 8 directions) from an SMD pad of the island on its outer layer to the nearest legal via spot within `--reach` mm of track. Track legality as in the router (DRU/net-class clearance incl. outer-layer creepage, rule areas, mask apertures, edge); via legality as in `stitch`. Width: `--width` or the net class / DRU width, inside the pad's own courtyard the width of a DRU `track_width` rule with `A.intersectsCourtyard('REF')` (neck-down). Pads whose own cells are already too close to other copper (in-package creepage) are skipped. Options: `--via D,DRILL`, `--margin`, `--min-clr`, `--islands opens.json` (only islands listed by `opens --json`), `--base`. `--json` lists per island the pad used, track length and via, or why each pad failed and the nearest blockers (`net`, `kind`, `fp`, `layer`, `dist_mm`, `need_mm`, `locked`, `at`: the copper closest to violating its clearance, i.e. what to move). The search runs in 8 directions, so 45-degree tracks to a via spot are tried as well. |
 | `nudge (--parts R5,R7 \| --spec moves.json \| --auto) [--range 1] [--step 0.05] [--rots 0,90] --out OUT.kicad_pcb [--dry-run]` | Local placement optimisation by real routing: moves a few small parts (translation on a grid, rotation about the footprint origin, side kept) until their nets route, see [Nudge](#nudge-local-placement-by-real-routing). Writes the moved footprints and the new copper to a copy and `OUT_nudge.json`. |
+| `render [--roi x0,y0,x1,y1] --out roi.png` | PNG of a board region for AI agents and humans, native rasteriser (about 0.05 s per image). See [Rendering](#rendering-render). |
 | `pads` | Pad world positions, sizes and nets (tab separated). |
 | `netclass` | net → net class table (tab separated). |
 
@@ -93,6 +94,41 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `--reroute-blockers` | | after routing, for each net still open: a coarse search (0.1 mm, all layers) in which unlocked tracks/vias of other nets are passable at a high cost finds the cheapest corridor; the unlocked copper on it is ripped and the net is routed again together with the ripped nets (negotiated as usual). A try is kept only if the net gets fewer opens and no ripped net and no other net ends up with more opens; otherwise it is rolled back. Locked copper, pads, rule areas and the edge are never moved. `--json`: `reroute` = per net `ripped_nets`, `ripped_items`, `accepted`, opens before/after, `reason` |
 | `--max-ripped N` / `--max-targets N` | 3 / 10 | blocking nets ripped per try / open nets tried |
 | `--dbg-net NAME` | | verbose trace of one net |
+
+## Rendering (`render`)
+
+One PNG of a region with every copper layer colour-coded and semi-transparent (KiCad colours,
+B.Cu at the bottom, F.Cu on top), so an AI agent can *look* at a placement or routing problem
+instead of reading coordinates. Native Rust, no Python or matplotlib.
+
+```bash
+B=target/release/copperpath
+# region around a part, labels, ratsnest of the open connections, DRC markers
+$B render --pcb board.kicad_pcb --roi 110,105,135,125 --labels --opens --drc drc.json --out roi.png
+# one small image per copper layer (small multiples)
+$B render --pcb board.kicad_pcb --per-layer --layers F,In1,In2,B --labels --out sheet.png
+# one net highlighted, all other copper grey
+$B render --pcb board.kicad_pcb --hl-net GND --fills --out gnd.png
+```
+
+| option | default | meaning |
+|---|---|---|
+| `--roi x0,y0,x1,y1` | board + 1 mm | region in board mm |
+| `--px N` | 1200 | image width in pixels (height from the aspect ratio) |
+| `--layers F,In1,..,B` | all | copper layers to draw (`F.Cu` style names work too) |
+| `--nets REGEX` / `--hl-net NAME` | | only these nets / this net in colour, everything else grey |
+| `--fills` | off | saved zone fills (`filled_polygon`), lighter than tracks |
+| `--labels` | off | `REF.PIN` and net name on every pad in the region (largest pads first, never overlapping; a label that does not fit is moved beside the pad or dropped), net names on long tracks |
+| `--opens` | off | ratsnest: one white line per open connection (minimum spanning tree over the copper islands of each net, closest pad pair) |
+| `--drc FILE` | | markers from a `kicad-cli pcb drc --format json` report: red X for errors, yellow for warnings, dashed line for unconnected items |
+| `--courtyards` | off | courtyard outlines |
+| `--halo-min D` | 1.0 | nets whose outer-layer clearance (incl. creepage) to another net in the region is at least D mm get a hatched halo of that width (HV creepage zones); 0 = off |
+| `--per-layer` | off | one tile per layer in a grid |
+
+Always drawn: board outline, rule areas (orange hatch), vias and drill holes, a millimetre grid
+with coordinates along the top and left edge, a scale bar and a legend. `--json` returns the
+image size, the region, `px_per_mm`, the number of labels and the open connections in the region
+(`ratsnest`: net, both pads, end points, length).
 
 ## How routing works
 
