@@ -4,7 +4,7 @@
 usage: python3 scripts/drc_compare.py base_drc.json new_drc.json
 
 Reports come from `kicad-cli pcb drc --format json --severity-all -o X.json B.kicad_pcb`.
-Plain Python 3, no extra packages. `placeroute route --drc` does the same comparison itself.
+Plain Python 3, no extra packages. `copperpath route --drc` does the same comparison itself.
 """
 import collections
 import json

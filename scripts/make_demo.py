@@ -100,7 +100,7 @@ PRO = {
 }
 
 DRU = """(version 1)
-# Custom rules of the demo board (read by KiCad DRC and by placeroute).
+# Custom rules of the demo board (read by KiCad DRC and by copperpath).
 
 # power nets keep more distance to everything else on the outer layers
 (rule "power_outer_clearance"

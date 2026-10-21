@@ -1,6 +1,6 @@
 {
   "_doc": [
-    "Placement problem for `placeroute place --zones` (written by a person or an AI agent).",
+    "Placement problem for `copperpath place --zones` (written by a person or an AI agent).",
     "movable / fixed: reference wildcards or sheet:<sheet name>. Parts not listed as movable stay.",
     "zones[]: refs, rect [x0,y0,x1,y1] or poly [[x,y],...], side F/B/FB, rot_step (deg, 0 = keep),",
     "rot_pref (deg list), near {ref, pin, max} (hard distance limit in mm), why (free text).",

@@ -1,6 +1,6 @@
 {
   "_doc": [
-    "Board configuration for placeroute (--cfg). Every key is optional; without --cfg every net",
+    "Board configuration for copperpath (--cfg). Every key is optional; without --cfg every net",
     "with at least two pads is routed on every copper layer of the board.",
     "Keys may sit at the top level, or per board under \"boards\": {\"<name>\": {...}} (pick one",
     "with --board <name>; without --board the first entry is used). Keys starting with _ are ignored.",

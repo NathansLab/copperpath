@@ -1,6 +1,6 @@
 # Third-party licenses
 
-placeroute is licensed under MIT OR Apache-2.0. Its Rust dependencies (from `Cargo.lock`) are
+copperpath is licensed under MIT OR Apache-2.0. Its Rust dependencies (from `Cargo.lock`) are
 listed below; all are compatible with both licenses. Release binaries statically link these crates.
 Keep their notices when you redistribute binaries.
 

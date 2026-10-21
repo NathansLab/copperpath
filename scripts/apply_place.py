@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply a `placeroute place` result (place.json) to a copy of a board.
+"""Apply a `copperpath place` result (place.json) to a copy of a board.
 
 usage: <KiCad python> scripts/apply_place.py IN.kicad_pcb place.json OUT.kicad_pcb
 

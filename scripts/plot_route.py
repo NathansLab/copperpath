@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Plot the copper of a region: pads (from `placeroute pads`), tracks and vias per layer.
+"""Plot the copper of a region: pads (from `copperpath pads`), tracks and vias per layer.
 Locked copper is drawn thin and pale, unlocked (router) copper in full colour.
 
 usage: plot_route.py OUT.png x0,y0,x1,y1 TITLE=BOARD.kicad_pcb [TITLE=BOARD.kicad_pcb ...]
 
-Requires Python 3.9+ and matplotlib. Pad outlines come from `placeroute pads`; the binary is
-$PLACEROUTE_BIN, else target/release/placeroute of this repository (run `cargo build --release`).
+Requires Python 3.9+ and matplotlib. Pad outlines come from `copperpath pads`; the binary is
+$COPPERPATH_BIN, else target/release/copperpath of this repository (run `cargo build --release`).
 """
 import os
 import re
@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, Polygon
 import math
 
-BIN = os.environ.get('PLACEROUTE_BIN') or Path(__file__).resolve().parent.parent / 'target/release/placeroute'
+BIN = os.environ.get('COPPERPATH_BIN') or Path(__file__).resolve().parent.parent / 'target/release/copperpath'
 COL = {'F.Cu': '#d62728', 'In1.Cu': '#9467bd', 'In2.Cu': '#8c564b', 'In3.Cu': '#e377c2', 'In4.Cu': '#17becf', 'B.Cu': '#1f77b4'}
 SEG_L = re.compile(r'\(segment\s*(\(locked yes\)\s*)?\(start ([-\d.]+) ([-\d.]+)\)\s*\(end ([-\d.]+) ([-\d.]+)\)\s*\(width ([-\d.]+)\)\s*(\(locked yes\)\s*)?\(layer "([^"]+)"\)', re.S)
 VIA = re.compile(r'\(via\s*(\(locked yes\)\s*)?\(at ([-\d.]+) ([-\d.]+)\)\s*\(size ([-\d.]+)\)', re.S)

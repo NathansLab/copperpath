@@ -1,8 +1,8 @@
 //! Routes the demo board with the release binary and checks the result:
 //! 0 opens, only 45-degree multiples, no track copper inside a foreign pad, straight pad exits.
 
-use placeroute::board;
-use placeroute::geom::{shape_dist, Shape};
+use copperpath::board;
+use copperpath::geom::{shape_dist, Shape};
 use std::process::Command;
 
 const DEMO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo/demo.kicad_pcb");
@@ -17,14 +17,14 @@ fn octi(dx: f64, dy: f64) -> bool {
 fn demo_routes_completely_and_cleanly() {
     let out_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("demo_route");
     let out = out_dir.join("demo_routed.kicad_pcb");
-    let o = Command::new(env!("CARGO_BIN_EXE_placeroute"))
+    let o = Command::new(env!("CARGO_BIN_EXE_copperpath"))
         .args(["route", "--pcb", DEMO, "--threads", "4", "--json", "--out"])
         .arg(&out)
         .output()
-        .expect("run placeroute");
+        .expect("run copperpath");
     assert!(
         o.status.success(),
-        "placeroute failed: {}",
+        "copperpath failed: {}",
         String::from_utf8_lossy(&o.stderr)
     );
     let v: serde_json::Value =
@@ -96,7 +96,7 @@ fn demo_routes_completely_and_cleanly() {
                             c
                         );
                         let u = (other - e) * (1.0 / (other - e).len());
-                        let ax = placeroute::geom::p(1.0, 0.0).rot(ang);
+                        let ax = copperpath::geom::p(1.0, 0.0).rot(ang);
                         let along_x = u.cross(ax).abs() < 1e-3;
                         let along_y = u.dot(ax).abs() < 1e-3;
                         assert!(
@@ -133,7 +133,7 @@ fn demo_routes_completely_and_cleanly() {
 
 #[test]
 fn errors_are_reported_with_exit_codes() {
-    let bin = env!("CARGO_BIN_EXE_placeroute");
+    let bin = env!("CARGO_BIN_EXE_copperpath");
     let o = Command::new(bin)
         .args(["route", "--pcb", "does_not_exist.kicad_pcb", "--json"])
         .output()
@@ -145,5 +145,5 @@ fn errors_are_reported_with_exit_codes() {
     let o = Command::new(bin).args(["bogus"]).output().unwrap();
     assert_eq!(o.status.code(), Some(2));
     let o = Command::new(bin).args(["--version"]).output().unwrap();
-    assert!(String::from_utf8_lossy(&o.stdout).starts_with("placeroute "));
+    assert!(String::from_utf8_lossy(&o.stdout).starts_with("copperpath "));
 }

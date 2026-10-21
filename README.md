@@ -1,4 +1,4 @@
-# placeroute
+# copperpath
 
 Rule-aware routability check, placement helper and grid router for **already-placed KiCad boards**,
 written in Rust (parallel with rayon). It reads the board, the net classes (`.kicad_pro`) and the
@@ -16,7 +16,7 @@ and plane nets are not routed. Expect rough edges; see [Limitations](#limitation
 Requires a recent stable Rust toolchain (developed with 1.95).
 
 ```bash
-cargo build --release          # binary: target/release/placeroute
+cargo build --release          # binary: target/release/copperpath
 cargo test --release           # unit tests + routing of the demo board
 ```
 
@@ -29,7 +29,7 @@ Optional: KiCad 10's `kicad-cli` for the DRC comparison (`route --drc`). It is f
 classes, three custom rules), placed but not routed.
 
 ```bash
-B=target/release/placeroute
+B=target/release/copperpath
 $B route --pcb examples/demo/demo.kicad_pcb --out out/demo_routed.kicad_pcb --threads 4
 #   [route] 24 nets, 50 connections: 181 segments (601 mm), 31 vias ... 0 opens
 $B route --pcb examples/demo/demo.kicad_pcb --out out/demo_routed.kicad_pcb --drc --json
@@ -121,7 +121,7 @@ exactly, aligned. Fix those in the placement and the exits connect with one stra
 footprints whose courtyard forbids vias, allowed layers per net class, preferred layer directions
 for the global router, mounting-hole pattern. Keys may be per board under `"boards"`.
 
-## Using placeroute from scripts/AI agents
+## Using copperpath from scripts/AI agents
 
 Every command accepts `--json`. It then prints exactly **one JSON object** to stdout; human-readable
 logs go to stderr. Exit codes: `0` success, `1` error in a known command (bad file, bad option,
@@ -156,14 +156,14 @@ Freerouting is the established open-source autorouter for KiCad (via Specctra DS
 comparison on one region of a 6-layer mixed-signal board (46 nets, 90 connections, 4 threads,
 same placed input):
 
-| | placeroute | Freerouting (60 s budget) | Freerouting (full run, ~5 min) |
+| | copperpath | Freerouting (60 s budget) | Freerouting (full run, ~5 min) |
 |---|---|---|---|
 | connections routed | 90 / 90 | 83 / 90 | 81 / 90 |
 | new KiCad DRC errors | 0 | clearance errors (rules not in DSN) | dangling tracks |
 | wall time | 5–15 s | 50 s | ~300 s |
 | vias | ~28 | 9 | 9 |
 
-- placeroute reads the KiCad rules directly (DRU conditions such as outer-layer-only clearances
+- copperpath reads the KiCad rules directly (DRU conditions such as outer-layer-only clearances
   or rule areas), so it does not lose rules in the DSN export, and it is fast and parallel.
 - Freerouting uses far fewer vias, produces somewhat shorter tracks, has years of polish and
   handles many more cases (differential pairs, more board types). After its optimisation passes
@@ -192,7 +192,7 @@ same placed input):
 | `scripts/apply_place.py IN place.json OUT` | KiCad 10 Python (`pcbnew`) | apply a `place` result to a copy |
 | `scripts/plot_route.py OUT.png x0,y0,x1,y1 TITLE=B.kicad_pcb ...` | Python 3, matplotlib | side-by-side copper plots |
 | `scripts/drc_compare.py base.json new.json` | Python 3 | diff two kicad-cli DRC reports |
-| `scripts/release.sh [--no-latest]` | bash, git, cargo | build, test, copy the binary to `$PLACEROUTE_RELEASE_DIR` |
+| `scripts/release.sh [--no-latest]` | bash, git, cargo | build, test, copy the binary to `$COPPERPATH_RELEASE_DIR` |
 
 Run the `pcbnew` scripts with KiCad's bundled Python (e.g. on macOS
 `/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3`).

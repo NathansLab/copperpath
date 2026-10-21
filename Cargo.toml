@@ -1,10 +1,10 @@
 [package]
-name = "placeroute"
+name = "copperpath"
 version = "0.1.0"
 edition = "2021"
 description = "Rule-aware placement helper, routability check and grid router for already-placed KiCad boards"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/<user>/placeroute"
+repository = "https://github.com/NathansLab/copperpath"
 readme = "README.md"
 keywords = ["kicad", "pcb", "router", "eda", "autorouter"]
 categories = ["command-line-utilities", "science"]

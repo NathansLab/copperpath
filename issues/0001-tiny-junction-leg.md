@@ -8,7 +8,7 @@ and a neighbouring segment. KiCad DRC: 1 new `track_dangling` warning, 0 errors.
 
 **Command and version**
 ```
-placeroute route --pcb examples/demo/demo.kicad_pcb --out out/demo_routed.kicad_pcb --drc --json
+copperpath route --pcb examples/demo/demo.kicad_pcb --out out/demo_routed.kicad_pcb --drc --json
 ```
 
 **Minimal synthetic repro board**

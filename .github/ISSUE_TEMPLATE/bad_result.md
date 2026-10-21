@@ -10,8 +10,8 @@ labels: bad-result
 
 **Command and version**
 ```
-placeroute --version
-placeroute route --pcb ... (full command line)
+copperpath --version
+copperpath route --pcb ... (full command line)
 ```
 
 **Minimal synthetic repro board**

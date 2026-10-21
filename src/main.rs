@@ -1,6 +1,6 @@
-//! placeroute command line: check, place, route, opens, hints, pads, netclass (see README.md).
+//! copperpath command line: check, place, route, opens, hints, pads, netclass (see README.md).
 
-use placeroute::{board, check, droute, geom, groute, model, place, rules, sch, sites};
+use copperpath::{board, check, droute, geom, groute, model, place, rules, sch, sites};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -9,11 +9,11 @@ use std::time::Instant;
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (",
-    env!("PLACEROUTE_GIT_HASH"),
+    env!("COPPERPATH_GIT_HASH"),
     ")"
 );
 
-const USAGE: &str = "usage: placeroute <command> --pcb BOARD.kicad_pcb [options]
+const USAGE: &str = "usage: copperpath <command> --pcb BOARD.kicad_pcb [options]
 
 commands:
   check     routability report (via sites, global-route congestion, hotspots)
@@ -145,7 +145,7 @@ pub fn load_ctx(a: &Args) -> Result<Ctx, String> {
 fn main() {
     let a = Args::parse();
     if matches!(a.cmd.as_str(), "--version" | "-V" | "version") || a.get("version").is_some() {
-        println!("placeroute {VERSION}");
+        println!("copperpath {VERSION}");
         return;
     }
     if matches!(a.cmd.as_str(), "--help" | "-h" | "help") {
@@ -665,7 +665,7 @@ fn cmd_place(a: &Args) -> CmdResult {
             .map(|z| z.why.clone())
             .unwrap_or_default();
         rows.push(json!({"ref": f.refd, "x": geom_r(ps.at.x), "y": geom_r(ps.at.y), "rot": geom_r(ps.rot), "side": if ps.back {"B"} else {"F"},
-            "old": [geom_r(f.at.x), geom_r(f.at.y), geom_r(f.rot), if f.back {"B"} else {"F"}], "why": format!("placeroute SA: {why}")}));
+            "old": [geom_r(f.at.x), geom_r(f.at.y), geom_r(f.rot), if f.back {"B"} else {"F"}], "why": format!("copperpath SA: {why}")}));
     }
     write_file(
         &format!("{out}/place.json"),

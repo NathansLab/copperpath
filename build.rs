@@ -1,4 +1,4 @@
-//! Embeds the git commit (short hash, "-dirty" with local changes) for `placeroute --version`.
+//! Embeds the git commit (short hash, "-dirty" with local changes) for `copperpath --version`.
 use std::process::Command;
 
 fn main() {
@@ -14,7 +14,7 @@ fn main() {
     let dirty =
         git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
     println!(
-        "cargo:rustc-env=PLACEROUTE_GIT_HASH={hash}{}",
+        "cargo:rustc-env=COPPERPATH_GIT_HASH={hash}{}",
         if dirty { "-dirty" } else { "" }
     );
     println!("cargo:rerun-if-changed=.git/HEAD");
