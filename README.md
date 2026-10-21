@@ -62,6 +62,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `hints [--region] [--nets] [--tol 1.0]` | Pad pairs of a net that are *almost* in one row or column (offset 0.02..tol mm). Each forces a jog between two straight pad exits; align the pads before routing. |
 | `stitch --net GND --zones REGEX --plane REGEX [--grid G] --out OUT.kicad_pcb` | Stitching vias for a plane net from the saved zone fills: one via in every fill island of the `--zones` zones (zone name, full match) that has no via or plated hole of the net, optionally a via grid of pitch G per island. A via must lie on a fill of a `--plane` zone of the same net (fully on its copper), keep the DRU/net-class clearance to every other net on every layer (outer layers incl. creepage, last matching rule wins) plus `--margin` (0.05), 0.2 mm to every pad, the hole and edge rules, and stay out of no-via rule areas. Unlocked zones of other nets are ignored (they refill around the via), locked ones are copper. Options: `--via D,DRILL` (default: the net class via), `--min-clr` (floor on the clearance to other nets), `--min-area` (0.3 mm²), `--base B.kicad_pcb` (write the vias into this board instead of the input, e.g. the unfilled original). `--json` lists the vias, the islands without a legal spot (with the nearest blockers of a via there) and the rejection causes. |
 | `fanout --net GND --plane REGEX [--reach 6] --out OUT.kicad_pcb` | Connects every open island of a plane net (a copper island with pads that touches no fill of a `--plane` zone) with one short track and a via onto the plane: grid search (0.05 mm, 8 directions) from an SMD pad of the island on its outer layer to the nearest legal via spot within `--reach` mm of track. Track legality as in the router (DRU/net-class clearance incl. outer-layer creepage, rule areas, mask apertures, edge); via legality as in `stitch`. Width: `--width` or the net class / DRU width, inside the pad's own courtyard the width of a DRU `track_width` rule with `A.intersectsCourtyard('REF')` (neck-down). Pads whose own cells are already too close to other copper (in-package creepage) are skipped. Options: `--via D,DRILL`, `--margin`, `--min-clr`, `--islands opens.json` (only islands listed by `opens --json`), `--base`. `--json` lists per island the pad used, track length and via, or why each pad failed and the nearest blockers (`net`, `kind`, `fp`, `layer`, `dist_mm`, `need_mm`, `locked`, `at`: the copper closest to violating its clearance, i.e. what to move). The search runs in 8 directions, so 45-degree tracks to a via spot are tried as well. |
+| `nudge (--parts R5,R7 \| --spec moves.json \| --auto) [--range 1] [--step 0.05] [--rots 0,90] --out OUT.kicad_pcb [--dry-run]` | Local placement optimisation by real routing: moves a few small parts (translation on a grid, rotation about the footprint origin, side kept) until their nets route, see [Nudge](#nudge-local-placement-by-real-routing). Writes the moved footprints and the new copper to a copy and `OUT_nudge.json`. |
 | `pads` | Pad world positions, sizes and nets (tab separated). |
 | `netclass` | net → net class table (tab separated). |
 
@@ -130,6 +131,62 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 - **Fallback ladder.** If the cleanup costs completeness (a net loses a connection), the router
   reruns without sliding (`no-slide`), then without cleanup (`no-clean`). The level used is in
   `aes.cleanup_level`.
+
+## Nudge: local placement by real routing
+
+A pad that the router cannot reach is often fixed by moving a resistor half a millimetre or turning
+it. `nudge` searches such moves and judges every candidate by routing it for real:
+
+```sh
+# move R5 and C7 by up to 1 mm on a 0.05 mm grid, also try them turned by 90 degrees
+copperpath nudge --pcb board.kicad_pcb --parts R5,C7 --range 1 --step 0.05 --rots 0,90 \
+  --out nudged.kicad_pcb --json
+# only report the best moves
+copperpath nudge --pcb board.kicad_pcb --parts R5 --dry-run --json
+# pick the parts automatically: unlocked 2-pad SMD parts within 3 mm of an open connection
+copperpath nudge --pcb board.kicad_pcb --region 40,20,60,35 --auto --auto-dist 3 --auto-max 4 \
+  --out nudged.kicad_pcb
+# full move spec (per part ranges, rotations, keep-in polygon; see examples/nudge.json)
+copperpath nudge --pcb board.kicad_pcb --spec examples/nudge.json --time-limit 30 --out nudged.kicad_pcb
+```
+
+- **Move space.** Per part an x/y offset range on a grid (`dx`, `dy`, `step`; default `--range`
+  ±1 mm, `--step` 0.05 mm) and a list of rotations (`rot` absolute or `drot` relative, default
+  `--rots 0`), optionally a `keepin` polygon. The side stays. Locked parts are refused unless
+  `--move-locked`.
+- **Hard rules.** Every candidate passes the placement checker of `place` first: pad clearance from
+  the DRU/net-class matrix (outer layers incl. creepage), mounting-hole keepouts, via-to-pad gap,
+  courtyard overlap, board edge clearance, footprint rule areas and the keep-in. A candidate may
+  not have more violations than the start placement.
+- **Real routing.** The nets to route are the nets of the movable parts plus the nets open in the
+  region (or `--nets`). Their unlocked tracks and vias inside the region are ripped once
+  (`--rip region`; `attached` rips only the copper connected to the movable parts, `none` keeps
+  everything), then every candidate is routed by the detailed router inside the region (default:
+  the parts' move envelope + `--margin` 2 mm).
+- **Score.** Opens first, then cost = track length + `via_w` (2 mm) per via + `move_w` (2 per mm)
+  × moved distance + `rot_w` (0.5) per turned part. The result is written only if it has fewer
+  opens than the board as it is (`improved`).
+- **Search.** A coarse scan of each part's move space (`--coarse` 9 points per axis × rotations),
+  then a pattern search around the best (step halving down to the grid step), in rounds over all
+  parts until nothing improves, `--time-limit` (60 s) or `--max-cands`. Candidates of a step are
+  evaluated in parallel.
+- **Speed.** The board is cropped once to the region plus the router's job margin (all copper of
+  the routed nets stays, so their connectivity is exact). The blocker maps of everything that
+  does not move are built once; a candidate only stamps the moving pads into copies of them and
+  routes without the exact cleanup; the winner is routed again with the cleanup. On a 6-layer
+  board with 845 footprints, two parts and three nets (32 ripped items, GND among them) a
+  candidate costs about 11 ms wall time on 4 threads (≈ 0.8 ms model, 7 ms maps, 33 ms
+  search per thread); 330 candidates in 4 s.
+
+`--json` / `OUT_nudge.json`: `moves` (per part `from`/`to` as x, y, rotation and `dx`, `dy`,
+`drot`), `nets` (opens before/after per net), `score` (opens, length, vias, moved mm, rotated
+parts, cost), `opens_before`, `opens` (counted again on the written board), `candidates`,
+`infeasible`, `route_ms_per_candidate`, `search_s`, `stopped`, `log` (search phases and a time
+profile), `ripped_items`, `region`. `--drc` compares kicad-cli DRC before/after as in `route`.
+
+Limits: no side flip; copper graphics inside a moved footprint are not moved in the routing model
+(the written board moves them, KiCad keeps them local); the saved zone fills are not refilled
+(run the zone filler in KiCad afterwards).
 
 `hints` finds the placement-side cause of many ugly jogs: two pads of a net that are almost, but not
 exactly, aligned. Fix those in the placement and the exits connect with one straight track.
