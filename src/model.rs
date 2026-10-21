@@ -208,6 +208,8 @@ pub struct Model<'a> {
     pub fills: Vec<Obj>,
     /// edge index of every fill polygon (same order as `fills`)
     pub fill_idx: Vec<PolyIndex>,
+    /// index into `Board::zones` of the zone of every fill polygon
+    pub fill_zone: Vec<usize>,
     /// indices into `objs` of zone outlines whose zone has a saved fill (connectivity uses the
     /// fill instead of the outline)
     pub filled_outline: std::collections::HashSet<usize>,
@@ -268,6 +270,13 @@ impl<'a> Model<'a> {
             });
         }
         let mut filled_outline = std::collections::HashSet::new();
+        let fill_zone: Vec<usize> = b
+            .zones
+            .iter()
+            .enumerate()
+            .filter(|(_, z)| !z.keepout && z.net != 0)
+            .flat_map(|(zi, z)| std::iter::repeat_n(zi, z.fills.len()))
+            .collect();
         let fills: Vec<Obj> = b
             .zones
             .iter()
@@ -396,6 +405,7 @@ impl<'a> Model<'a> {
             objs,
             fills,
             fill_idx,
+            fill_zone,
             filled_outline,
             routable,
             net_layers,

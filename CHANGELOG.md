@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `fanout`: one track + via per open island of a plane net onto a plane fill (grid search from an
+  SMD pad to the nearest legal via spot within `--reach`), neck-down inside the pad's courtyard
+  from a DRU `track_width` rule with `intersectsCourtyard`. About 1 s for 42 islands on a 6-layer
+  board.
+- DRU conditions `intersectsCourtyard` / `intersectsFrontCourtyard` / `intersectsBackCourtyard`
+  are evaluated when the item position is known (`Rules::track_width_at`).
+- `Model::fill_zone`: zone of every fill polygon.
 - `stitch`: stitching vias for the fill islands of a plane net (one per island without a via,
   optional grid), legal against the DRU/net-class model incl. outer-layer creepage, pads, holes,
   edge and no-via rule areas, on a plane fill of the same net. Writes the vias to a copy

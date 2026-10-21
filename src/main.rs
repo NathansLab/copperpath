@@ -1,6 +1,8 @@
 //! copperpath command line: check, place, route, opens, hints, pads, netclass (see README.md).
 
-use copperpath::{board, check, droute, geom, groute, model, place, rules, sch, sites, stitch};
+use copperpath::{
+    board, check, droute, fanout, geom, groute, model, place, rules, sch, sites, stitch,
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -24,6 +26,7 @@ commands:
   pads      pad world positions, sizes and nets (tab separated)
   netclass  net -> net class table (tab separated)
   stitch    stitching vias for pour islands of a plane net (--net --zones --plane --out)
+  fanout    track + via from every open island of a plane net to its plane (--net --plane --out)
 
 common options:
   --cfg config.json   board configuration (optional, see examples/config.json)
@@ -235,6 +238,7 @@ fn main() {
         "hints" => cmd_hints(&a),
         "netclass" => cmd_netclass(&a),
         "stitch" => cmd_stitch(&a),
+        "fanout" => cmd_fanout(&a),
         "" => Err(format!("no command given\n{USAGE}")),
         c => Err(format!("unknown command '{c}'\n{USAGE}")),
     };
@@ -274,8 +278,8 @@ fn main() {
     }
 }
 
-const KNOWN: [&str; 8] = [
-    "check", "place", "route", "opens", "pads", "hints", "netclass", "stitch",
+const KNOWN: [&str; 9] = [
+    "check", "place", "route", "opens", "pads", "hints", "netclass", "stitch", "fanout",
 ];
 
 fn write_file(path: &str, data: &str) -> Result<(), String> {
@@ -1188,6 +1192,107 @@ fn full_regex(a: &Args, k: &str) -> Result<regex::Regex, String> {
     regex::Regex::new(&format!("^(?:{pat})$")).map_err(|e| format!("--{k}: {e}"))
 }
 
+/// --via D,DRILL or the net class via
+fn via_arg(a: &Args, c: &Ctx, net: usize) -> Result<(f64, f64), String> {
+    match a.get("via") {
+        Some(v) => {
+            let mut it = v.split(',').map(|x| x.trim().parse::<f64>());
+            match (it.next(), it.next()) {
+                (Some(Ok(d)), Some(Ok(h))) => Ok((d, h)),
+                _ => Err(format!("--via {v}: expected DIAMETER,DRILL in mm")),
+            }
+        }
+        None => Ok(c.rules.via(net)),
+    }
+}
+
+/// the board text new copper is appended to: --base or the input
+fn base_text(a: &Args, c: &Ctx) -> Result<String, String> {
+    match a.get("base") {
+        Some(b) => std::fs::read_to_string(b).map_err(|e| format!("--base {b}: {e}")),
+        None => Ok(c.board.text.clone()),
+    }
+}
+
+/// fanout --pcb FILLED --net GND --plane REGEX [--reach 6] [--via D,DRILL] [--width W]
+/// [--margin 0.05] [--min-clr 0] [--islands opens.json] [--base B] --out OUT.kicad_pcb
+fn cmd_fanout(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let out = out_path(a, &c, "fanout.kicad_pcb")?;
+    let net_name = a.s("net", "GND");
+    let net = *c
+        .board
+        .net_id
+        .get(&net_name)
+        .ok_or(format!("--net {net_name}: no such net"))?;
+    let (via_d, drill) = via_arg(a, &c, net)?;
+    // --islands: `opens --json` output; only islands with one of its pads of this net
+    let mut only = std::collections::HashSet::new();
+    if let Some(f) = a.get("islands") {
+        let v: Value = serde_json::from_str(
+            &std::fs::read_to_string(f).map_err(|e| format!("--islands {f}: {e}"))?,
+        )
+        .map_err(|e| format!("--islands {f}: {e}"))?;
+        for pn in v["per_net"].as_array().into_iter().flatten() {
+            if pn["net"] == json!(net_name) {
+                for isl in pn["islands"].as_array().into_iter().flatten() {
+                    for pad in isl.as_array().into_iter().flatten() {
+                        if let Some(s) = pad.as_str() {
+                            only.insert(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if only.is_empty() {
+            return Err(format!("--islands {f}: no islands of net {net_name}"));
+        }
+    }
+    let p = fanout::FanoutParams {
+        net,
+        plane: full_regex(a, "plane")?,
+        reach: a.f("reach", 6.0),
+        via_d,
+        drill,
+        width: a.get("width").and_then(|w| w.parse().ok()),
+        margin: a.f("margin", 0.05),
+        min_clr: a.f("min-clr", 0.0),
+        only,
+        res: a.f("res", 0.05),
+    };
+    let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
+    let t = Instant::now();
+    let r = fanout::fanout(&m, &p)?;
+    let ok = r.islands.iter().filter(|i| i.pad.is_some()).count();
+    eprintln!(
+        "[fanout] {net_name}: {} open islands, {ok} connected, {} failed in {:.2} s",
+        r.islands.len(),
+        r.islands.len() - ok,
+        t.elapsed().as_secs_f64()
+    );
+    for i in &r.islands {
+        match &i.pad {
+            Some(pd) => eprintln!(
+                "[fanout]   {pd}: {:.2} mm on {} to via {:?}",
+                i.length_mm,
+                i.layer.as_deref().unwrap_or(""),
+                i.via.unwrap_or_default()
+            ),
+            None => eprintln!("[fanout]   failed {:?}: {:?}", i.pads, i.why),
+        }
+    }
+    let mut routed = HashMap::new();
+    routed.insert(net, r.copper);
+    droute::write_copper(&base_text(a, &c)?, &c.board.nets, &routed, &out)
+        .map_err(|e| format!("{out}: {e}"))?;
+    eprintln!("[fanout] -> {out}");
+    Ok(json!({
+        "out": out, "net": net_name, "via": [via_d, drill],
+        "open_islands": r.islands.len(), "connected": ok,
+        "islands": r.islands,
+    }))
+}
+
 /// stitch --pcb FILLED --net GND --zones REGEX --plane REGEX [--grid G] [--via D,DRILL]
 /// [--margin 0.05] [--min-clr 0] [--min-area 0.3] [--base BASE.kicad_pcb] --out OUT.kicad_pcb
 fn cmd_stitch(a: &Args) -> CmdResult {
@@ -1199,17 +1304,7 @@ fn cmd_stitch(a: &Args) -> CmdResult {
         .net_id
         .get(&net_name)
         .ok_or(format!("--net {net_name}: no such net"))?;
-    let (vd, vdr) = c.rules.via(net);
-    let (via_d, drill) = match a.get("via") {
-        Some(v) => {
-            let mut it = v.split(',').map(|x| x.trim().parse::<f64>());
-            match (it.next(), it.next()) {
-                (Some(Ok(d)), Some(Ok(h))) => (d, h),
-                _ => return Err(format!("--via {v}: expected DIAMETER,DRILL in mm")),
-            }
-        }
-        None => (vd, vdr),
-    };
+    let (via_d, drill) = via_arg(a, &c, net)?;
     let p = stitch::StitchParams {
         net,
         zones: full_regex(a, "zones")?,
@@ -1251,10 +1346,7 @@ fn cmd_stitch(a: &Args) -> CmdResult {
         eprintln!("[stitch]   no spot: {l} ({:.2}, {:.2}) {ar} mm2", q.x, q.y);
     }
     // vias go into a copy of the input, or of --base (e.g. the same board without saved fills)
-    let text = match a.get("base") {
-        Some(b) => std::fs::read_to_string(b).map_err(|e| format!("--base {b}: {e}"))?,
-        None => c.board.text.clone(),
-    };
+    let text = base_text(a, &c)?;
     let mut routed = HashMap::new();
     routed.insert(
         net,

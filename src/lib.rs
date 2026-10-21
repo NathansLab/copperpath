@@ -8,6 +8,7 @@ pub mod board;
 pub mod check;
 pub mod clean;
 pub mod droute;
+pub mod fanout;
 pub mod geom;
 pub mod groute;
 pub mod img;
