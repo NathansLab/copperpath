@@ -179,10 +179,8 @@ impl<'a> Checker<'a> {
                 return false;
             }
         }
-        if let Some(outl) = m.b.edge.first() {
-            if !point_in_poly(a, outl) || !point_in_poly(b, outl) {
-                return false;
-            }
+        if !m.b.inside(a) || !m.b.inside(b) {
+            return false;
         }
         true
     }
@@ -255,10 +253,8 @@ impl<'a> Checker<'a> {
                 return false;
             }
         }
-        if let Some(outl) = m.b.edge.first() {
-            if !point_in_poly(at, outl) {
-                return false;
-            }
+        if !m.b.inside(at) {
+            return false;
         }
         true
     }

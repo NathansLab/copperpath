@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Panel files with several closed Edge.Cuts outlines: each item is checked against the outline
+  it lies in (even-odd: an outline inside another is a cut-out), instead of only the first
+  outline; outlines drawn from lines chain into several loops. New option `--outline N` keeps
+  only outline N (#68).
 - Tracks and vias of other nets stay out of solder mask apertures: F.Mask/B.Mask graphics of
   footprints and the board (e.g. over a solder jumper) and pad mask expansions only admit the
   nets of the pads and locked zones inside them; no more `solder_mask_bridge` (#3).

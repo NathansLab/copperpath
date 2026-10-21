@@ -194,7 +194,8 @@ pub struct Problem<'a> {
     pub eval: Option<(GridSpec, usize, f64, f64)>, // grid, rep net, via r, drill r
     pub base_count: Vec<u16>,
     pub maxclr: f64,
-    pub outline: Option<Vec<P>>,
+    /// the board has a closed Edge.Cuts outline (courtyards must lie inside it)
+    pub has_outline: bool,
     pub fp_keepouts: Vec<(Vec<P>, u8)>, // rule areas forbidding footprints
 }
 
@@ -596,7 +597,7 @@ impl<'a> Problem<'a> {
             eval,
             base_count: vec![],
             maxclr,
-            outline: b.edge.first().cloned(),
+            has_outline: !b.edge.is_empty(),
             fp_keepouts,
         };
         pb.base_count = pb.fixed_via_count();
@@ -744,10 +745,8 @@ impl<'a> Problem<'a> {
             }
         }
         // board outline
-        if let Some(o) = &self.outline {
-            if !poly_inside(&pl.crtyd, o) {
-                v += 1;
-            }
+        if self.has_outline && !pl.crtyd.iter().all(|q| self.m.b.inside(*q)) {
+            v += 1;
         }
         // near
         for (tp, mx) in &spec.near {
