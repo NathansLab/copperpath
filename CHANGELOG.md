@@ -55,6 +55,9 @@ All notable changes to this project are documented here. The format follows
   open board and applies the `--delta-json` change set as one commit (one Ctrl+Z undoes it, no
   file reload); binary from the plugin setting, the bundled `bin/` or `PATH`; errors in a dialog
   with the last log lines. Tested against a mocked kipy API in CI (#21).
+- `route --delta-json FILE` (or `-` for stdout): added and removed items in integer nanometres
+  for the KiCad IPC API, with or instead of `--out`; `--pcb -` reads the board from stdin.
+  `copperpath::delta::apply` applies a delta to board text (#20).
 
 ## [0.1.0] - 2026-10-21
 

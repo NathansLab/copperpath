@@ -55,7 +55,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 
 | command | job |
 |---|---|
-| `route [--region x0,y0,x1,y1] [--nets PATTERNS] --out OUT.kicad_pcb [--drc]` | Detailed router (below). Routes every routable net whose pads lie in the region (default: whole board). Appends unlocked tracks/vias to a copy and writes `OUT_route.json`. `--drc` runs `kicad-cli` on input and output and reports the new violations. |
+| `route [--region x0,y0,x1,y1] [--nets PATTERNS] --out OUT.kicad_pcb [--delta-json DELTA.json] [--drc]` | Detailed router (below). Routes every routable net whose pads lie in the region (default: whole board). Appends unlocked tracks/vias to a copy and writes `OUT_route.json`; `--delta-json` writes the added/removed items in nm for the KiCad IPC API ([schema](#change-set-for-the-kicad-ipc-api---delta-json)). `--drc` runs `kicad-cli` on input and output and reports the new violations. |
 | `check [--out DIR] [--res 0.25] [--tile 1.0] [--copper locked\|all] [--crop x0,y0,x1,y1 --crop-class C]` | Routability report: via-site maps per net class, region analysis per schematic sheet, what-if ablation (without rule areas, via keepouts, locked copper), global route with congestion per tile and layer, hotspot list. Writes `report.json`, `groute.json`, `congestion.json` and PNG maps. |
 | `place --zones zones.json [--init keep\|schematic\|both] [--moves N] [--starts K] [--out DIR]` | Parallel simulated-annealing placement of the movable parts inside zones (see `examples/zones.json`). Writes `place.json`; apply it to a copy with `scripts/apply_place.py`. |
 | `opens [--region] [--nets]` | Unconnected connections per net, counted from all copper (no 499-item cap as in kicad-cli). |
@@ -162,6 +162,33 @@ Common fields: `ok`, `command`, `version`, `threads`, `total_s`, `warnings`. On 
 Suggested agent loop: `hints` → fix placement → `route --drc --json` → accept if `ok`, `opens == 0`
 and `drc.new_errors == 0`, else inspect `open_nets`, `drc.new` and `aes` and adjust nets, region
 or options. Keep the input board read-only; always route into a new file.
+
+### Change set for the KiCad IPC API (`--delta-json`)
+
+`route --delta-json DELTA.json` writes what the run changed, so an editor plugin can apply it as
+one commit (`begin_commit`, `remove_items` / `create_items`, `push_commit`) instead of reloading a
+file. It works together with `--out` or instead of it (without `--out` no board file and no
+`OUT_route.json` are written; `--drc` needs `--out`). `--delta-json -` prints the delta to stdout
+(not together with `--json`). `--pcb -` reads the board text from stdin; give `--pro` / `--dru`
+explicitly then. The `--json` result reports `delta_json` (path) and `out` (`null` without `--out`).
+
+```json
+{"v": 1, "units": "nm",
+ "remove": ["<uuid>"],
+ "add": [{"type": "track", "net": "SDA", "layer": "F.Cu", "width": 150000, "start": [0, 0], "end": [0, 0]},
+         {"type": "arc", "net": "SDA", "layer": "F.Cu", "width": 150000, "start": [0, 0], "mid": [0, 0], "end": [0, 0]},
+         {"type": "via", "net": "GND", "at": [0, 0], "size": 600000, "drill": 300000,
+          "layers": ["F.Cu", "B.Cu"], "via_type": "through"}]}
+```
+
+- All lengths and coordinates are integer nanometres (KiCad's internal unit), so nothing is lost
+  to rounding; `v` is the schema version.
+- `remove`: UUIDs of input items that were ripped up or replaced. `route` keeps all existing
+  copper today, so the list is empty; the field is there for the incremental modes.
+- `add`: new items in output order. The router emits `track` and through `via` items; `arc` is
+  part of the schema for later cleanup steps.
+- Applying the delta to the input board (`copperpath::delta::apply`) gives the same copper as
+  `--out` (tested on the demo: same tracks and vias within 1 nm, same opens).
 
 ## Comparison with Freerouting
 
