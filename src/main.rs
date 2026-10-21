@@ -889,12 +889,21 @@ fn cmd_route(a: &Args) -> CmdResult {
         None
     };
     if !res.failed.is_empty() && p.clean && !halted() {
-        for (lv, slide, clean) in [("no-slide", false, true), ("no-clean", false, false)] {
+        // both fallback levels run at the same time (a route mostly uses one core); the choice
+        // is the same as trying them one after the other
+        let run_level = |slide: bool, clean: bool| {
             let mut p2 = p.clone();
             p2.slide = slide;
             p2.clean = clean;
             let r2 = droute::Router::new(&m, region, p2, filt.as_ref());
             let res2 = r2.run();
+            (r2, res2)
+        };
+        let (a, b) = rayon::join(|| run_level(false, true), || run_level(false, false));
+        for (lv, (r2, res2)) in [("no-slide", a), ("no-clean", b)] {
+            if res.failed.is_empty() || halted() {
+                break;
+            }
             eprintln!(
                 "[route] fallback {}: {} failed nets (was {})",
                 lv,
@@ -905,9 +914,6 @@ fn cmd_route(a: &Args) -> CmdResult {
                 r = r2;
                 res = res2;
                 level = lv;
-            }
-            if res.failed.is_empty() || halted() {
-                break;
             }
         }
     }
