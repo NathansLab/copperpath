@@ -279,12 +279,7 @@ impl<'a> Model<'a> {
         let net_layers: Vec<u8> = (0..n)
             .map(|i| {
                 let cls = &r.class_of(i).name;
-                cfg.class_layers
-                    .iter()
-                    .find(|(p, _)| wild(cls, p))
-                    .map(|(_, m)| *m)
-                    .unwrap_or(0x3f)
-                    & b.cu_mask
+                class_layer_mask(&cfg.class_layers, cls).unwrap_or(0x3f) & b.cu_mask
             })
             .collect();
         Model {
@@ -392,6 +387,15 @@ pub struct Pin {
     pub at: P,
     pub layers: u8,
     pub comp: usize, // connectivity component id within the net
+}
+
+/// layer mask of a net class from `class_layers`: the most specific matching pattern wins (most
+/// non-wildcard characters; JSON key order is not kept), None when no pattern matches
+pub fn class_layer_mask(cl: &[(String, u8)], cls: &str) -> Option<u8> {
+    cl.iter()
+        .filter(|(p, _)| wild(cls, p))
+        .max_by_key(|(p, _)| p.chars().filter(|c| *c != '*' && *c != '?').count())
+        .map(|(_, m)| *m)
 }
 
 /// pins of every net plus the copper components already formed by locked tracks/vias/zones
@@ -525,6 +529,19 @@ mod tests {
     fn objs(b: &Board, cfg: BoardCfg, mode: CopperMode) -> Vec<Obj> {
         let r = Rules::load("", "", &b.nets).unwrap();
         Model::new(b, &r, cfg, mode).objs
+    }
+
+    #[test]
+    fn most_specific_class_layers_pattern_wins() {
+        let cl = vec![
+            ("*".to_string(), 0b111111u8),
+            ("CLS_*".to_string(), 0b110011),
+            ("HV_*".to_string(), 0b100001),
+        ];
+        assert_eq!(class_layer_mask(&cl, "CLS_2"), Some(0b110011));
+        assert_eq!(class_layer_mask(&cl, "HV_1"), Some(0b100001));
+        assert_eq!(class_layer_mask(&cl, "Default"), Some(0b111111));
+        assert_eq!(class_layer_mask(&cl[1..], "Default"), None);
     }
 
     #[test]

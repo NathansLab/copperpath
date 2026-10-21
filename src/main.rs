@@ -835,6 +835,17 @@ fn cmd_route(a: &Args) -> CmdResult {
         model::CopperMode::All
     };
     let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), mode);
+    if !c.cfg.class_layers.is_empty() {
+        for cl in &c.rules.classes {
+            if let Some(mk) = model::class_layer_mask(&c.cfg.class_layers, &cl.name) {
+                let ls: Vec<&str> = (0..6)
+                    .filter(|l| mk & c.board.cu_mask & (1 << l) != 0)
+                    .map(|l| board::CU[l])
+                    .collect();
+                eprintln!("[route] class {} layers {}", cl.name, ls.join(","));
+            }
+        }
+    }
     let mut p = droute::DParams::default();
     p.res = a.f("res", p.res);
     p.via_cost = a.f("via-cost", p.via_cost as f64) as f32;

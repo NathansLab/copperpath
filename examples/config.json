@@ -12,7 +12,9 @@
     "  class_layers        allowed copper layers per net class",
     "  layer_dir           preferred direction per layer for the global router (H or V)",
     "  mounting_hole_refs  reference pattern of mounting holes (default MH*)",
-    "  yield_pours         locked pours (zone name wildcards) that do not block routing (KiCad refills them)"
+    "  yield_pours         locked pours (zone name wildcards) that do not block routing (KiCad refills them)",
+    "  class_layers        allowed copper layers per net class pattern; the most specific matching",
+    "                      pattern wins (most non-wildcard characters), e.g. HV_* before *"
   ],
   "layer_dir": { "F.Cu": "H", "In1.Cu": "V", "In2.Cu": "H", "In3.Cu": "V", "In4.Cu": "H", "B.Cu": "V" },
   "mounting_hole_refs": "MH*",
