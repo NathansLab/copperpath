@@ -2592,11 +2592,13 @@ mod tests {
         let mut want = Vec::new();
         let mut x = 12345u64;
         for _ in 0..1000 {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let e = x >> 40; // includes duplicates
             h.push(e);
             want.push(e);
-            if e % 3 == 0 {
+            if e.is_multiple_of(3) {
                 want.sort_unstable();
                 assert_eq!(h.pop(), Some(want.remove(0)));
             }
