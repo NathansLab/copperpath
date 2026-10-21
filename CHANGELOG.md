@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- `class_layers`: the most specific matching pattern wins; before, `"*"` won because JSON keys
+  are sorted. The log prints the effective layers per class (#38).
 - KiCad 5 board files are refused with a clear message instead of routing an empty board (#0002).
 - A missing `.kicad_pro` no longer aborts; KiCad's default net class is used (#0003).
 - Edge.Cuts arcs in the legacy centre/angle form are read; no panic on incomplete graphics (#0004).
