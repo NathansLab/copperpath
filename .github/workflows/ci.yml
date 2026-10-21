@@ -1,7 +1,9 @@
 name: CI
 
 on:
+  # pushes to PR branches are covered by pull_request; push only for main
   push:
+    branches: [main]
   pull_request:
 
 env:
