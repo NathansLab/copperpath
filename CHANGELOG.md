@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `stitch`: stitching vias for the fill islands of a plane net (one per island without a via,
+  optional grid), legal against the DRU/net-class model incl. outer-layer creepage, pads, holes,
+  edge and no-via rule areas, on a plane fill of the same net. Writes the vias to a copy
+  (`--base` for another board text). About 0.5 s for 97 islands on a 6-layer board (a Shapely
+  prototype took 16 s).
+- `Checker::via_block_fixed` reports what blocks a via; `Checker::min_clr` floors the clearance.
+- Added copper gets uuids seeded from the board text (no duplicates when a command runs on the
+  output of another).
 - Saved zone fills (`filled_polygon`) count as connected copper of their net, locked or not:
   `opens` and the router's unrouted-component count see the real islands of a plane net instead
   of one component per pad. `opens --json` lists the pads of every island (`--max-islands`);

@@ -28,6 +28,8 @@ pub struct Checker<'a> {
     pub m: &'a Model<'a>,
     /// locked pours of the routed net's own class yield (as in the router's maps)
     pub yield_same_class: bool,
+    /// floor (mm) on the via clearance to copper of other nets (0 = rules only)
+    pub min_clr: f64,
     objs: &'a [Obj],
     bs: f64,
     x0: f64,
@@ -75,6 +77,7 @@ impl<'a> Checker<'a> {
         Checker {
             m,
             yield_same_class: true,
+            min_clr: 0.0,
             objs,
             bs,
             x0,
@@ -188,6 +191,12 @@ impl<'a> Checker<'a> {
     /// through via (radius vr incl. margin, drill radius dr) legal for `net` against fixed objects
     /// (same semantics as sites::via_map)
     pub fn via_ok_fixed(&self, net: usize, at: P, vr: f64, dr: f64) -> bool {
+        self.via_block_fixed(net, at, vr, dr).is_none()
+    }
+
+    /// what blocks a through via at `at` (None = legal; see [`Checker::via_ok_fixed`]):
+    /// "keepout", "pad", "copper", "mask", "hole", "edge"
+    pub fn via_block_fixed(&self, net: usize, at: P, vr: f64, dr: f64) -> Option<&'static str> {
         let m = self.m;
         let via_pad_gap = 0.2;
         let pt = Shape::circle(at, 0.0);
@@ -217,6 +226,9 @@ impl<'a> Checker<'a> {
                             continue;
                         }
                         let mut c = m.clr(net, o, l);
+                        if c >= 0.0 && o.net != net {
+                            c = c.max(self.min_clr);
+                        }
                         if matches!(o.kind, Kind::Pad { .. }) {
                             c = c.max(via_pad_gap);
                         }
@@ -233,7 +245,12 @@ impl<'a> Checker<'a> {
                 }
             }
             if d >= 0.0 && o.shape.dist(at) <= d {
-                return false;
+                return Some(match o.kind {
+                    Kind::Keepout { .. } | Kind::ViaKeepout => "keepout",
+                    Kind::Pad { .. } => "pad",
+                    Kind::Mask { .. } => "mask",
+                    _ => "copper",
+                });
             }
             if o.hole_r > 0.0 {
                 let ctr = match &o.shape {
@@ -243,20 +260,20 @@ impl<'a> Checker<'a> {
                     }
                 };
                 if (ctr - at).len() <= m.r.min_hole_to_hole + o.hole_r + dr {
-                    return false;
+                    return Some("hole");
                 }
             }
         }
         let e = m.r.edge_clearance(net) + vr;
         for (p0, p1) in &m.b.edge_segs {
             if dist_seg(at, *p0, *p1) <= e {
-                return false;
+                return Some("edge");
             }
         }
         if !m.b.inside(at) {
-            return false;
+            return Some("edge");
         }
-        true
+        None
     }
 
     pub fn via_ok_foreign(&self, net: usize, at: P, vr: f64, dr: f64, foreign: &[FItem]) -> bool {

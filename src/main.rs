@@ -1,6 +1,6 @@
 //! copperpath command line: check, place, route, opens, hints, pads, netclass (see README.md).
 
-use copperpath::{board, check, droute, geom, groute, model, place, rules, sch, sites};
+use copperpath::{board, check, droute, geom, groute, model, place, rules, sch, sites, stitch};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -23,6 +23,7 @@ commands:
   hints     near-collinear pad pairs that force jogs between straight pad exits
   pads      pad world positions, sizes and nets (tab separated)
   netclass  net -> net class table (tab separated)
+  stitch    stitching vias for pour islands of a plane net (--net --zones --plane --out)
 
 common options:
   --cfg config.json   board configuration (optional, see examples/config.json)
@@ -233,6 +234,7 @@ fn main() {
         "pads" => cmd_pads(&a),
         "hints" => cmd_hints(&a),
         "netclass" => cmd_netclass(&a),
+        "stitch" => cmd_stitch(&a),
         "" => Err(format!("no command given\n{USAGE}")),
         c => Err(format!("unknown command '{c}'\n{USAGE}")),
     };
@@ -272,8 +274,8 @@ fn main() {
     }
 }
 
-const KNOWN: [&str; 7] = [
-    "check", "place", "route", "opens", "pads", "hints", "netclass",
+const KNOWN: [&str; 8] = [
+    "check", "place", "route", "opens", "pads", "hints", "netclass", "stitch",
 ];
 
 fn write_file(path: &str, data: &str) -> Result<(), String> {
@@ -1160,6 +1162,123 @@ fn drc_delta(a: &Args, before: &str, after: &str) -> Result<Value, String> {
         "new_violations": added.len(), "new_errors": added.iter().filter(|k| k.starts_with("error ")).count(),
         "new": added.iter().take(50).collect::<Vec<_>>(),
         "unconnected_before": unc(&b), "unconnected_after": unc(&n), "reports": [base, new],
+    }))
+}
+
+/// output path for a command that writes a board copy: must end in .kicad_pcb and differ from
+/// the input
+fn out_path(a: &Args, c: &Ctx, default: &str) -> Result<String, String> {
+    let out = a.s("out", default);
+    if !out.ends_with(".kicad_pcb") {
+        return Err(format!(
+            "--out {out}: the output file must end in .kicad_pcb"
+        ));
+    }
+    if std::path::Path::new(&out).canonicalize().ok()
+        == std::path::Path::new(&c.pcb).canonicalize().ok()
+    {
+        return Err("--out must differ from --pcb (the input board is never overwritten)".into());
+    }
+    Ok(out)
+}
+
+/// regex that must match a whole name
+fn full_regex(a: &Args, k: &str) -> Result<regex::Regex, String> {
+    let pat = a.get(k).ok_or(format!("missing --{k} REGEX"))?;
+    regex::Regex::new(&format!("^(?:{pat})$")).map_err(|e| format!("--{k}: {e}"))
+}
+
+/// stitch --pcb FILLED --net GND --zones REGEX --plane REGEX [--grid G] [--via D,DRILL]
+/// [--margin 0.05] [--min-clr 0] [--min-area 0.3] [--base BASE.kicad_pcb] --out OUT.kicad_pcb
+fn cmd_stitch(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let out = out_path(a, &c, "stitched.kicad_pcb")?;
+    let net_name = a.s("net", "GND");
+    let net = *c
+        .board
+        .net_id
+        .get(&net_name)
+        .ok_or(format!("--net {net_name}: no such net"))?;
+    let (vd, vdr) = c.rules.via(net);
+    let (via_d, drill) = match a.get("via") {
+        Some(v) => {
+            let mut it = v.split(',').map(|x| x.trim().parse::<f64>());
+            match (it.next(), it.next()) {
+                (Some(Ok(d)), Some(Ok(h))) => (d, h),
+                _ => return Err(format!("--via {v}: expected DIAMETER,DRILL in mm")),
+            }
+        }
+        None => (vd, vdr),
+    };
+    let p = stitch::StitchParams {
+        net,
+        zones: full_regex(a, "zones")?,
+        plane: full_regex(a, "plane")?,
+        grid: a.f("grid", 0.0),
+        via_d,
+        drill,
+        margin: a.f("margin", 0.05),
+        min_clr: a.f("min-clr", 0.0),
+        min_area: a.f("min-area", 0.3),
+        step: a.f("step", 0.25),
+    };
+    let nfill: usize = c
+        .board
+        .zones
+        .iter()
+        .filter(|z| z.net == net && p.zones.is_match(&z.name))
+        .map(|z| z.fills.len())
+        .sum();
+    if nfill == 0 {
+        return Err(format!(
+            "no saved fill in the zones matching --zones for net {net_name}: refill a copy first (kicad-cli pcb drc --refill-zones --save-board)"
+        ));
+    }
+    let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
+    let t = Instant::now();
+    let r = stitch::stitch(&m, &p);
+    eprintln!(
+        "[stitch] {net_name}: {} islands, {} without via, {} fixed, {} new vias, {} failed in {:.2} s; rejected {:?}",
+        r.islands,
+        r.lone,
+        r.fixed,
+        r.vias.len(),
+        r.failed.len(),
+        t.elapsed().as_secs_f64(),
+        r.why
+    );
+    for (l, q, ar) in r.failed.iter().take(12) {
+        eprintln!("[stitch]   no spot: {l} ({:.2}, {:.2}) {ar} mm2", q.x, q.y);
+    }
+    // vias go into a copy of the input, or of --base (e.g. the same board without saved fills)
+    let text = match a.get("base") {
+        Some(b) => std::fs::read_to_string(b).map_err(|e| format!("--base {b}: {e}"))?,
+        None => c.board.text.clone(),
+    };
+    let mut routed = HashMap::new();
+    routed.insert(
+        net,
+        droute::RNet {
+            segs: vec![],
+            vias: r
+                .vias
+                .iter()
+                .map(|q| droute::RVia {
+                    at: *q,
+                    d: via_d,
+                    drill,
+                })
+                .collect(),
+        },
+    );
+    droute::write_copper(&text, &c.board.nets, &routed, &out).map_err(|e| format!("{out}: {e}"))?;
+    eprintln!("[stitch] {} vias -> {out}", r.vias.len());
+    Ok(json!({
+        "out": out, "net": net_name, "via": [via_d, drill],
+        "islands": r.islands, "lone": r.lone, "fixed": r.fixed,
+        "vias": r.vias.iter().map(|q| [geom_r(q.x), geom_r(q.y)]).collect::<Vec<_>>(),
+        "failed": r.failed.iter().map(|(l, q, ar)| json!({"layer": l, "at": [geom_r(q.x), geom_r(q.y)], "area_mm2": ar})).collect::<Vec<_>>(),
+        "rejected": r.why,
     }))
 }
 
