@@ -18,6 +18,7 @@ pub const K_CRTYD: u8 = 6;
 pub const K_EDGE: u8 = 7;
 pub const K_HOLE: u8 = 8;
 pub const K_MH: u8 = 9;
+pub const K_MASK: u8 = 10;
 
 pub fn kind_name(k: u8) -> &'static str {
     match k & 15 {
@@ -30,6 +31,7 @@ pub fn kind_name(k: u8) -> &'static str {
         K_EDGE => "edge",
         K_HOLE => "hole_to_hole",
         K_MH => "mounting_hole",
+        K_MASK => "solder_mask_aperture",
         _ => "free",
     }
 }
@@ -71,6 +73,7 @@ fn obj_code(o: &Obj, m: &Model) -> u8 {
         Kind::Zone => K_ZONE,
         Kind::Keepout { .. } => K_KEEPOUT,
         Kind::ViaKeepout => K_CRTYD,
+        Kind::Mask { .. } => K_MASK,
     }
 }
 

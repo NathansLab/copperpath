@@ -141,8 +141,8 @@ pub fn layer_image(
             Some(l) => o.layers & (1 << l) != 0,
             None => true,
         };
-        if !on {
-            continue;
+        if !on || matches!(o.kind, Kind::Mask { .. }) {
+            continue; // mask apertures are not copper
         }
         let col = match o.kind {
             Kind::Keepout { .. } => [120, 0, 120],

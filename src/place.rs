@@ -450,6 +450,8 @@ impl<'a> Problem<'a> {
             .iter()
             .filter(|o| match o.kind {
                 Kind::Pad { fp, .. } => !idx_of_fp.contains_key(&fp),
+                // mask apertures move with their part; they only matter to the router
+                Kind::Mask { fp, .. } => !idx_of_fp.contains_key(&fp),
                 _ => true,
             })
             .filter(|o| {

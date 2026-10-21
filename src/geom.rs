@@ -212,6 +212,20 @@ impl Shape {
             },
         }
     }
+    /// the shape grown by d on every side
+    pub fn inflated(&self, d: f64) -> Shape {
+        match self {
+            Shape::Capsule { a, b, r } => Shape::Capsule {
+                a: *a,
+                b: *b,
+                r: r + d,
+            },
+            Shape::Poly { pts, r } => Shape::Poly {
+                pts: pts.clone(),
+                r: r + d,
+            },
+        }
+    }
     /// mirror local y (flip to the other side)
     pub fn mirror_y(&self) -> Shape {
         match self {

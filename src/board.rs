@@ -32,6 +32,32 @@ pub fn layer_mask(names: &[String]) -> u8 {
     m
 }
 
+/// solder mask layers ("F.Mask", "*.Mask", ...) as the mask of the copper layer they expose
+/// (F.Mask -> F.Cu, B.Mask -> B.Cu)
+pub fn mask_layers(names: &[String]) -> u8 {
+    let mut m = 0u8;
+    for n in names {
+        match n.as_str() {
+            "*.Mask" | "F&B.Mask" => m |= 1 | (1 << (NL - 1)),
+            "F.Mask" => m |= 1,
+            "B.Mask" => m |= 1 << (NL - 1),
+            _ => {}
+        }
+    }
+    m
+}
+
+/// swap the copper layer bits of a mask front to back (side flip)
+fn flip_layers(lm: u8) -> u8 {
+    let mut m = 0u8;
+    for l in 0..NL {
+        if lm & (1 << l) != 0 {
+            m |= 1 << (NL - 1 - l);
+        }
+    }
+    m
+}
+
 #[derive(Debug, Clone)]
 pub struct Pad {
     pub num: String,
@@ -50,6 +76,10 @@ pub struct Pad {
     /// plated hole with `remove_unused_layers`: the pad shape only on the outer layers, only the
     /// barrel on the inner layers
     pub inner_barrel_only: bool,
+    /// outer copper layers whose solder mask is opened over the pad (bit 0 = F.Mask, bit 5 = B.Mask)
+    pub mask: u8,
+    /// local solder mask expansion (pad, else footprint); None = board setup value
+    pub mask_margin: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +99,9 @@ pub struct Footprint {
     pub pads: Vec<Pad>,
     /// courtyard polygon in the footprint frame (as stored, i.e. already mirrored for B)
     pub crtyd: Vec<P>,
+    /// solder mask graphics (fp_* on F.Mask / B.Mask) in the footprint frame, as (shape, mask of
+    /// the copper layer they expose)
+    pub mask: Vec<(Shape, u8)>,
     pub span: (usize, usize),
 }
 
@@ -86,6 +119,13 @@ impl Footprint {
     pub fn pad_shapes(&self, pd: &Pad) -> Vec<Shape> {
         let (c, a) = self.pad_world(pd);
         pd.shapes.iter().map(|s| s.xform(c, a)).collect()
+    }
+    /// solder mask graphics in world coordinates
+    pub fn mask_world(&self) -> Vec<(Shape, u8)> {
+        self.mask
+            .iter()
+            .map(|(s, lm)| (s.xform(self.at, self.rot), *lm))
+            .collect()
     }
     pub fn crtyd_world(&self) -> Vec<P> {
         self.crtyd
@@ -105,14 +145,14 @@ impl Footprint {
                 pd.pos = p(pd.pos.x, -pd.pos.y);
                 pd.rel_rot = -pd.rel_rot;
                 pd.shapes = pd.shapes.iter().map(|s| s.mirror_y()).collect();
-                let mut m = 0u8;
-                for l in 0..NL {
-                    if pd.layers & (1 << l) != 0 {
-                        m |= 1 << (NL - 1 - l);
-                    }
-                }
-                pd.layers = m;
+                pd.layers = flip_layers(pd.layers);
+                pd.mask = flip_layers(pd.mask);
             }
+            f.mask = f
+                .mask
+                .iter()
+                .map(|(s, lm)| (s.mirror_y(), flip_layers(*lm)))
+                .collect();
         }
         f
     }
@@ -172,6 +212,10 @@ pub struct Board {
     pub bbox: BBox,
     /// copper layers present in the board's layer stack (bit i = CU[i]); 2-, 4- and 6-layer boards
     pub cu_mask: u8,
+    /// board-level solder mask graphics (gr_* on F.Mask / B.Mask), as (shape, exposed copper layer)
+    pub mask: Vec<(Shape, u8)>,
+    /// board setup solder mask expansion of pads (`pad_to_mask_clearance`)
+    pub mask_margin: f64,
 }
 
 impl Board {
@@ -202,7 +246,7 @@ fn pts_of(l: &List) -> Vec<P> {
         .unwrap_or_default()
 }
 
-fn parse_pad(l: &List, b: &mut Board, fp_rot: f64) -> Pad {
+fn parse_pad(l: &List, b: &mut Board, fp_rot: f64, fp_margin: Option<f64>) -> Pad {
     let num = l.arg(0).unwrap_or("").to_string();
     let kind = l.arg(1).unwrap_or("").to_string();
     let shape = l.arg(2).unwrap_or("").to_string();
@@ -307,6 +351,8 @@ fn parse_pad(l: &List, b: &mut Board, fp_rot: f64) -> Pad {
         drill,
         local_clr,
         inner_barrel_only,
+        mask: mask_layers(&l.atoms("layers")),
+        mask_margin: l.valf("solder_mask_margin").or(fp_margin),
     }
 }
 
@@ -449,6 +495,13 @@ fn graphic_shapes(g: &List) -> Vec<Shape> {
         _ => {}
     }
     out
+}
+
+/// exposed copper layer of a solder mask graphic item (0 if it is not on a mask layer)
+fn graphic_mask_layers(g: &List) -> u8 {
+    g.val("layer")
+        .map(|l| mask_layers(&[l.to_string()]))
+        .unwrap_or(0)
 }
 
 /// copper layer mask of a graphic item (0 if it is not on copper)
@@ -613,6 +666,9 @@ pub fn parse_board(text: String) -> Result<Board, String> {
                     }
                 }
             }
+            "setup" => {
+                b.mask_margin = it.valf("pad_to_mask_clearance").unwrap_or(0.0);
+            }
             "footprint" => {
                 let (x, y, r) = it.xy("at").unwrap_or((0.0, 0.0, 0.0));
                 let mut refd = String::new();
@@ -628,13 +684,14 @@ pub fn parse_board(text: String) -> Result<Board, String> {
                 }
                 let pads: Vec<Pad> = it
                     .children("pad")
-                    .map(|pd| parse_pad(pd, &mut b, r))
+                    .map(|pd| parse_pad(pd, &mut b, r, it.valf("solder_mask_margin")))
                     .collect();
                 let fpz: Vec<Zone> = it
                     .children("zone")
                     .map(|z| parse_zone(z, &mut b, Some(&refd), Some((p(x, y), r))))
                     .collect();
                 b.zones.extend(fpz);
+                let mut mask = Vec::new();
                 for g in it.lists() {
                     if !(g.head().starts_with("fp_") || g.head() == "property") {
                         continue;
@@ -646,6 +703,14 @@ pub fn parse_board(text: String) -> Result<Board, String> {
                             if let Shape::Capsule { a, b: e, .. } = sh.xform(at, r) {
                                 b.edge_segs.push((a, e));
                             }
+                        }
+                        continue;
+                    }
+                    let mm = graphic_mask_layers(g);
+                    if mm != 0 && !matches!(g.head(), "fp_text" | "property") {
+                        // mask openings (e.g. over a solder jumper), kept in the footprint frame
+                        for sh in graphic_shapes(g) {
+                            mask.push((sh, mm));
                         }
                         continue;
                     }
@@ -680,6 +745,7 @@ pub fn parse_board(text: String) -> Result<Board, String> {
                     board,
                     pads,
                     crtyd: courtyard(it),
+                    mask,
                     span: it.span,
                 });
             }
@@ -752,6 +818,13 @@ pub fn parse_board(text: String) -> Result<Board, String> {
             }
             "gr_line" | "gr_rect" | "gr_poly" | "gr_arc" | "gr_circle" => {
                 if it.val("layer") != Some("Edge.Cuts") {
+                    let mm = graphic_mask_layers(it);
+                    if mm != 0 {
+                        for sh in graphic_shapes(it) {
+                            b.mask.push((sh, mm));
+                        }
+                        continue;
+                    }
                     let lm = graphic_layers(it);
                     if lm != 0 {
                         b.graphics
