@@ -73,12 +73,14 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `--via-cost` | 30 | via cost (in grid steps) |
 | `--bend-cost` / `--bend90` | 4 / 1.4 | cost of a 45° bend / factor for 90° bends |
 | `--hweight` | 1.02 | A\* heuristic weight (>1: faster, less optimal) |
-| `--max-expand` | 4e6 | node budget per search |
+| `--max-expand` | 4e6 | node budget per search (at least half the nodes of the net's window) |
 | `--iters` | 25 | negotiation iterations |
 | `--job-margin` | 6 | per-net search window margin in mm |
 | `--no-stubs` / `--no-clean` | | disable straight pad exits / the cleanup |
 | `--stub-ext` / `--stub-ext-long` | 0.6 / 0.6 | exit stub length beyond the pad (mm) |
 | `--own-pad-cost` / `--stub-side-cost` | 40 / 20 | cost of crossing own pads / of side exits on long pads |
+| `--yield-pours PATTERNS` | | locked pours (zone name wildcards) that do not block (KiCad refills them); also `yield_pours` in the config |
+| `--ignore-unlocked` | | ignore unlocked tracks/vias of the input (old behaviour; by default all existing copper blocks other nets) |
 | `--dbg-net NAME` | | verbose trace of one net |
 
 ## How routing works
@@ -175,7 +177,9 @@ same placed input):
 - Copper layers are indexed as a 6-layer stack (`F.Cu`, `In1..In4.Cu`, `B.Cu`); boards with more
   inner layers are not supported. Boards with fewer layers work (missing layers are masked out; tested with 4 layers).
 - Plane nets, pours and high-current/HV nets are not routed (skip them via the config); existing
-  zones are obstacles (locked) or ignored (unlocked, refilled later by KiCad).
+  zones are obstacles (locked) or ignored (unlocked or listed in `yield_pours`, refilled later by
+  KiCad). Existing tracks and vias, locked or not, are kept and block other nets.
+- DRU conditions that depend on position (`intersectsCourtyard`, `insideArea`) are not evaluated.
 - Through vias only; no differential pairs, no length tuning; DRU max-length rules are only used by
   `place`.
 - Very long multi-pin nets are slow (millions of nodes per search); restrict with `--region`/`--nets`.

@@ -12,6 +12,14 @@ All notable changes to this project are documented here. The format follows
 - The neck-down width respects the Board Setup minimum track width (#0005).
 - Copper graphics and copper text without a net are obstacles, Edge.Cuts drawn inside footprints
   are part of the board outline (#0006).
+- Unlocked tracks and vias of other nets are obstacles (they stay in the output); `--ignore-unlocked`
+  restores the old behaviour (#0008).
+- Plated pads with `remove_unused_layers` block only with their barrel on inner layers (#0010).
+- Failed nets report why the search stopped (node cap, job window, no path); the node cap grows
+  with the net's search window (#0011).
+
+### Added
+- `--yield-pours` / config `yield_pours`: locked pours that yield like unlocked ones (#0009).
 
 ## [0.1.0] - 2026-10-21
 

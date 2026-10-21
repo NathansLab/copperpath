@@ -120,10 +120,14 @@ pub fn load_ctx(a: &Args) -> Result<Ctx, String> {
         &board.nets,
     )?;
     // board configuration: optional JSON (see examples/config.json), built-in defaults otherwise
-    let cfg = match a.get("cfg") {
+    let mut cfg = match a.get("cfg") {
         Some(path) => model::load_cfg(path, a.get("board"))?,
         None => model::BoardCfg::default(),
     };
+    if let Some(y) = a.get("yield-pours") {
+        cfg.yield_pours
+            .extend(y.split(',').filter(|s| !s.is_empty()).map(String::from));
+    }
     eprintln!(
         "[load] {} footprints, {} tracks, {} vias, {} zones, {} copper graphics, {} nets, {} DRU rules in {:.2} s",
         board.fps.len(),
@@ -823,12 +827,14 @@ fn cmd_route(a: &Args) -> CmdResult {
     {
         return Err("--out must differ from --pcb (the input board is never overwritten)".into());
     }
-    let m = model::Model::new(
-        &c.board,
-        &c.rules,
-        c.cfg.clone(),
-        model::CopperMode::LockedOnly,
-    );
+    // all existing copper stays in the output, so all of it is an obstacle for other nets (and
+    // connectivity for its own net); --ignore-unlocked restores the old "locked only" view
+    let mode = if a.get("ignore-unlocked").is_some() {
+        model::CopperMode::LockedOnly
+    } else {
+        model::CopperMode::All
+    };
+    let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), mode);
     let mut p = droute::DParams::default();
     p.res = a.f("res", p.res);
     p.via_cost = a.f("via-cost", p.via_cost as f64) as f32;
@@ -890,14 +896,14 @@ fn cmd_route(a: &Args) -> CmdResult {
     eprintln!("[aes] pins {} without legal stub {} {:?}; stub ends {}, short stubs {:?}, fallback pad ends {}; stub alignments {} (failed {}), pull-tights {}, mitered {} (kept 90: {} = clearance/L-stubs/shift-blocked/Z-U-short/short-legs {:?}, stub-end shifts {}), exact-check fails {}",
         s.pins, s.pins_no_stub.len(), s.pins_no_stub, s.stubs_used, s.short_stubs, s.fallback_ends, s.aligned, s.align_failed, s.pulls, s.mitered, s.miter_failed, s.kept90, s.shifted, s.exact_fail);
     let mut warnings: Vec<String> = Vec::new();
-    for (n, left) in &res.failed {
+    for ((n, left), why) in res.failed.iter().zip(&res.why) {
         eprintln!(
-            "[route]   FAILED {} ({} components left)",
-            c.board.nets[*n], left
+            "[route]   FAILED {} ({} components left): {}",
+            c.board.nets[*n], left, why
         );
         warnings.push(format!(
-            "net {} not completed ({} components left)",
-            c.board.nets[*n], left
+            "net {} not completed ({} components left): {}",
+            c.board.nets[*n], left, why
         ));
     }
     if level != "full" {

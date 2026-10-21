@@ -47,6 +47,9 @@ pub struct Pad {
     pub drill: f64,
     /// local pad clearance override (0 = none)
     pub local_clr: f64,
+    /// plated hole with `remove_unused_layers`: the pad shape only on the outer layers, only the
+    /// barrel on the inner layers
+    pub inner_barrel_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +282,7 @@ fn parse_pad(l: &List, b: &mut Board, fp_rot: f64) -> Pad {
         "trapezoid" => shapes.push(rect_shape(o, w, h, 0.0, 0.0)),
         _ => shapes.push(rect_shape(o, w, h, 0.0, 0.0)),
     }
+    let inner_barrel_only = kind == "thru_hole" && l.flag("remove_unused_layers");
     if kind == "np_thru_hole" && shapes.is_empty() {
         shapes.push(Shape::circle(o, drill / 2.0));
     }
@@ -293,6 +297,7 @@ fn parse_pad(l: &List, b: &mut Board, fp_rot: f64) -> Pad {
         layers,
         drill,
         local_clr,
+        inner_barrel_only,
     }
 }
 

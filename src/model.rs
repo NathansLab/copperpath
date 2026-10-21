@@ -56,6 +56,8 @@ pub struct BoardCfg {
     pub layer_dir: [u8; NL],
     /// reference wildcard of mounting holes (their keepout rules apply)
     pub mh_pattern: String,
+    /// locked pours (zone name wildcards) that yield like unlocked ones (KiCad refills them)
+    pub yield_pours: Vec<String>,
 }
 
 impl Default for BoardCfg {
@@ -68,6 +70,7 @@ impl Default for BoardCfg {
             class_layers: Vec::new(),
             layer_dir: [0, 1, 0, 1, 0, 1],
             mh_pattern: "MH*".into(),
+            yield_pours: Vec::new(),
         }
     }
 }
@@ -119,6 +122,7 @@ pub fn parse_cfg(j: &Value, board: Option<&str>) -> Result<BoardCfg, String> {
     };
     c.skip_classes = strs(&b["skip_classes"]);
     c.skip_nets = strs(&b["skip_nets"]);
+    c.yield_pours = strs(&b["yield_pours"]);
     c.via_keepout_refs = strs(&b["via_keepout_refs"]);
     if let Some(cl) = b["class_layers"].as_object() {
         for (k, v) in cl {
@@ -221,7 +225,7 @@ impl<'a> Model<'a> {
             if mode == CopperMode::LockedOnly && !z.locked {
                 continue;
             }
-            if !z.locked {
+            if !z.locked || cfg.yield_pours.iter().any(|p| wild(&z.name, p)) {
                 continue; // router pours never block (they refill)
             }
             objs.push(Obj {
@@ -300,9 +304,27 @@ impl<'a> Model<'a> {
             } else {
                 0.0
             };
+            // outer copper layers (F.Cu, B.Cu)
+            let outer: u8 = 1 | (1 << (NL - 1));
+            if pd.inner_barrel_only && pd.layers & !outer != 0 {
+                // unused inner layers keep only the plated barrel (KiCad removes the annulus there;
+                // a track of the own net on such a layer would bring it back: accepted)
+                let s = Shape::circle(f.pad_world(pd).0, pd.drill / 2.0);
+                objs.push(Obj {
+                    bbox: s.bbox(),
+                    shape: s,
+                    layers: pd.layers & !outer,
+                    net: pd.net,
+                    kind: Kind::Pad { fp: fi, pad: pi },
+                    locked: f.locked,
+                    hole_r,
+                });
+            }
             for s in f.pad_shapes(pd) {
                 let layers = if pd.kind == "np_thru_hole" {
                     0x3f
+                } else if pd.inner_barrel_only {
+                    pd.layers & outer
                 } else {
                     pd.layers
                 };
@@ -486,4 +508,80 @@ pub fn mst_connections(pins: &[Pin]) -> Vec<(usize, usize)> {
         upd(&mut best, &in_tree, bi);
     }
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn board(items: &str) -> Board {
+        crate::board::parse_board(format!(
+            "(kicad_pcb (version 20260206) (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" signal) \
+             (6 \"In2.Cu\" signal) (2 \"B.Cu\" signal)) {items})"
+        ))
+        .unwrap()
+    }
+
+    fn objs(b: &Board, cfg: BoardCfg, mode: CopperMode) -> Vec<Obj> {
+        let r = Rules::load("", "", &b.nets).unwrap();
+        Model::new(b, &r, cfg, mode).objs
+    }
+
+    #[test]
+    fn unlocked_copper_of_other_nets_is_an_obstacle() {
+        let b = board("(segment (start 0 0) (end 5 0) (width 0.25) (layer \"F.Cu\") (net \"HV\"))");
+        let track = |o: &Obj| matches!(o.kind, Kind::Track);
+        assert_eq!(
+            objs(&b, BoardCfg::default(), CopperMode::All)
+                .iter()
+                .filter(|o| track(o))
+                .count(),
+            1
+        );
+        assert_eq!(
+            objs(&b, BoardCfg::default(), CopperMode::LockedOnly)
+                .iter()
+                .filter(|o| track(o))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn yield_pours_releases_locked_pours() {
+        let b = board(
+            "(zone (net \"GND\") (name \"CELL1_GND\") (layer \"F.Cu\") (locked yes) \
+             (polygon (pts (xy 0 0) (xy 5 0) (xy 5 5) (xy 0 5))))",
+        );
+        let zones = |c: BoardCfg| {
+            objs(&b, c, CopperMode::All)
+                .iter()
+                .filter(|o| matches!(o.kind, Kind::Zone))
+                .count()
+        };
+        assert_eq!(zones(BoardCfg::default()), 1);
+        let cfg = BoardCfg {
+            yield_pours: vec!["CELL*".into()],
+            ..BoardCfg::default()
+        };
+        assert_eq!(zones(cfg), 0);
+    }
+
+    #[test]
+    fn removed_unused_layers_leave_only_the_barrel_inside() {
+        let b = board(
+            "(footprint \"MH\" (layer \"F.Cu\") (at 10 10) (property \"Reference\" \"H1\") \
+             (pad \"1\" thru_hole circle (at 0 0) (size 8.6 8.6) (drill 4.3) (layers \"*.Cu\") \
+             (remove_unused_layers yes) (keep_end_layers yes) (net \"PE\")))",
+        );
+        let os = objs(&b, BoardCfg::default(), CopperMode::All);
+        let inner: u8 = 0b011110;
+        let barrel: Vec<&Obj> = os.iter().filter(|o| o.layers & inner != 0).collect();
+        assert_eq!(barrel.len(), 1);
+        assert!((barrel[0].bbox.x1 - barrel[0].bbox.x0 - 4.3).abs() < 1e-6);
+        // the full 8.6 mm pad stays on F.Cu and B.Cu only
+        assert!(os
+            .iter()
+            .any(|o| o.layers == 0b100001 && o.bbox.x1 - o.bbox.x0 > 8.5));
+    }
 }

@@ -240,6 +240,8 @@ struct Owners {
 pub struct DResult {
     pub routed: HashMap<usize, RNet>,
     pub failed: Vec<(usize, usize)>, // (net, unconnected components left)
+    /// why the last search of each failed net gave up (same order as `failed`)
+    pub why: Vec<&'static str>,
     pub routes: usize,
     pub rips: usize,
     pub conns: usize,
@@ -286,6 +288,8 @@ pub struct Router<'a> {
     stubs: Vec<Vec<Stub>>,
     maxd: f64,
     expanded: std::sync::atomic::AtomicU64,
+    /// per job: reason of the last failed search (0 none, 1 node cap, 2 job window, 3 no path)
+    why: Vec<std::sync::atomic::AtomicU8>,
 }
 
 const OFF: [(f64, f64); 4] = [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)];
@@ -454,6 +458,7 @@ impl<'a> Router<'a> {
                 eprintln!("[dbg] {} hw {:.2} hn {:.2} vr {:.2}: via sites {} (blockers {:?}), free track cells per layer {:?}", m.b.nets[j.net], j.hw, j.hn, j.vr, fv, hist, ft);
             }
         }
+        let nj_why = jobs.len();
         Router {
             m,
             gs,
@@ -464,6 +469,7 @@ impl<'a> Router<'a> {
             stubs,
             maxd,
             expanded: Default::default(),
+            why: (0..nj_why).map(|_| Default::default()).collect(),
         }
     }
 
@@ -789,9 +795,20 @@ impl<'a> Router<'a> {
             pres *= self.p.pres_mul;
             it += 1;
         }
-        let failed = (0..nj)
+        let failed: Vec<(usize, usize)> = (0..nj)
             .filter(|k| left[*k] > 0)
             .map(|k| (self.jobs[k].net, left[k]))
+            .collect();
+        let why = (0..nj)
+            .filter(|k| left[*k] > 0)
+            .map(
+                |k| match self.why[k].load(std::sync::atomic::Ordering::Relaxed) {
+                    1 => "node cap hit (raise --max-expand)",
+                    2 => "job window exhausted (raise --job-margin)",
+                    3 => "no path (target unreachable)",
+                    _ => "no legal start or target cell",
+                },
+            )
             .collect();
         let conns = self
             .jobs
@@ -920,6 +937,7 @@ impl<'a> Router<'a> {
                 .map(|k| (self.jobs[k].net, routed[k].clone()))
                 .collect(),
             failed,
+            why,
             routes,
             rips: it,
             conns,
@@ -1361,12 +1379,18 @@ impl<'a> Router<'a> {
         let mut expanded = 0u64;
         let mut found = None;
         let hw = self.p.hweight;
+        // node cap: the configured value, at least half the nodes of the job window
+        let cap = self.p.max_expand.max((n * NL / 2) as u64);
+        let (jx0, jy0) = (mp.ox as i32, mp.oy as i32);
+        let (jx1, jy1) = (jx0 + mp.g.nx as i32 - 1, jy0 + mp.g.ny as i32 - 1);
+        let clipped = mp.g.nx < self.gs.nx || mp.g.ny < self.gs.ny;
+        let mut edge = false;
         while let Some(Reverse((_, ln))) = heap.pop() {
             let ln = ln as usize;
             let (l, i) = glob(ln);
             let node = l * n + mp.li(self.gs.nx, i).unwrap();
             expanded += 1;
-            if expanded > self.p.max_expand {
+            if expanded > cap {
                 break;
             }
             let tm = tmark[node];
@@ -1377,6 +1401,7 @@ impl<'a> Router<'a> {
             let gc = g[ln];
             let x = (i as i32) % nxg;
             let y = (i as i32) / nxg;
+            edge |= x == jx0 || x == jx1 || y == jy0 || y == jy1;
             let din = indir[ln];
             for (d, (dx, dy)) in DIRS.iter().enumerate() {
                 let (xx, yy) = (x + dx, y + dy);
@@ -1461,6 +1486,16 @@ impl<'a> Router<'a> {
         }
         self.expanded
             .fetch_add(expanded, std::sync::atomic::Ordering::Relaxed);
+        if found.is_none() {
+            let why = if expanded > cap {
+                1
+            } else if edge && clipped {
+                2
+            } else {
+                3
+            };
+            self.why[k].store(why, std::sync::atomic::Ordering::Relaxed);
+        }
         let (ln, c) = found?;
         let mut path = vec![glob(ln)];
         let mut cur = ln;
