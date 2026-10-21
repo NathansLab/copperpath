@@ -1,0 +1,18 @@
+(version 1)
+# Custom rules of the demo board (read by KiCad DRC and by placeroute).
+
+# power nets keep more distance to everything else on the outer layers
+(rule "power_outer_clearance"
+  (layer outer)
+  (condition "A.NetClass == 'Power' && B.NetClass != 'Power'")
+  (constraint clearance (min 0.3mm)))
+
+# power tracks: 0.4 mm, neck-down to 0.25 mm at fine-pitch pins
+(rule "power_track_width"
+  (condition "A.NetClass == 'Power'")
+  (constraint track_width (min 0.25mm) (opt 0.4mm) (max 2mm)))
+
+# copper keeps 0.5 mm from the mounting-hole drills
+(rule "mounting_hole_clearance"
+  (condition "A.memberOfFootprint('MH*')")
+  (constraint hole_clearance (min 0.5mm)))
