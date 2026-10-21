@@ -28,6 +28,10 @@ All notable changes to this project are documented here. The format follows
 - Pad drill offsets shift the pad copper (#0014).
 - New vias and tracks of different nets keep the minimum hole clearance (#0015).
 - Multi-line copper texts are obstacles over their full height.
+- Fine-pitch pins whose pad axes sit off the 0.05 mm grid get exit stubs again: copper may touch
+  the clearance exactly (1 nm float guard instead of a 5 µm margin), and the routing grid is
+  shifted onto the axes of the tightest pin rows (#1; synthetic QFN-48 at 0.4 mm pitch, 0.0164 mm
+  off-grid: 48 of 48 pins without a stub -> 0, all 48 connections routed).
 - Faster negotiation: A* skips stale heap entries and caches its heuristic per cell (same
   result, demo 5.5 s -> 2.8 s); nets with non-interacting windows route in parallel; the
   negotiation stops after 3 iterations without progress (`--stall-iters`) instead of 6
