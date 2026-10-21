@@ -40,8 +40,9 @@ pub struct StitchResult {
     /// lone islands that got a via
     pub fixed: usize,
     pub vias: Vec<P>,
-    /// lone islands without a legal spot: (layer, point inside, area mm^2)
-    pub failed: Vec<(String, P, f64)>,
+    /// lone islands without a legal spot: (layer, point inside, area mm^2, nearest blockers of
+    /// a via at that point)
+    pub failed: Vec<(String, P, f64, Vec<Blocker>)>,
     /// rejected candidates by cause
     pub why: BTreeMap<String, usize>,
 }
@@ -160,11 +161,15 @@ pub fn stitch(m: &Model, p: &StitchParams) -> StitchResult {
                     own.push(q);
                     res.fixed += 1;
                 }
-                None => res.failed.push((
-                    crate::board::CU[isl.layer].to_string(),
-                    inner_point(isl, ctr),
-                    (isl.area * 100.0).round() / 100.0,
-                )),
+                None => {
+                    let q = inner_point(isl, ctr);
+                    res.failed.push((
+                        crate::board::CU[isl.layer].to_string(),
+                        q,
+                        (isl.area * 100.0).round() / 100.0,
+                        nearest_blockers(m, net, &Shape::circle(q, vr), 0x3f, 3.0, 3),
+                    ))
+                }
             }
         }
         if p.grid > 0.0 {

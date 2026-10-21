@@ -727,6 +727,95 @@ pub fn components(m: &Model, ids: &[usize]) -> Vec<usize> {
     (0..k).map(|j| find(&mut par, j)).collect()
 }
 
+/// copper of another net (or a rule area) near new copper of `net`, for reports: what an agent
+/// would have to move
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Blocker {
+    pub net: String,
+    /// "pad", "track", "via", "zone", "keepout", "graphic"
+    pub kind: &'static str,
+    /// footprint reference of a pad
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fp: Option<String>,
+    pub layer: String,
+    /// edge-to-edge distance (mm) from the probe shape
+    pub dist_mm: f64,
+    /// required clearance (mm) on that layer (DRU/net class incl. outer-layer creepage)
+    pub need_mm: f64,
+    pub locked: bool,
+    /// a point of the blocker (mm)
+    pub at: [f64; 2],
+}
+
+/// up to `k` objects that come closest to violating their clearance with the probe `shape` of
+/// `net` on `layers` (sorted by distance minus required clearance), within `reach` mm
+pub fn nearest_blockers(
+    m: &Model,
+    net: usize,
+    shape: &Shape,
+    layers: u8,
+    reach: f64,
+    k: usize,
+) -> Vec<Blocker> {
+    let bb = shape.bbox().inflate(reach);
+    let r4 = |v: f64| (v * 1e4).round() / 1e4;
+    let mut out: Vec<(f64, Blocker)> = Vec::new();
+    for o in &m.objs {
+        if o.layers & layers == 0 || !o.bbox.overlaps(&bb) {
+            continue;
+        }
+        let kind = match o.kind {
+            Kind::Pad { .. } => "pad",
+            Kind::Track => "track",
+            Kind::Via => "via",
+            Kind::Zone if o.net == 0 => "graphic",
+            Kind::Zone => "zone",
+            Kind::Keepout { .. } | Kind::ViaKeepout => "keepout",
+            Kind::Mask { .. } => continue,
+        };
+        if o.net == net && net != 0 && kind != "keepout" {
+            continue;
+        }
+        let l = (0..crate::board::NL)
+            .find(|l| o.layers & layers & (1 << l) != 0)
+            .unwrap_or(0);
+        let need = (0..crate::board::NL)
+            .filter(|l| o.layers & layers & (1 << l) != 0)
+            .map(|l| m.clr(net, o, l))
+            .fold(0.0f64, f64::max);
+        let d = shape_dist(shape, &o.shape);
+        if d > reach {
+            continue;
+        }
+        let at = match &o.shape {
+            Shape::Capsule { a, b, .. } => (*a + *b) * 0.5,
+            Shape::Poly { pts, .. } => o.bbox.center().min_by_dist(pts),
+        };
+        out.push((
+            d - need,
+            Blocker {
+                net: m.b.nets[o.net].clone(),
+                kind,
+                fp: match o.kind {
+                    Kind::Pad { fp, .. } => Some(m.b.fps[fp].refd.clone()),
+                    _ => None,
+                },
+                layer: if o.layers.count_ones() > 1 && kind == "via" {
+                    "through".into()
+                } else {
+                    crate::board::CU[l].to_string()
+                },
+                dist_mm: r4(d),
+                need_mm: r4(need),
+                locked: o.locked,
+                at: [r4(at.x), r4(at.y)],
+            },
+        ));
+    }
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+    out.into_iter().take(k).map(|(_, b)| b).collect()
+}
+
 /// two-pin connections: minimum spanning tree over the copper components of each net
 pub fn mst_connections(pins: &[Pin]) -> Vec<(usize, usize)> {
     // group pins by component, connect components (Prim on component representatives using nearest pin pair)

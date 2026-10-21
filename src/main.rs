@@ -1278,7 +1278,23 @@ fn cmd_fanout(a: &Args) -> CmdResult {
                 i.layer.as_deref().unwrap_or(""),
                 i.via.unwrap_or_default()
             ),
-            None => eprintln!("[fanout]   failed {:?}: {:?}", i.pads, i.why),
+            None => eprintln!(
+                "[fanout]   failed {:?}: {:?}; nearest blocker {}",
+                i.pads,
+                i.why,
+                i.blockers
+                    .first()
+                    .map(|b| format!(
+                        "{} {} {} on {} at {:.2} mm (needs {:.2})",
+                        b.net,
+                        b.kind,
+                        b.fp.as_deref().unwrap_or(""),
+                        b.layer,
+                        b.dist_mm,
+                        b.need_mm
+                    ))
+                    .unwrap_or_else(|| "-".into())
+            ),
         }
     }
     let mut routed = HashMap::new();
@@ -1342,7 +1358,7 @@ fn cmd_stitch(a: &Args) -> CmdResult {
         t.elapsed().as_secs_f64(),
         r.why
     );
-    for (l, q, ar) in r.failed.iter().take(12) {
+    for (l, q, ar, _) in r.failed.iter().take(12) {
         eprintln!("[stitch]   no spot: {l} ({:.2}, {:.2}) {ar} mm2", q.x, q.y);
     }
     // vias go into a copy of the input, or of --base (e.g. the same board without saved fills)
@@ -1369,7 +1385,7 @@ fn cmd_stitch(a: &Args) -> CmdResult {
         "out": out, "net": net_name, "via": [via_d, drill],
         "islands": r.islands, "lone": r.lone, "fixed": r.fixed,
         "vias": r.vias.iter().map(|q| [geom_r(q.x), geom_r(q.y)]).collect::<Vec<_>>(),
-        "failed": r.failed.iter().map(|(l, q, ar)| json!({"layer": l, "at": [geom_r(q.x), geom_r(q.y)], "area_mm2": ar})).collect::<Vec<_>>(),
+        "failed": r.failed.iter().map(|(l, q, ar, bl)| json!({"layer": l, "at": [geom_r(q.x), geom_r(q.y)], "area_mm2": ar, "blockers": bl})).collect::<Vec<_>>(),
         "rejected": r.why,
     }))
 }

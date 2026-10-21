@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `fanout` and `stitch` report the nearest blockers of every failed island in `--json`
+  (net, kind, footprint, layer, distance, required clearance, locked, position): what an agent would
+  have to move (`model::nearest_blockers`).
 - `fanout`: one track + via per open island of a plane net onto a plane fill (grid search from an
   SMD pad to the nearest legal via spot within `--reach`), neck-down inside the pad's courtyard
   from a DRU `track_width` rule with `intersectsCourtyard`. About 1 s for 42 islands on a 6-layer

@@ -73,6 +73,13 @@ fn one_via_per_lone_island() {
     assert_eq!(v["lone"], 4, "{v}");
     assert_eq!(v["fixed"], 2, "{v}");
     assert_eq!(v["failed"].as_array().unwrap().len(), 2, "{v}");
+    // what blocks them: the other net on B.Cu, and the no-via rule area
+    let first = |i: usize| v["failed"][i]["blockers"][0].clone();
+    let kinds: Vec<String> = (0..2)
+        .map(|i| format!("{} {}", first(i)["kind"], first(i)["net"]))
+        .collect();
+    assert!(kinds.iter().any(|k| k == "\"track\" \"SIG\""), "{v}");
+    assert!(kinds.iter().any(|k| k.starts_with("\"keepout\"")), "{v}");
     let vs = vias(&v);
     assert_eq!(vs.len(), 2, "{v}");
     let inside = |q: &(f64, f64), x0: f64, y0: f64, x1: f64, y1: f64| {
