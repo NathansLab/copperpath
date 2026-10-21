@@ -1,0 +1,27 @@
+{
+  "_doc": [
+    "Board configuration for placeroute (--cfg). Every key is optional; without --cfg every net",
+    "with at least two pads is routed on every copper layer of the board.",
+    "Keys may sit at the top level, or per board under \"boards\": {\"<name>\": {...}} (pick one",
+    "with --board <name>; without --board the first entry is used). Keys starting with _ are ignored.",
+    "Wildcards: * and ? (e.g. \"MH*\", \"/Driver/*\").",
+    "  skip_classes        net classes that are not routed (e.g. classes poured as planes)",
+    "  skip_nets           nets that are not routed",
+    "  planes              plane nets (strings or {\"net\": ...}); never routed",
+    "  via_keepout_refs    footprints whose courtyard forbids vias",
+    "  class_layers        allowed copper layers per net class",
+    "  layer_dir           preferred direction per layer for the global router (H or V)",
+    "  mounting_hole_refs  reference pattern of mounting holes (default MH*)"
+  ],
+  "layer_dir": { "F.Cu": "H", "In1.Cu": "V", "In2.Cu": "H", "In3.Cu": "V", "In4.Cu": "H", "B.Cu": "V" },
+  "mounting_hole_refs": "MH*",
+  "boards": {
+    "demo": {
+      "skip_classes": [],
+      "skip_nets": [],
+      "planes": [],
+      "via_keepout_refs": ["MH*"],
+      "class_layers": { "Power": ["F.Cu", "B.Cu", "In1.Cu", "In2.Cu"] }
+    }
+  }
+}

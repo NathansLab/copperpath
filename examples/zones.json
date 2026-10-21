@@ -1,0 +1,29 @@
+{
+  "_doc": [
+    "Placement problem for `placeroute place --zones` (written by a person or an AI agent).",
+    "movable / fixed: reference wildcards or sheet:<sheet name>. Parts not listed as movable stay.",
+    "zones[]: refs, rect [x0,y0,x1,y1] or poly [[x,y],...], side F/B/FB, rot_step (deg, 0 = keep),",
+    "rot_pref (deg list), near {ref, pin, max} (hard distance limit in mm), why (free text).",
+    "eval_region + via_class: where free via sites of that class count in the cost.",
+    "init: keep | schematic | both. weights: hpwl, cross, via, cong, loop_, len, exit, pref, near, diag.",
+    "loop_nets: net wildcards whose length is weighted extra. moves: per start. seed: RNG seed."
+  ],
+  "movable": ["sheet:Driver"],
+  "fixed": ["J*", "MH*"],
+  "zones": [
+    {
+      "refs": ["sheet:Driver"],
+      "rect": [112, 106, 160, 132],
+      "side": "F",
+      "rot_step": 90,
+      "near": { "ref": "U2", "pin": "1", "max": 25 },
+      "why": "driver block stays between controller and outputs"
+    }
+  ],
+  "eval_region": [112, 106, 160, 132],
+  "via_class": "Default",
+  "init": "keep",
+  "loop_nets": [],
+  "moves": 20000,
+  "seed": 1
+}
