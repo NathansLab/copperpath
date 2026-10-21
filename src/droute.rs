@@ -36,6 +36,8 @@ pub struct DParams {
     /// nets routed in parallel against the same snapshot even if their windows overlap
     /// (1 = only non-overlapping nets in parallel: result identical to serial routing)
     pub par_nets: usize,
+    /// stop negotiating in time to finish by this instant (--time-limit); best result is written
+    pub deadline: Option<std::time::Instant>,
     /// iterations without a new minimum of conflict cells before the negotiation stops
     pub stall_iters: usize,
     /// experimental: parallel connection searches inside a multi-pin net (0 = number of threads,
@@ -83,6 +85,7 @@ impl Default for DParams {
             hist_inc: 3.0,
             nego_iters: 25,
             par_nets: 1,
+            deadline: None,
             stall_iters: 3,
             par_conn: 1,
             job_margin: 6.0,
@@ -260,6 +263,39 @@ pub struct DResult {
     pub conns: usize,
     pub expanded: u64,
     pub stats: AesStats,
+    /// conflict clusters of the last negotiation iteration (largest first)
+    pub hotspots: Vec<Hotspot>,
+}
+
+/// a net's conflicting cells in the last negotiation iteration and where they are
+#[derive(Debug, Clone)]
+pub struct Hotspot {
+    pub net: usize,
+    pub cells: usize,
+    pub x: f64,
+    pub y: f64,
+    pub layer: &'static str,
+}
+
+/// set by SIGTERM / SIGINT: the router stops negotiating and writes the best result so far
+pub static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// route SIGTERM and SIGINT to `STOP` (Unix; elsewhere a no-op)
+pub fn install_stop_handler() {
+    #[cfg(unix)]
+    {
+        extern "C" fn on_signal(_: i32) {
+            STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        extern "C" {
+            fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+        }
+        // SIGINT = 2 and SIGTERM = 15 on Linux and macOS
+        unsafe {
+            signal(2, on_signal);
+            signal(15, on_signal);
+        }
+    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -660,6 +696,68 @@ impl<'a> Router<'a> {
         d.into_iter().take(m).map(|x| x.1).collect()
     }
 
+    /// stop requested by a signal or the deadline has passed
+    fn halt(&self) -> bool {
+        STOP.load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .p
+                .deadline
+                .is_some_and(|d| std::time::Instant::now() > d)
+    }
+
+    /// cells (layer, cell; layer NL = via) where each job's copper overlaps another net's
+    fn conflicts(
+        &self,
+        routed: &[RNet],
+        cells: &[Vec<(usize, usize, bool)>],
+        vias: &[Vec<usize>],
+    ) -> Vec<Vec<(usize, usize)>> {
+        (0..self.jobs.len())
+            .into_par_iter()
+            .map(|k| {
+                if cells[k].is_empty() && vias[k].is_empty() {
+                    return vec![];
+                }
+                let o = self.owner_maps(k, routed);
+                let mut c: Vec<(usize, usize)> = cells[k]
+                    .iter()
+                    .filter(|(l, i, w)| self.owned(k, &o, *l, *i, *w))
+                    .map(|(l, i, _)| (*l, *i))
+                    .collect();
+                for &i in &vias[k] {
+                    if self.owned(k, &o, NL, i, false) {
+                        c.push((NL, i));
+                    }
+                }
+                c
+            })
+            .collect()
+    }
+
+    /// one hotspot per conflicting net: its conflict cell count and the median conflict cell
+    fn hotspots(&self, conf: &[Vec<(usize, usize)>]) -> Vec<Hotspot> {
+        let mut out: Vec<Hotspot> = conf
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_empty())
+            .map(|(k, c)| {
+                let mut v = c.clone();
+                v.sort_by_key(|(_, i)| (i % self.gs.nx, i / self.gs.nx));
+                let (l, i) = v[v.len() / 2];
+                let p = self.gs.center(i % self.gs.nx, i / self.gs.nx);
+                Hotspot {
+                    net: self.jobs[k].net,
+                    cells: c.len(),
+                    x: p.x,
+                    y: p.y,
+                    layer: if l < NL { CU[l] } else { "via" },
+                }
+            })
+            .collect();
+        out.sort_by_key(|h| std::cmp::Reverse(h.cells));
+        out
+    }
+
     /// list scheduling of `need` into waves: a net goes one wave after the latest earlier net whose
     /// window (plus the owner-map reach) overlaps its own
     fn waves(&self, need: &[usize]) -> Vec<Vec<usize>> {
@@ -715,12 +813,27 @@ impl<'a> Router<'a> {
         let mut best_hist: Vec<usize> = Vec::new();
         let ck = Checker::new(self.m, &self.objs, self.maxd);
         let mut nst: Vec<AesStats> = vec![AesStats::default(); nj];
+        // best iteration so far: (conflict cells, routed, cells, vias, left)
+        type Snap = (
+            usize,
+            Vec<RNet>,
+            Vec<Vec<(usize, usize, bool)>>,
+            Vec<Vec<usize>>,
+            Vec<usize>,
+        );
+        let mut best: Option<Snap> = None;
+        let hotspots: Vec<Hotspot>;
         loop {
             let t_it = std::time::Instant::now();
             // nets whose windows cannot see each other's copper route in parallel; a net waits for
             // every earlier net (in `need` order) it can see, so the result equals the serial order
             let waves = self.waves(&need);
+            let mut aborted = false;
             for wave in &waves {
+                if self.halt() {
+                    aborted = true;
+                    break;
+                }
                 let hist_ref = &hist;
                 let routed_ref = &routed;
                 let rs: Vec<(usize, NetRouteResult, AesStats, f64)> = wave
@@ -765,23 +878,7 @@ impl<'a> Router<'a> {
                 );
             }
             // conflicts of every net against all others
-            let conf: Vec<Vec<(usize, usize)>> = (0..nj)
-                .into_par_iter()
-                .map(|k| {
-                    let o = self.owner_maps(k, &routed);
-                    let mut c: Vec<(usize, usize)> = cells[k]
-                        .iter()
-                        .filter(|(l, i, w)| self.owned(k, &o, *l, *i, *w))
-                        .map(|(l, i, _)| (*l, *i))
-                        .collect();
-                    for &i in &vias[k] {
-                        if self.owned(k, &o, NL, i, false) {
-                            c.push((NL, i));
-                        }
-                    }
-                    c
-                })
-                .collect();
+            let conf = self.conflicts(&routed, &cells, &vias);
             let total: usize = conf.iter().map(|c| c.len()).sum();
             eprintln!(
                 "[droute] iter {it}: {} nets in {:.1} s, conflict cells {total}, nets in conflict {}, unrouted comps {}",
@@ -794,12 +891,52 @@ impl<'a> Router<'a> {
                 eprintln!("[dbg] nego iter {it}: pres {pres:.2}, {} nets rerouted, conflict cells {total}, nets in conflict {}", need.len(), conf.iter().filter(|c| !c.is_empty()).count());
             }
             best_hist.push(total);
+            if !aborted && best.as_ref().is_none_or(|b| total < b.0) {
+                best = Some((
+                    total,
+                    routed.clone(),
+                    cells.clone(),
+                    vias.clone(),
+                    left.clone(),
+                ));
+            }
+            // stop before an iteration that would end after the deadline (estimate: the last one)
+            let out_of_time = aborted
+                || STOP.load(std::sync::atomic::Ordering::Relaxed)
+                || self
+                    .p
+                    .deadline
+                    .is_some_and(|d| std::time::Instant::now() + t_it.elapsed() > d);
+            if out_of_time && total > 0 {
+                if let Some(b) = best.take() {
+                    if b.0 < total {
+                        (routed, cells, vias, left) = (b.1, b.2, b.3, b.4);
+                        eprintln!(
+                            "[droute] stopped: back to the best iteration ({} conflict cells)",
+                            b.0
+                        );
+                    }
+                }
+            }
+            let conf = if out_of_time && total > 0 {
+                self.conflicts(&routed, &cells, &vias)
+            } else {
+                conf
+            };
+            let total: usize = conf.iter().map(|c| c.len()).sum();
             // no new best for `stall_iters` iterations: stop negotiating, rip and reroute hard
             let sw = self.p.stall_iters.max(1);
             let stalled = best_hist.len() > sw
                 && best_hist[best_hist.len() - sw..].iter().min().unwrap()
                     >= best_hist[..best_hist.len() - sw].iter().min().unwrap();
-            if total == 0 || it + 1 >= self.p.nego_iters || stalled {
+            if total == 0 || it + 1 >= self.p.nego_iters || stalled || out_of_time {
+                hotspots = self.hotspots(&conf);
+                for h in hotspots.iter().take(10) {
+                    eprintln!(
+                        "[droute] hotspot {}: {} conflict cells around ({:.2}, {:.2}) {}",
+                        self.m.b.nets[h.net], h.cells, h.x, h.y, h.layer
+                    );
+                }
                 if total > 0 && dbg {
                     for (k, ck) in conf.iter().enumerate() {
                         if ck.is_empty() {
@@ -839,28 +976,14 @@ impl<'a> Router<'a> {
                         cells[k].clear();
                         vias[k].clear();
                         ripped.push(k);
-                        conf = (0..nj)
-                            .into_par_iter()
-                            .map(|j| {
-                                if cells[j].is_empty() && vias[j].is_empty() {
-                                    return vec![];
-                                }
-                                let o = self.owner_maps(j, &routed);
-                                let mut c: Vec<(usize, usize)> = cells[j]
-                                    .iter()
-                                    .filter(|(l, i, w)| self.owned(j, &o, *l, *i, *w))
-                                    .map(|(l, i, _)| (*l, *i))
-                                    .collect();
-                                for &i in &vias[j] {
-                                    if self.owned(j, &o, NL, i, false) {
-                                        c.push((NL, i));
-                                    }
-                                }
-                                c
-                            })
-                            .collect();
+                        conf = self.conflicts(&routed, &cells, &vias);
                     }
                     for &k in &ripped {
+                        if STOP.load(std::sync::atomic::Ordering::Relaxed) {
+                            // signal: no time for hard reroutes, the ripped nets stay unrouted
+                            left[k] = self.jobs[k].pins.len().saturating_sub(1).max(1);
+                            continue;
+                        }
                         let o = self.owner_maps(k, &routed);
                         let fr = self.foreign(k, &routed);
                         nst[k] = AesStats::default();
@@ -1045,6 +1168,7 @@ impl<'a> Router<'a> {
             rips: it,
             conns,
             expanded: self.expanded.load(std::sync::atomic::Ordering::Relaxed),
+            hotspots,
         }
     }
 

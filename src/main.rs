@@ -854,6 +854,12 @@ fn cmd_route(a: &Args) -> CmdResult {
     p.job_margin = a.f("job-margin", p.job_margin);
     p.nego_iters = a.f("iters", p.nego_iters as f64) as usize;
     p.par_nets = a.u("par-nets", p.par_nets);
+    let t_start = Instant::now();
+    let limit = a.f("time-limit", 0.0);
+    if limit > 0.0 {
+        p.deadline = Some(t_start + std::time::Duration::from_secs_f64(limit));
+    }
+    droute::install_stop_handler();
     p.stall_iters = a.u("stall-iters", p.stall_iters);
     p.par_conn = a.u("par-conn", p.par_conn);
     p.bend_cost = a.f("bend-cost", p.bend_cost as f64) as f32;
@@ -871,7 +877,18 @@ fn cmd_route(a: &Args) -> CmdResult {
     // fallback ladder when the cleanup's geometry costs completeness: no sliding, then no cleanup
     // (completeness first; the level used is reported)
     let mut level = "full";
-    if !res.failed.is_empty() && p.clean {
+    let halted = || {
+        droute::STOP.load(std::sync::atomic::Ordering::Relaxed)
+            || p.deadline.is_some_and(|d| Instant::now() > d)
+    };
+    let stopped = if droute::STOP.load(std::sync::atomic::Ordering::Relaxed) {
+        Some("signal")
+    } else if halted() {
+        Some("time-limit")
+    } else {
+        None
+    };
+    if !res.failed.is_empty() && p.clean && !halted() {
         for (lv, slide, clean) in [("no-slide", false, true), ("no-clean", false, false)] {
             let mut p2 = p.clone();
             p2.slide = slide;
@@ -889,10 +906,13 @@ fn cmd_route(a: &Args) -> CmdResult {
                 res = res2;
                 level = lv;
             }
-            if res.failed.is_empty() {
+            if res.failed.is_empty() || halted() {
                 break;
             }
         }
+    }
+    if let Some(why) = stopped {
+        eprintln!("[route] stopped early ({why}): writing the best result so far");
     }
     eprintln!("[route] cleanup level {}", level);
     let dt = t.elapsed().as_secs_f64();
@@ -991,6 +1011,8 @@ fn cmd_route(a: &Args) -> CmdResult {
         "drc": drc, "search_s": check::round2(dt),
         "failed": res.failed.iter().map(|(n, l)| json!([c.board.nets[*n], l])).collect::<Vec<_>>(),
         "warnings": warnings,
+        "stopped": stopped,
+        "hotspots": res.hotspots.iter().take(20).map(|h| json!({"net": c.board.nets[h.net], "cells": h.cells, "at": [check::round2(h.x), check::round2(h.y)], "layer": h.layer})).collect::<Vec<_>>(),
     });
     write_file(
         &out.replace(".kicad_pcb", "_route.json"),
