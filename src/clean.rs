@@ -127,6 +127,7 @@ impl<'a> Checker<'a> {
             }
             if self.yield_same_class
                 && matches!(o.kind, Kind::Zone)
+                && o.net != 0 // net-less copper (graphics, texts) never refills
                 && m.r.net_class[o.net] == m.r.net_class[net]
             {
                 continue;
@@ -199,6 +200,7 @@ impl<'a> Checker<'a> {
             let o = &self.objs[k as usize];
             if self.yield_same_class
                 && matches!(o.kind, Kind::Zone)
+                && o.net != 0 // net-less copper (graphics, texts) never refills
                 && m.r.net_class[o.net] == m.r.net_class[net]
             {
                 continue;

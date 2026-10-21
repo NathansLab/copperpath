@@ -5,6 +5,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- KiCad 5 board files are refused with a clear message instead of routing an empty board (#0002).
+- A missing `.kicad_pro` no longer aborts; KiCad's default net class is used (#0003).
+- Edge.Cuts arcs in the legacy centre/angle form are read; no panic on incomplete graphics (#0004).
+- The neck-down width respects the Board Setup minimum track width (#0005).
+- Copper graphics and copper text without a net are obstacles, Edge.Cuts drawn inside footprints
+  are part of the board outline (#0006).
+
 ## [0.1.0] - 2026-10-21
 
 First public version (research prototype).

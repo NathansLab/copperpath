@@ -103,11 +103,13 @@ pub fn load_ctx(a: &Args) -> Result<Ctx, String> {
     let dru = a.s("dru", &format!("{base}.kicad_dru"));
     let t0 = Instant::now();
     let board = board::load(&pcb)?;
-    if !std::path::Path::new(&pro).is_file() {
-        return Err(format!(
-            "{pro}: project file not found (net classes are read from it; set --pro)"
-        ));
-    }
+    // without a project file KiCad uses its default net class; do the same
+    let pro = if std::path::Path::new(&pro).is_file() {
+        pro
+    } else {
+        eprintln!("[load] warning: {pro} not found, using KiCad's default net class");
+        String::new()
+    };
     let rules = rules::Rules::load(
         &pro,
         if std::path::Path::new(&dru).exists() {
@@ -123,11 +125,12 @@ pub fn load_ctx(a: &Args) -> Result<Ctx, String> {
         None => model::BoardCfg::default(),
     };
     eprintln!(
-        "[load] {} footprints, {} tracks, {} vias, {} zones, {} nets, {} DRU rules in {:.2} s",
+        "[load] {} footprints, {} tracks, {} vias, {} zones, {} copper graphics, {} nets, {} DRU rules in {:.2} s",
         board.fps.len(),
         board.tracks.len(),
         board.vias.len(),
         board.zones.len(),
+        board.graphics.len(),
         board.nets.len(),
         rules.dru.len(),
         t0.elapsed().as_secs_f64()

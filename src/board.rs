@@ -164,6 +164,8 @@ pub struct Board {
     pub zones: Vec<Zone>,
     pub edge: Vec<Vec<P>>, // closed outline polygons
     pub edge_segs: Vec<(P, P)>,
+    /// copper graphics and texts without a net (board and footprint), as (shape, layer mask)
+    pub graphics: Vec<(Shape, u8)>,
     pub bbox: BBox,
     /// copper layers present in the board's layer stack (bit i = CU[i]); 2-, 4- and 6-layer boards
     pub cu_mask: u8,
@@ -292,6 +294,155 @@ fn parse_pad(l: &List, b: &mut Board, fp_rot: f64) -> Pad {
         drill,
         local_clr,
     }
+}
+
+/// outline points of an arc given by start / mid / end (or the legacy centre / start / angle form)
+fn arc_pts(g: &List) -> Option<Vec<P>> {
+    let (s, e) = (g.xy("start")?, g.xy("end")?);
+    if let Some(m) = g.xy("mid") {
+        return Some(vec![p(s.0, s.1), p(m.0, m.1), p(e.0, e.1)]);
+    }
+    // legacy form (KiCad 5): start = centre, end = arc start, angle in degrees
+    let ang = g.valf("angle")?;
+    let (r0, a0) = ((e.0 - s.0).hypot(e.1 - s.1), (e.1 - s.1).atan2(e.0 - s.0));
+    let n = ((ang.abs() / 15.0).ceil() as usize).max(2);
+    Some(
+        (0..=n)
+            .map(|k| {
+                let t = a0 + ang.to_radians() * k as f64 / n as f64;
+                p(s.0 + r0 * t.cos(), s.1 + r0 * t.sin())
+            })
+            .collect(),
+    )
+}
+
+/// polyline as capsules of half width r
+fn chain_caps(pts: &[P], r: f64, closed: bool, out: &mut Vec<Shape>) {
+    let n = pts.len();
+    let m = if closed && n > 2 {
+        n
+    } else {
+        n.saturating_sub(1)
+    };
+    for i in 0..m {
+        out.push(Shape::Capsule {
+            a: pts[i],
+            b: pts[(i + 1) % n],
+            r,
+        });
+    }
+}
+
+/// shapes (in the item's own frame) of a graphic item: gr_*/fp_* line, arc, rect, poly, circle,
+/// text (approximate bounding box). Unfilled closed shapes become their outline.
+fn graphic_shapes(g: &List) -> Vec<Shape> {
+    let kind = g.head().split_once('_').map(|(_, k)| k).unwrap_or("");
+    let r = g
+        .valf("width")
+        .or_else(|| g.child("stroke").and_then(|st| st.valf("width")))
+        .unwrap_or(0.0)
+        .max(0.0)
+        / 2.0;
+    let filled = match g.val("fill") {
+        Some(v) => v != "no" && v != "none",
+        None => kind == "poly" && g.child("stroke").is_none(), // KiCad 5 polygons are filled
+    };
+    let mut out = Vec::new();
+    match kind {
+        "line" => {
+            if let (Some(a), Some(b)) = (g.xy("start"), g.xy("end")) {
+                chain_caps(&[p(a.0, a.1), p(b.0, b.1)], r, false, &mut out);
+            }
+        }
+        "arc" => {
+            if let Some(pts) = arc_pts(g) {
+                chain_caps(&pts, r, false, &mut out);
+            }
+        }
+        "rect" | "poly" => {
+            let pts = if kind == "rect" {
+                match (g.xy("start"), g.xy("end")) {
+                    (Some(a), Some(b)) => vec![p(a.0, a.1), p(b.0, a.1), p(b.0, b.1), p(a.0, b.1)],
+                    _ => Vec::new(),
+                }
+            } else {
+                pts_of(g)
+            };
+            if filled && pts.len() > 2 {
+                out.push(Shape::Poly { pts, r });
+            } else {
+                chain_caps(&pts, r, true, &mut out);
+            }
+        }
+        "circle" => {
+            if let (Some(c), Some(e)) = (g.xy("center"), g.xy("end")) {
+                let (c, rad) = (p(c.0, c.1), (e.0 - c.0).hypot(e.1 - c.1));
+                if filled {
+                    out.push(Shape::circle(c, rad + r));
+                } else {
+                    let pts: Vec<P> = (0..32)
+                        .map(|k| {
+                            let t = k as f64 * std::f64::consts::PI / 16.0;
+                            p(c.x + rad * t.cos(), c.y + rad * t.sin())
+                        })
+                        .collect();
+                    chain_caps(&pts, r, true, &mut out);
+                }
+            }
+        }
+        "text" => {
+            // bounding box estimate (generous: 1.1 x glyph width per character), centred unless justified
+            let txt = if g.head() == "fp_text" {
+                g.arg(1)
+            } else {
+                g.arg(0)
+            }
+            .unwrap_or("");
+            let Some((x, y, a)) = g.xy("at") else {
+                return out;
+            };
+            let font = g.child("effects").and_then(|e| e.child("font"));
+            let (h, w) = font
+                .and_then(|f| f.xy("size"))
+                .map(|s| (s.0, s.1))
+                .unwrap_or((1.0, 1.0));
+            let t = font.and_then(|f| f.valf("thickness")).unwrap_or(0.15);
+            let lines: Vec<&str> = txt.split("\\n").collect();
+            let len = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as f64;
+            let (bw, bh) = (len * w * 1.1 + t, lines.len() as f64 * h * 1.6 + t);
+            let just = g
+                .child("effects")
+                .map(|e| e.atoms("justify"))
+                .unwrap_or_default();
+            let x0 = if just.iter().any(|j| j == "left") {
+                0.0
+            } else if just.iter().any(|j| j == "right") {
+                -bw
+            } else {
+                -bw / 2.0
+            };
+            let pts = [
+                (x0, -bh / 2.0),
+                (x0 + bw, -bh / 2.0),
+                (x0 + bw, bh / 2.0),
+                (x0, bh / 2.0),
+            ]
+            .iter()
+            .map(|&(dx, dy)| p(x, y) + p(dx, dy).rot(a))
+            .collect();
+            out.push(Shape::Poly { pts, r: 0.0 });
+        }
+        _ => {}
+    }
+    out
+}
+
+/// copper layer mask of a graphic item (0 if it is not on copper)
+fn graphic_layers(g: &List) -> u8 {
+    g.val("layer")
+        .and_then(layer_idx)
+        .map(|l| 1u8 << l)
+        .unwrap_or(0)
 }
 
 fn parse_zone(z: &List, b: &mut Board, fp: Option<&str>, fp_at: Option<(P, f64)>) -> Zone {
@@ -427,6 +578,15 @@ fn chain(lines: &[(P, P)]) -> Option<Vec<P>> {
 
 pub fn parse_board(text: String) -> Result<Board, String> {
     let root = sexpr::parse(&text)?;
+    // KiCad 5 and older (modules, numbered nets, legacy arcs) is not read; refuse instead of
+    // silently routing an empty board
+    if let Some(v) = root.valf("version") {
+        if v < 20211014.0 {
+            return Err(format!(
+                "board file format {v} is from KiCad 5 or older; open and save it in KiCad 6+ first"
+            ));
+        }
+    }
     let mut b = Board::default();
     b.net(""); // net 0 = no net
     for it in root.lists() {
@@ -461,6 +621,36 @@ pub fn parse_board(text: String) -> Result<Board, String> {
                     .map(|z| parse_zone(z, &mut b, Some(&refd), Some((p(x, y), r))))
                     .collect();
                 b.zones.extend(fpz);
+                for g in it.lists() {
+                    if !(g.head().starts_with("fp_") || g.head() == "property") {
+                        continue;
+                    }
+                    let (at, lay) = (p(x, y), g.val("layer").unwrap_or(""));
+                    if lay == "Edge.Cuts" {
+                        // cut-outs drawn inside a footprint (frame: footprint position and rotation)
+                        for sh in graphic_shapes(g) {
+                            if let Shape::Capsule { a, b: e, .. } = sh.xform(at, r) {
+                                b.edge_segs.push((a, e));
+                            }
+                        }
+                        continue;
+                    }
+                    let lm = graphic_layers(g);
+                    if lm == 0 || g.head() == "property" || g.flag("hide") {
+                        continue; // properties (reference, value) on copper are rare; skip
+                    }
+                    for sh in graphic_shapes(g) {
+                        let sh = match (g.head(), g.xy("at")) {
+                            // fp_text: local position, but its angle is already absolute
+                            ("fp_text", Some((tx, ty, _))) => {
+                                let c = p(tx, ty);
+                                sh.xform(at + c.rot(r) - c, 0.0)
+                            }
+                            _ => sh.xform(at, r),
+                        };
+                        b.graphics.push((sh, lm));
+                    }
+                }
                 b.fps.push(Footprint {
                     refd,
                     value,
@@ -539,32 +729,48 @@ pub fn parse_board(text: String) -> Result<Board, String> {
                 let z = parse_zone(it, &mut b, None, None);
                 b.zones.push(z);
             }
+            "gr_text" => {
+                let lm = graphic_layers(it);
+                if lm != 0 {
+                    b.graphics
+                        .extend(graphic_shapes(it).into_iter().map(|sh| (sh, lm)));
+                }
+            }
             "gr_line" | "gr_rect" | "gr_poly" | "gr_arc" | "gr_circle" => {
                 if it.val("layer") != Some("Edge.Cuts") {
+                    let lm = graphic_layers(it);
+                    if lm != 0 {
+                        b.graphics
+                            .extend(graphic_shapes(it).into_iter().map(|sh| (sh, lm)));
+                    }
                     continue;
                 }
                 match it.head() {
                     "gr_rect" => {
-                        let (s, e) = (it.xy("start").unwrap(), it.xy("end").unwrap());
+                        let (Some(s), Some(e)) = (it.xy("start"), it.xy("end")) else {
+                            continue;
+                        };
                         b.edge
                             .push(vec![p(s.0, s.1), p(e.0, s.1), p(e.0, e.1), p(s.0, e.1)]);
                     }
                     "gr_poly" => b.edge.push(pts_of(it)),
                     "gr_line" => {
-                        let (s, e) = (it.xy("start").unwrap(), it.xy("end").unwrap());
+                        let (Some(s), Some(e)) = (it.xy("start"), it.xy("end")) else {
+                            continue;
+                        };
                         b.edge_segs.push((p(s.0, s.1), p(e.0, e.1)));
                     }
                     "gr_arc" => {
-                        let (s, m, e) = (
-                            it.xy("start").unwrap(),
-                            it.xy("mid").unwrap(),
-                            it.xy("end").unwrap(),
-                        );
-                        b.edge_segs.push((p(s.0, s.1), p(m.0, m.1)));
-                        b.edge_segs.push((p(m.0, m.1), p(e.0, e.1)));
+                        if let Some(pts) = arc_pts(it) {
+                            for w in pts.windows(2) {
+                                b.edge_segs.push((w[0], w[1]));
+                            }
+                        }
                     }
                     "gr_circle" => {
-                        let (c, e) = (it.xy("center").unwrap(), it.xy("end").unwrap());
+                        let (Some(c), Some(e)) = (it.xy("center"), it.xy("end")) else {
+                            continue;
+                        };
                         let r = ((e.0 - c.0).powi(2) + (e.1 - c.1).powi(2)).sqrt();
                         b.edge.push(
                             (0..32)
@@ -641,6 +847,60 @@ mod tests {
         assert!(ra[0].ko_tracks && ra[0].ko_vias && !ra[0].ko_footprints);
         assert_eq!(ra[0].layers, 0b100111);
         assert!(b.bbox.x1 - b.bbox.x0 > 69.9 && b.bbox.y1 - b.bbox.y0 > 49.9);
+    }
+
+    /// minimal KiCad 10 board around the given items
+    fn mini(items: &str) -> String {
+        format!(
+            "(kicad_pcb (version 20260206) (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal) (25 \"Edge.Cuts\" user)) {items})"
+        )
+    }
+
+    #[test]
+    fn rejects_kicad5_boards() {
+        let e = parse_board("(kicad_pcb (version 20171130) (module R1))".into()).unwrap_err();
+        assert!(e.contains("KiCad 5"), "{e}");
+    }
+
+    #[test]
+    fn legacy_edge_arc_is_read() {
+        // centre (10, 10), start (12, 10), 90 degrees -> ends near (10, 12)
+        let b = parse_board(mini(
+            "(gr_arc (start 10 10) (end 12 10) (angle 90) (layer \"Edge.Cuts\") (width 0.1))",
+        ))
+        .unwrap();
+        assert!(b.edge_segs.len() >= 2);
+        let last = b.edge_segs.last().unwrap().1;
+        assert!(
+            (last.x - 10.0).abs() < 1e-6 && (last.y - 12.0).abs() < 1e-6,
+            "{last:?}"
+        );
+    }
+
+    #[test]
+    fn copper_graphics_text_and_footprint_cutouts() {
+        let b = parse_board(mini(concat!(
+            "(gr_text \"HELLO\" (at 50 20 0) (layer \"F.Cu\") (effects (font (size 1 1) (thickness 0.2))))",
+            "(gr_line (start 0 0) (end 5 0) (stroke (width 0.3)) (layer \"B.Cu\"))",
+            "(gr_text \"silk\" (at 0 0 0) (layer \"F.SilkS\"))",
+            "(footprint \"X\" (layer \"F.Cu\") (at 30 30 90)",
+            "  (fp_poly (pts (xy 0 0) (xy 1 0) (xy 1 1)) (stroke (width 0)) (fill yes) (layer \"F.Cu\"))",
+            "  (fp_line (start 2 0) (end 4 0) (stroke (width 0.05)) (layer \"Edge.Cuts\")))",
+        )))
+        .unwrap();
+        // text box, B.Cu line, footprint polygon; silkscreen text ignored
+        assert_eq!(b.graphics.len(), 3);
+        let (txt, lm) = &b.graphics[0];
+        assert_eq!(*lm, 1);
+        assert_eq!(txt.dist(p(50.0, 20.0)), 0.0);
+        assert!(txt.dist(p(50.0 + 3.5, 20.0)) > 0.0); // 5 glyphs x 1.1 mm / 2 + thickness
+        assert_eq!(b.graphics[1].1, 1 << (NL - 1));
+        // footprint frame: (2, 0) rotated by 90 degrees -> (30, 28)
+        let (a, _) = b.edge_segs[0];
+        assert!(
+            (a.x - 30.0).abs() < 1e-6 && (a.y - 28.0).abs() < 1e-6,
+            "{a:?}"
+        );
     }
 
     #[test]

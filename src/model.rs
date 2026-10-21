@@ -234,6 +234,17 @@ impl<'a> Model<'a> {
                 hole_r: 0.0,
             });
         }
+        for (s, lm) in &b.graphics {
+            objs.push(Obj {
+                bbox: s.bbox(),
+                shape: s.clone(),
+                layers: *lm,
+                net: 0,
+                kind: Kind::Zone,
+                locked: true,
+                hole_r: 0.0,
+            });
+        }
         let n = b.nets.len();
         let mut npins = vec![0usize; n];
         for f in &b.fps {

@@ -180,6 +180,7 @@ same placed input):
   `place`.
 - Very long multi-pin nets are slow (millions of nodes per search); restrict with `--region`/`--nets`.
 - Panels with several board outlines must be split first.
+- KiCad 6 or newer board files only; open and save older boards in KiCad first.
 - Uses more vias than Freerouting; tune `--via-cost` and `class_layers`.
 - Legality is exact at grid cell centres; off-grid pad centres are reached by stubs and verified
   exactly, but rare edge cases can still show up in KiCad DRC. Always run `--drc`.

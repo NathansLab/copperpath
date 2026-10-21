@@ -337,6 +337,8 @@ pub struct Rules {
     pub classes: Vec<NetClass>,
     pub class_idx: HashMap<String, usize>,
     pub min_clearance: f64,
+    /// board setup minimum track width (hard floor, also for neck-down)
+    pub min_track: f64,
     pub min_edge: f64,
     pub min_hole_to_hole: f64,
     pub min_hole_clearance: f64,
@@ -359,9 +361,13 @@ fn layer_applies(r: &Rule, outer: bool) -> bool {
 
 impl Rules {
     pub fn load(pro: &str, dru: &str, nets: &[String]) -> Result<Rules, String> {
-        let pj: Value =
+        // empty `pro`: no project file, a single Default class with KiCad's default values
+        let pj: Value = if pro.is_empty() {
+            serde_json::json!({"net_settings": {"classes": [{"name": "Default"}]}})
+        } else {
             serde_json::from_str(&std::fs::read_to_string(pro).map_err(|e| format!("{pro}: {e}"))?)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+        };
         let ns = &pj["net_settings"];
         let mut classes = Vec::new();
         for c in ns["classes"].as_array().ok_or("no classes")? {
@@ -433,6 +439,7 @@ impl Rules {
             classes,
             class_idx,
             min_clearance: rs["min_clearance"].as_f64().unwrap_or(0.2),
+            min_track: rs["min_track_width"].as_f64().unwrap_or(0.2),
             min_edge: rs["min_copper_edge_clearance"].as_f64().unwrap_or(0.5),
             min_hole_to_hole: rs["min_hole_to_hole"].as_f64().unwrap_or(0.25),
             min_hole_clearance: rs["min_hole_clearance"].as_f64().unwrap_or(0.25),
@@ -559,12 +566,13 @@ impl Rules {
         a.typ = Some("Track");
         let e = Item::default();
         let c = self.class_of(net);
-        let (mut mn, mut opt) = (0.2f64, c.track_width);
+        // neck-down floor: 0.2 mm unless a DRU min says otherwise, never below the board minimum
+        let (mut mn, mut opt) = (self.min_track.max(0.2), c.track_width);
         for r in &self.dru {
             if let Some(tw) = r.cons.get("track_width") {
                 if eval(&r.expr, [&a, &e]) == Some(true) {
                     if let Some(m) = tw.get("min") {
-                        mn = *m;
+                        mn = m.max(self.min_track);
                     }
                     opt = tw.get("opt").copied().unwrap_or(opt.max(mn));
                 }
@@ -620,6 +628,18 @@ mod tests {
     use super::*;
 
     const DEMO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/demo/demo");
+
+    #[test]
+    fn without_project_file_default_class_and_board_min_width() {
+        let nets: Vec<String> = ["", "A"].iter().map(|s| s.to_string()).collect();
+        let r = Rules::load("", "", &nets).unwrap();
+        assert_eq!(r.classes.len(), 1);
+        assert_eq!(r.track_width(1), (0.2, 0.25));
+        // board setup minimum is a hard floor for the neck-down width
+        let mut r = r;
+        r.min_track = 0.3;
+        assert_eq!(r.track_width(1), (0.3, 0.3));
+    }
 
     fn demo_rules() -> Rules {
         let nets: Vec<String> = ["", "GND", "+5V", "VIN", "SDA", "+3V3", "OUT_A"]

@@ -380,6 +380,7 @@ impl<'a> Router<'a> {
                         o.bbox.overlaps(&wb)
                             && !(p.yield_same_class
                                 && matches!(o.kind, Kind::Zone)
+                                && o.net != 0 // net-less copper never refills
                                 && m.r.net_class[o.net] == cls)
                     })
                     .cloned()
