@@ -7,6 +7,7 @@
 pub mod board;
 pub mod check;
 pub mod clean;
+pub mod delta;
 pub mod droute;
 pub mod geom;
 pub mod groute;
