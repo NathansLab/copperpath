@@ -70,7 +70,10 @@ fn delta_applied_to_the_input_equals_the_output_board() {
 
     let dt = std::fs::read_to_string(&dj).unwrap();
     let dv: serde_json::Value = serde_json::from_str(&dt).unwrap();
-    assert_eq!((dv["v"].as_i64(), dv["units"].as_str()), (Some(1), Some("nm")));
+    assert_eq!(
+        (dv["v"].as_i64(), dv["units"].as_str()),
+        (Some(1), Some("nm"))
+    );
     let add = dv["add"].as_array().unwrap();
     assert_eq!(
         add.iter().filter(|i| i["type"] == "track").count() as u64,
@@ -92,10 +95,16 @@ fn delta_applied_to_the_input_equals_the_output_board() {
     let ((ta, va), (tb, vb)) = (copper(&a), copper(&b));
     assert_eq!((ta.len(), va.len()), (tb.len(), vb.len()));
     for (x, y) in ta.iter().zip(&tb) {
-        assert!(x.iter().zip(y).all(|(p, q)| (p - q).abs() <= 1), "{x:?} != {y:?}");
+        assert!(
+            x.iter().zip(y).all(|(p, q)| (p - q).abs() <= 1),
+            "{x:?} != {y:?}"
+        );
     }
     for (x, y) in va.iter().zip(&vb) {
-        assert!(x.iter().zip(y).all(|(p, q)| (p - q).abs() <= 1), "{x:?} != {y:?}");
+        assert!(
+            x.iter().zip(y).all(|(p, q)| (p - q).abs() <= 1),
+            "{x:?} != {y:?}"
+        );
     }
     assert_eq!(opens(&applied), opens(&out));
 }
