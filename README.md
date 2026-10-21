@@ -102,7 +102,9 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
   1.5 mm of own pads the minimum width is allowed (neck-down for fine pitch). The grid is shifted
   by less than one cell so that the axes of the tightest pin rows lie on cell centres (a 0.2 mm
   track between 0.2 mm pads at 0.4 mm pitch fits only exactly on the pad axis).
-- **Search.** Windowed multi-target A\* per net; nets are routed in parallel per iteration.
+- **Search.** Windowed multi-target A\* per net; nets are routed in parallel per iteration. A
+  connection starts or ends at a pad (through its exit stub) or on any existing track or via of
+  the same copper component, so a boxed-in pad still joins through its own via.
 - **Negotiation.** PathFinder-style congestion costs (present × occupancy + history), stall
   detection, then rip-up of the most conflicted nets and a hard reroute.
 - **Verification.** All routed copper is checked exactly against fixed objects and other nets

@@ -491,6 +491,17 @@ pub fn class_layer_mask(cl: &[(String, u8)], cls: &str) -> Option<u8> {
 
 /// pins of every net plus the copper components already formed by locked tracks/vias/zones
 pub fn pins_by_net(m: &Model) -> HashMap<usize, Vec<Pin>> {
+    pins_and_copper(m).0
+}
+
+/// existing tracks and vias of a net as (index into `Model::objs`, component id of
+/// [`Pin::comp`]); components without a pin are left out
+pub type NetCopper = HashMap<usize, Vec<(usize, usize)>>;
+
+/// [`pins_by_net`] plus the tracks and vias that belong to each pin component: a connection
+/// may start or end on any copper of a component, not only at its pads
+pub fn pins_and_copper(m: &Model) -> (HashMap<usize, Vec<Pin>>, NetCopper) {
+    let mut copper: NetCopper = HashMap::new();
     let mut out: HashMap<usize, Vec<Pin>> = HashMap::new();
     for (fi, f) in m.b.fps.iter().enumerate() {
         for (pi, pd) in f.pads.iter().enumerate() {
@@ -549,8 +560,17 @@ pub fn pins_by_net(m: &Model) -> HashMap<usize, Vec<Pin>> {
             let idx = ids.iter().position(|&i| matches!(m.objs[i].kind, Kind::Pad { fp, pad } if fp == pin.fp && pad == pin.pad));
             pin.comp = idx.map(|j| find(&mut par, j)).unwrap_or(usize::MAX);
         }
+        let pin_comps: std::collections::HashSet<usize> = pins.iter().map(|p| p.comp).collect();
+        let cu: Vec<(usize, usize)> = (0..k)
+            .filter(|&j| matches!(m.objs[ids[j]].kind, Kind::Track | Kind::Via))
+            .map(|j| (ids[j], find(&mut par, j)))
+            .filter(|(_, c)| pin_comps.contains(c))
+            .collect();
+        if !cu.is_empty() {
+            copper.insert(*net, cu);
+        }
     }
-    out
+    (out, copper)
 }
 
 /// two-pin connections: minimum spanning tree over the copper components of each net
