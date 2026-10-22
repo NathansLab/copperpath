@@ -184,6 +184,49 @@ def prepare(board, short, sha, work, cli):
     return pcb, json.load(open(os.path.join(d, "metadata.json")))
 
 
+def route(cp, pcb, out, budget):
+    """autoroute, or route for releases without it (before 0.2); (cmd, returncode, stderr, s)"""
+    t0 = time.time()
+    r = subprocess.run([cp, "autoroute", "--pcb", pcb, "--out", out, "--time", str(budget),
+                        "--json", "--allow-drc"], capture_output=True, text=True)
+    cmd = "autoroute"
+    if r.returncode != 0 and "unknown command" in r.stderr.lower():
+        t0 = time.time()
+        r = subprocess.run([cp, "route", "--pcb", pcb, "--out", out, "--time-limit", str(budget)],
+                           capture_output=True, text=True)
+        cmd = "route"
+    return cmd, r.returncode, r.stderr, time.time() - t0
+
+
+def machine():
+    cpu = ""
+    try:
+        cpu = next(l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name"))
+    except (OSError, StopIteration):
+        pass
+    return f"{os.cpu_count()} cores {cpu}".strip()
+
+
+def history(path, run):
+    """add (or replace) this run's row in the history table of docs/benchmark.md"""
+    rows = [r for r in run["boards"] if "error" not in r]
+    routed = sum(1 for r in rows if r["unconnected"] == 0)
+    line = (f"| {run['label']} | {run['date']} | `{run['commit']}` | {run['command']} | "
+            f"{routed}/{len(run['boards'])} | {sum(r['unconnected'] for r in rows)} | "
+            f"{sum(sum(r['new_drc'].values()) for r in rows)} | {sum(r['vias'] for r in rows)} | "
+            f"{run['route_s']:.0f} | {run['machine']} |")
+    head = "| release | date | commit | command | fully routed | unconnected | new DRC | vias | route time s | machine |"
+    text = open(path).read() if os.path.exists(path) else ""
+    if head not in text:
+        text += "\n" + head + "\n|---|---|---|---|---|---|---|---|---|---|\n"
+    lines = [l for l in text.split("\n") if not l.startswith(f"| {run['label']} |")]
+    k = max(i for i, l in enumerate(lines) if l.startswith("|---"))
+    while k + 1 < len(lines) and lines[k + 1].startswith("| "):
+        k += 1
+    lines.insert(k + 1, line)
+    open(path, "w").write("\n".join(lines))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--time", type=float, default=300)
@@ -191,47 +234,60 @@ def main():
     ap.add_argument("--work", default="bench_work")
     ap.add_argument("--copperpath", default="target/release/copperpath")
     ap.add_argument("--kicad-cli", default=os.environ.get("KICAD_CLI", "kicad-cli"))
-    ap.add_argument("--md", default="")
+    ap.add_argument("--md", default="", help="per-board Markdown table")
+    ap.add_argument("--label", default="", help="release name for --history (default: version)")
+    ap.add_argument("--commit", default="", help="commit of the binary (for --history)")
+    ap.add_argument("--history", default="", help="docs/benchmark.md: add this run's summary row")
     a = ap.parse_args()
     sel = [b for b, (s, _) in BOARDS.items() if not a.boards or s in a.boards.split(",")]
-    rows = []
+    ver = subprocess.run([a.copperpath, "--version"], capture_output=True, text=True).stdout.strip()
+    rows, cmd_used, t_all = [], "", time.time()
     for b in sel:
         short, sha = BOARDS[b]
         pcb, meta = prepare(b, short, sha, a.work, a.kicad_cli)
         unc0, types_in = drc(a.kicad_cli, pcb, pcb.replace(".kicad_pcb", "_drc_in.json"))
         out = pcb.replace(".kicad_pcb", "_routed.kicad_pcb")
-        t0 = time.time()
-        r = subprocess.run([a.copperpath, "autoroute", "--pcb", pcb, "--out", out, "--time", str(a.time),
-                            "--json", "--allow-drc"], capture_output=True, text=True)
-        dt = time.time() - t0
-        open(pcb.replace(".kicad_pcb", "_autoroute.log"), "w").write(r.stderr)
-        if r.returncode != 0 or not os.path.exists(out):
-            print(f"{short}: autoroute failed ({r.returncode}): {r.stderr.strip()[-300:]}", file=sys.stderr)
-            rows.append({"board": short, "error": r.stderr.strip()[-200:]})
+        if os.path.exists(out):
+            os.remove(out)
+        cmd_used, rc, err, dt = route(a.copperpath, pcb, out, a.time)
+        open(pcb.replace(".kicad_pcb", "_route.log"), "w").write(err)
+        if not os.path.exists(out):
+            print(f"{short}: {cmd_used} failed ({rc}): {err.strip()[-300:]}", file=sys.stderr)
+            rows.append({"board": short, "error": err.strip()[-200:], "s": round(dt, 1)})
             continue
         # the routed copy gets the project file, else kicad-cli checks it with default rules
         shutil.copy(pcb.replace(".kicad_pcb", ".kicad_pro"), out.replace(".kicad_pcb", ".kicad_pro"))
+        t0 = time.time()
         unc, types = drc(a.kicad_cli, out, out.replace(".kicad_pcb", "_drc.json"))
+        t_drc = time.time() - t0
         new = {k: v - types_in.get(k, 0) for k, v in types.items() if v > types_in.get(k, 0)}
         vias, ln = copper(open(out, encoding="utf-8").read())
         ref = meta["reference"]
         rows.append({
             "board": short, "layers": meta["board"]["layers"], "nets": meta["board"]["nets"],
             "unconnected_in": unc0, "unconnected": unc, "new_drc": new, "s": round(dt, 1),
-            "vias": vias, "length_mm": round(ln), "ref_vias": ref["vias"],
-            "ref_length_mm": round(ref["track_length_mm"]),
+            "kicad_drc_s": round(t_drc, 2), "vias": vias, "length_mm": round(ln),
+            "ref_vias": ref["vias"], "ref_length_mm": round(ref["track_length_mm"]),
         })
         print(json.dumps(rows[-1]), flush=True)
-    json.dump(rows, open(os.path.join(a.work, "results.json"), "w"), indent=2)
+    run = {"label": a.label or ver, "version": ver, "commit": a.commit[:8], "command": cmd_used,
+           "date": time.strftime("%Y-%m-%d"), "machine": machine(), "budget_s": a.time,
+           "route_s": sum(r["s"] for r in rows), "total_s": round(time.time() - t_all, 1),
+           "boards": rows}
+    json.dump(run, open(os.path.join(a.work, "results.json"), "w"), indent=2)
+    if a.history:
+        history(a.history, run)
     if a.md:
         with open(a.md, "w") as f:
-            f.write("| board | layers | nets | unconnected before → after | new DRC (KiCad) | time s | vias (human) | length mm (human) |\n|---|---|---|---|---|---|---|---|\n")
+            f.write(f"copperpath {ver} (`{run['command']}`, budget {a.time:.0f} s per board, "
+                    f"{run['machine']}, {run['date']})\n\n")
+            f.write("| board | layers | nets | unconnected before → after | new DRC (KiCad) | route s | KiCad DRC s | vias (human) | length mm (human) |\n|---|---|---|---|---|---|---|---|---|\n")
             for r in rows:
                 if "error" in r:
-                    f.write(f"| {r['board']} | | | failed | | | | |\n")
+                    f.write(f"| {r['board']} | | | failed | | {r['s']} | | | |\n")
                     continue
                 nd = ", ".join(f"{k} {v}" for k, v in sorted(r["new_drc"].items())) or "0"
-                f.write(f"| {r['board']} | {r['layers']} | {r['nets']} | {r['unconnected_in']} → {r['unconnected']} | {nd} | {r['s']} | {r['vias']} ({r['ref_vias']}) | {r['length_mm']} ({r['ref_length_mm']}) |\n")
+                f.write(f"| {r['board']} | {r['layers']} | {r['nets']} | {r['unconnected_in']} → {r['unconnected']} | {nd} | {r['s']} | {r['kicad_drc_s']} | {r['vias']} ({r['ref_vias']}) | {r['length_mm']} ({r['ref_length_mm']}) |\n")
 
 
 if __name__ == "__main__":
