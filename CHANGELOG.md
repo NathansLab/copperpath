@@ -86,6 +86,8 @@ All notable changes to this project are documented here. The format follows
   parallel, so the autoroute quality gate and repeated runs check an unchanged input once.
 
 ### Fixed
+- `autoroute`: a net with outer pours only is no longer a plane net. It had no inner plane to fan
+  out to and stayed open (two-layer boards: all GND/supply pads unconnected); it is now routed.
 - `route`: the cleanup fallback ladder (two more full routes) only runs when a failed net may have
   been broken by the cleanup; pure search failures (no path, node cap, window) skip it (#54).
   Route stage of the 800-part stress board: 217 s to 70 s, same opens.

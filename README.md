@@ -177,8 +177,9 @@ $B autoroute --pcb placed.kicad_pcb --planes In1.Cu=GND,In4.Cu=+3V3 --time 600 -
 Stages (each writes its board to `OUT_stages/`, the input is never modified):
 
 1. **planes**: `--planes LAYER=NET[+NET],...` creates the missing plane zones (`plane create`).
-   Plane nets = the nets of `--plane-nets A,B`, of `--planes` and every net with a copper zone;
-   they are not routed as signals.
+   Plane nets = the nets of `--plane-nets A,B`, of `--planes` and every net with a copper zone
+   on an inner layer; they are not routed as signals. Nets with outer pours only (two-layer
+   boards) are routed as signals.
 2. **fanout**: every open island of each plane net gets a track + via onto its plane
    (`fanout --native-fill`; the plane = its zones on inner layers).
 3. **route**: the negotiated router for all other nets with `--time-limit` = the time left minus

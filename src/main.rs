@@ -2952,10 +2952,16 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
             detail: json!(made),
         });
     }
-    // plane nets: given, plus every net with a copper zone
+    // plane nets: given, plus every net with a copper zone on an inner layer (its plane); a net
+    // with outer pours only has no plane to fan out to, so it is routed like a signal
     {
         let b = board::load(&cur)?;
-        for z in b.zones.iter().filter(|z| !z.keepout && z.net != 0) {
+        let inner = 0b01_1110u8; // In1.Cu..In4.Cu in board::CU order
+        for z in b
+            .zones
+            .iter()
+            .filter(|z| !z.keepout && z.net != 0 && z.layers & inner != 0)
+        {
             let n = &b.nets[z.net];
             if !plane_nets.contains(n) {
                 plane_nets.push(n.clone());
