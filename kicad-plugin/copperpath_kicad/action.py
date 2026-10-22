@@ -1,11 +1,12 @@
-"""The "Route with copperpath" action: editor board -> copperpath -> one commit."""
+"""The plugin actions: editor board (and selection) -> copperpath -> one commit per step."""
 
 import os
 
 from . import delta as deltamod
-from . import runner, ui
+from . import runner, selection, ui
 
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+COMMANDS = ("all", "nets", "region", "ripup", "ripup-route")
 
 
 def board_text(board):
@@ -35,23 +36,85 @@ def project_files(board):
     return tuple(found)
 
 
-def run(kicad=None, api=None):
-    """Route the open board; returns a process exit code."""
+def route_args(settings):
+    """The `args` plugin setting, without options the selection commands set or must not get."""
+    args = [str(a) for a in settings.get("args", ())]
+    if "--ignore-unlocked" in args:
+        # the router would not see unlocked copper, but it stays on the board: overlaps, shorts
+        raise runner.RouteError(
+            "--ignore-unlocked in the plugin settings: new copper could overlap the existing "
+            "unlocked copper; use Rip up selected nets instead"
+        )
+    for opt in ("--nets", "--region"):
+        if opt in args:
+            raise runner.RouteError(f"{opt} in the plugin settings: the commands set it")
+    return args
+
+
+def command_args(settings, nets=None, region=None):
+    """`route` arguments: the plugin setting plus the selection."""
+    args = route_args(settings)
+    if nets is not None:
+        args += ["--nets", selection.nets_arg(nets)]
+    if region is not None:
+        args += ["--region", selection.region_arg(region)]
+    return args
+
+
+def route(board, binary, args, api, nets=None):
+    """Route with `args` and apply the delta as one commit; (removed, added)."""
+    pro, dru = project_files(board)
+    delta = runner.route(binary, board_text(board), pro, dru, args)
+    deltamod.check_scope(delta, nets)
+    return deltamod.apply(board, delta, api)
+
+
+def rip_up(board, nets):
+    """Remove the unlocked copper of `nets` in its own commit; (removed, locked kept)."""
+    items, locked = selection.ripup_items(board, nets)
+    removed, _ = deltamod.commit_items(board, items, [], "copperpath rip up")
+    return removed, locked
+
+
+def run(kicad=None, api=None, command="all"):
+    """Run one command on the open board; returns a process exit code.
+
+    `all`: route every unrouted connection (existing copper stays as it is),
+    `nets`: route the selected nets, `region`: route inside the selected shape or zone,
+    `ripup`: remove the unlocked copper of the selected nets, `ripup-route`: rip up, then route
+    those nets again (two commits, so Ctrl+Z first undoes the route, then the rip-up).
+    """
+    if command not in COMMANDS:
+        raise ValueError(f"unknown command {command!r}")
     try:
         if kicad is None:
             from kipy import KiCad
 
             kicad = KiCad()
         board = kicad.get_board()
-        settings = runner.load_settings(PLUGIN_DIR)
-        binary = runner.find_binary(PLUGIN_DIR, settings)
-        pro, dru = project_files(board)
-        delta = runner.route(binary, board_text(board), pro, dru, settings.get("args", ()))
-        removed, added = deltamod.apply(board, delta, api or deltamod.kipy_api())
+        api = api or deltamod.kipy_api()
+        nets = region = None
+        if command != "all":
+            items = list(board.get_selection())
+            if command == "region":
+                region = selection.selected_region(board, items)
+            else:
+                nets = selection.selected_nets(items)
+        if command != "ripup":
+            # settings, binary and arguments are checked before the rip-up changes anything
+            settings = runner.load_settings(PLUGIN_DIR)
+            binary = runner.find_binary(PLUGIN_DIR, settings)
+            args = command_args(settings, nets, region)
+        if command.startswith("ripup"):
+            removed, locked = rip_up(board, nets)
+            print(f"copperpath: ripped up {removed} items, kept {locked} locked")
+            if command == "ripup":
+                return 0
+        removed, added = route(board, binary, args, api, nets)
     except runner.RouteError as e:
         ui.error(str(e), e.log)
         return 1
-    except deltamod.DeltaError as e:
+    except (deltamod.DeltaError, selection.SelectionError) as e:
         ui.error(str(e))
         return 1
     except Exception as e:  # editor not reachable, API errors: show instead of dying silently

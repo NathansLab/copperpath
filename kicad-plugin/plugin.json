@@ -2,7 +2,7 @@
   "$schema": "https://go.kicad.org/api/schemas/v1",
   "identifier": "io.github.nathanslab.copperpath",
   "name": "copperpath",
-  "description": "Route the open board with the copperpath autorouter; one Ctrl+Z undoes the route",
+  "description": "Route the open board or the selection with the copperpath autorouter; one Ctrl+Z undoes the route",
   "runtime": {
     "type": "python",
     "min_version": "3.9"
@@ -11,10 +11,42 @@
     {
       "identifier": "io.github.nathanslab.copperpath.route",
       "name": "Route with copperpath",
-      "description": "Route all routable nets of the open board with copperpath",
+      "description": "Route all unrouted connections; existing copper stays as it is",
       "show-button": true,
       "scopes": ["pcb"],
       "entrypoint": "copperpath_action.py"
+    },
+    {
+      "identifier": "io.github.nathanslab.copperpath.route_nets",
+      "name": "Route selected nets",
+      "description": "Route the nets of the selected tracks, vias, pads and footprints",
+      "show-button": true,
+      "scopes": ["pcb"],
+      "entrypoint": "copperpath_nets.py"
+    },
+    {
+      "identifier": "io.github.nathanslab.copperpath.route_region",
+      "name": "Route region",
+      "description": "Route the nets whose pads lie inside the selected rectangle or zone",
+      "show-button": true,
+      "scopes": ["pcb"],
+      "entrypoint": "copperpath_region.py"
+    },
+    {
+      "identifier": "io.github.nathanslab.copperpath.ripup",
+      "name": "Rip up selected nets",
+      "description": "Remove the unlocked tracks and vias of the selected nets",
+      "show-button": false,
+      "scopes": ["pcb"],
+      "entrypoint": "copperpath_ripup.py"
+    },
+    {
+      "identifier": "io.github.nathanslab.copperpath.ripup_route",
+      "name": "Rip up and reroute selected nets",
+      "description": "Remove the unlocked tracks and vias of the selected nets, then route them again",
+      "show-button": false,
+      "scopes": ["pcb"],
+      "entrypoint": "copperpath_ripup_route.py"
     }
   ]
 }
