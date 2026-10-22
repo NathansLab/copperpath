@@ -65,6 +65,9 @@ pub struct Item<'a> {
     pub parent: Option<&'a str>, // footprint reference
     pub pad_num: Option<&'a str>,
     pub pad_type: Option<&'a str>,
+    /// references of the footprints whose courtyard the item intersects (None = unknown:
+    /// `intersectsCourtyard` then leaves the rule undecided)
+    pub courtyards: Option<&'a [String]>,
 }
 
 pub fn wild(v: &str, pat: &str) -> bool {
@@ -248,7 +251,11 @@ fn eval(e: &Expr, ab: [&Item; 2]) -> Option<bool> {
             match name.as_str() {
                 "hasNetclass" => Some(it.class == arg),
                 "memberOfFootprint" => it.parent.map(|p| wild(p, arg)),
-                _ => None, // intersectsCourtyard etc.: position dependent
+                // the side (front/back) of the courtyard is not distinguished
+                "intersectsCourtyard" | "intersectsFrontCourtyard" | "intersectsBackCourtyard" => {
+                    it.courtyards.map(|c| c.iter().any(|r| wild(r, arg)))
+                }
+                _ => None, // insideArea etc.: position dependent
             }
         }
         Expr::Cmp {
@@ -440,12 +447,15 @@ impl Rules {
         let mut r = Rules {
             classes,
             class_idx,
-            min_clearance: rs["min_clearance"].as_f64().unwrap_or(0.2),
+            // KiCad's default minimum clearance is 0: the net classes decide
+            min_clearance: rs["min_clearance"].as_f64().unwrap_or(0.0),
             min_track: rs["min_track_width"].as_f64().unwrap_or(0.2),
+            // KiCad's board setup defaults when the project has no value (kicad-cli 10 reports
+            // 0.5 mm via diameter, 0.1 mm annular width, 0.3 mm hole)
             min_via: (
-                rs["min_via_diameter"].as_f64().unwrap_or(0.0),
-                rs["min_via_annular_width"].as_f64().unwrap_or(0.0),
-                rs["min_through_hole_diameter"].as_f64().unwrap_or(0.0),
+                rs["min_via_diameter"].as_f64().unwrap_or(0.5),
+                rs["min_via_annular_width"].as_f64().unwrap_or(0.1),
+                rs["min_through_hole_diameter"].as_f64().unwrap_or(0.3),
             ),
             min_edge: rs["min_copper_edge_clearance"].as_f64().unwrap_or(0.5),
             min_hole_to_hole: rs["min_hole_to_hole"].as_f64().unwrap_or(0.25),
@@ -569,8 +579,15 @@ impl Rules {
 
     /// (min, opt) track width: DRU track_width rule (Type == 'Track') if any, else the class width
     pub fn track_width(&self, net: usize) -> (f64, f64) {
+        self.track_width_at(net, None)
+    }
+
+    /// [`Rules::track_width`] for a track inside the courtyards of the footprints `courtyards`
+    /// (rules with `intersectsCourtyard` apply; None = position unknown, they are skipped)
+    pub fn track_width_at(&self, net: usize, courtyards: Option<&[String]>) -> (f64, f64) {
         let mut a = self.item(net);
         a.typ = Some("Track");
+        a.courtyards = courtyards;
         let e = Item::default();
         let c = self.class_of(net);
         // neck-down floor: 0.2 mm unless a DRU min says otherwise, never below the board minimum
@@ -759,6 +776,24 @@ mod tests {
         assert_eq!(eval(&rs[0].expr, [&lv, &hv]), Some(false));
         // item attribute unknown at net level -> undecided
         assert_eq!(eval(&rs[2].expr, [&lv, &hv]), None);
+    }
+
+    #[test]
+    fn courtyard_neck_rule_applies_inside_the_courtyard() {
+        let dru = "(version 1)\n(rule \"neck\" (constraint track_width (min 0.15mm) (opt 0.15mm)) \
+                   (condition \"A.Type == 'Track' && A.intersectsCourtyard('U*')\"))\n";
+        let dir = std::env::temp_dir().join("copperpath_neck_rule");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("n.kicad_dru");
+        std::fs::write(&p, dru).unwrap();
+        let mut r = Rules::load("", p.to_str().unwrap(), &["".into(), "GND".into()]).unwrap();
+        r.min_track = 0.1;
+        let (_, w) = r.track_width(1);
+        assert!(w > 0.15, "outside: class width {w}");
+        let u = ["U3".to_string()];
+        assert_eq!(r.track_width_at(1, Some(&u)), (0.15, 0.15));
+        let c = ["C1".to_string()];
+        assert_eq!(r.track_width_at(1, Some(&c)).1, w);
     }
 
     #[test]

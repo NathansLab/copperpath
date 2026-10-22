@@ -129,11 +129,13 @@ pub fn layer_image(
     heatmap: Option<&[f64]>,
 ) -> Canvas {
     let mut cv = Canvas::new(gs, [18, 18, 22]);
-    if let Some(outl) = m.b.edge.first() {
+    for outl in &m.b.edge {
         let mut cells = Vec::new();
         gs.fill_poly(outl, &mut |x, y| cells.push((x, y)));
         for (x, y) in cells {
-            cv.set(x, y, [34, 36, 40]);
+            if m.b.inside(gs.center(x, y)) {
+                cv.set(x, y, [34, 36, 40]);
+            }
         }
     }
     for o in &m.objs {

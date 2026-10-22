@@ -117,6 +117,140 @@ pub struct BoardCfg {
     pub mh_pattern: String,
     /// locked pours (zone name wildcards) that yield like unlocked ones (KiCad refills them)
     pub yield_pours: Vec<String>,
+    /// routing intent per net (net wildcard, profile); the first match wins
+    pub net_prio: Vec<(String, NetPrio)>,
+}
+
+/// Routing intent of a net: multipliers on the router's costs and the track width, and whether
+/// the net is routed before the others. Profiles (combine with `+`):
+/// `low_r` (low resistance: twice the width, vias cost twice, first), `low_l` (low inductance:
+/// short and direct, vias cost three times, first), `short` (direct path: wrong layer direction
+/// and bends cheap), `few_vias` (vias cost four times), `wide` (1.5 times the width), `first`,
+/// and numbers `via:X`, `bend:X`, `dir:X`, `width:X`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NetPrio {
+    pub via: f32,
+    pub bend: f32,
+    /// wrong-direction cost multiplier on inner layers
+    pub dir: f32,
+    /// track width multiplier (the neck-down at pads keeps the class minimum)
+    pub width: f64,
+    pub first: bool,
+}
+
+impl Default for NetPrio {
+    fn default() -> Self {
+        NetPrio {
+            via: 1.0,
+            bend: 1.0,
+            dir: 1.0,
+            width: 1.0,
+            first: false,
+        }
+    }
+}
+
+impl NetPrio {
+    pub fn parse(spec: &str) -> Result<NetPrio, String> {
+        let mut p = NetPrio::default();
+        for t in spec.split('+').map(str::trim).filter(|t| !t.is_empty()) {
+            match t {
+                "low_r" => {
+                    p.width *= 2.0;
+                    p.via *= 2.0;
+                    p.first = true;
+                }
+                "low_l" => {
+                    p.via *= 3.0;
+                    p.bend *= 0.5;
+                    p.dir *= 0.25;
+                    p.first = true;
+                }
+                "short" => {
+                    p.bend *= 0.5;
+                    p.dir *= 0.25;
+                }
+                "few_vias" => p.via *= 4.0,
+                "wide" => p.width *= 1.5,
+                "first" => p.first = true,
+                _ => {
+                    let (k, v) = t
+                        .split_once(':')
+                        .ok_or(format!("net priority '{t}': unknown profile"))?;
+                    let x: f64 = v
+                        .parse()
+                        .map_err(|_| format!("net priority '{t}': expected a number"))?;
+                    if !(0.0..=100.0).contains(&x) {
+                        return Err(format!("net priority '{t}': out of range 0..100"));
+                    }
+                    match k {
+                        "via" => p.via = x as f32,
+                        "bend" => p.bend = x as f32,
+                        "dir" => p.dir = x as f32,
+                        "width" => p.width = x.max(0.1),
+                        _ => return Err(format!("net priority '{t}': unknown key '{k}'")),
+                    }
+                }
+            }
+        }
+        Ok(p)
+    }
+}
+
+impl BoardCfg {
+    /// routing intent of net `name` in net class `class`: the first entry whose wildcard matches
+    /// the net name, or the class name for entries written `class:PATTERN` (default: neutral)
+    pub fn prio(&self, name: &str, class: &str) -> NetPrio {
+        self.net_prio
+            .iter()
+            .find(|(pat, _)| match pat.strip_prefix("class:") {
+                Some(cp) => wild(class, cp),
+                None => wild(name, pat),
+            })
+            .map(|(_, p)| *p)
+            .unwrap_or_default()
+    }
+
+    /// add the `net_prio` object of a JSON value (config or `.kicad_pro` `copperpath` block)
+    /// behind the entries already there
+    pub fn add_prio_json(&mut self, np: &Value) -> Result<(), String> {
+        let Some(np) = np.as_object() else {
+            return Ok(());
+        };
+        for (k, v) in np {
+            let p = match v {
+                Value::String(s) => NetPrio::parse(s)?,
+                Value::Object(o) => {
+                    let spec: Vec<String> = o
+                        .iter()
+                        .filter(|(kk, vv)| !(*kk == "first" && vv.as_bool() == Some(false)))
+                        .map(|(kk, vv)| match vv {
+                            Value::Bool(true) if kk == "first" => "first".to_string(),
+                            _ => format!("{kk}:{}", vv.as_f64().unwrap_or(1.0)),
+                        })
+                        .collect();
+                    NetPrio::parse(&spec.join("+"))?
+                }
+                _ => return Err(format!("net_prio.{k}: expected a string or object")),
+            };
+            self.net_prio.push((k.clone(), p));
+        }
+        Ok(())
+    }
+
+    /// add `NET=PROFILE,...` (CLI `--prio`) in front of the configured ones
+    pub fn add_prio(&mut self, spec: &str) -> Result<(), String> {
+        let mut v = Vec::new();
+        for item in spec.split(',').filter(|s| !s.trim().is_empty()) {
+            let (n, pr) = item
+                .split_once('=')
+                .ok_or(format!("--prio {item}: expected NET=PROFILE"))?;
+            v.push((n.trim().to_string(), NetPrio::parse(pr)?));
+        }
+        v.append(&mut self.net_prio);
+        self.net_prio = v;
+        Ok(())
+    }
 }
 
 impl Default for BoardCfg {
@@ -130,6 +264,7 @@ impl Default for BoardCfg {
             layer_dir: [0, 1, 0, 1, 0, 1],
             mh_pattern: "MH*".into(),
             yield_pours: Vec::new(),
+            net_prio: Vec::new(),
         }
     }
 }
@@ -183,6 +318,8 @@ pub fn parse_cfg(j: &Value, board: Option<&str>) -> Result<BoardCfg, String> {
     c.skip_nets = strs(&b["skip_nets"]);
     c.yield_pours = strs(&b["yield_pours"]);
     c.via_keepout_refs = strs(&b["via_keepout_refs"]);
+    c.add_prio_json(&b["net_prio"])
+        .map_err(|e| format!("config: {e}"))?;
     if let Some(cl) = b["class_layers"].as_object() {
         for (k, v) in cl {
             c.class_layers.push((k.clone(), layer_mask(&strs(v))));
@@ -203,6 +340,16 @@ pub struct Model<'a> {
     pub r: &'a Rules,
     pub cfg: BoardCfg,
     pub objs: Vec<Obj>,
+    /// saved zone fills of all copper zones (locked or not), one object per fill polygon; they
+    /// count for connectivity only, never as obstacles
+    pub fills: Vec<Obj>,
+    /// edge index of every fill polygon (same order as `fills`)
+    pub fill_idx: Vec<PolyIndex>,
+    /// index into `Board::zones` of the zone of every fill polygon
+    pub fill_zone: Vec<usize>,
+    /// indices into `objs` of zone outlines whose zone has a saved fill (connectivity uses the
+    /// fill instead of the outline)
+    pub filled_outline: std::collections::HashSet<usize>,
     /// routable nets (have >= 2 pins, not skipped, not plane nets)
     pub routable: Vec<bool>,
     pub net_layers: Vec<u8>,
@@ -259,6 +406,36 @@ impl<'a> Model<'a> {
                 hole_r: v.drill / 2.0,
             });
         }
+        let mut filled_outline = std::collections::HashSet::new();
+        let fill_zone: Vec<usize> = b
+            .zones
+            .iter()
+            .enumerate()
+            .filter(|(_, z)| !z.keepout && z.net != 0)
+            .flat_map(|(zi, z)| std::iter::repeat_n(zi, z.fills.len()))
+            .collect();
+        let fills: Vec<Obj> = b
+            .zones
+            .iter()
+            .filter(|z| !z.keepout && z.net != 0)
+            .flat_map(|z| {
+                z.fills.iter().map(move |(l, pts)| {
+                    let s = Shape::Poly {
+                        pts: pts.clone(),
+                        r: 0.0,
+                    };
+                    Obj {
+                        bbox: s.bbox(),
+                        shape: s,
+                        layers: 1 << l,
+                        net: z.net,
+                        kind: Kind::Zone,
+                        locked: z.locked,
+                        hole_r: 0.0,
+                    }
+                })
+            })
+            .collect();
         for z in &b.zones {
             if z.outline.len() < 3 {
                 continue;
@@ -289,6 +466,9 @@ impl<'a> Model<'a> {
             }
             if !z.locked || cfg.yield_pours.iter().any(|p| wild(&z.name, p)) {
                 continue; // router pours never block (they refill)
+            }
+            if !z.fills.is_empty() {
+                filled_outline.insert(objs.len());
             }
             objs.push(Obj {
                 bbox: s.bbox(),
@@ -345,11 +525,25 @@ impl<'a> Model<'a> {
                 class_layer_mask(&cfg.class_layers, cls).unwrap_or(0x3f) & b.cu_mask
             })
             .collect();
+        let fill_idx: Vec<PolyIndex> = {
+            use rayon::prelude::*;
+            fills
+                .par_iter()
+                .map(|o| match &o.shape {
+                    Shape::Poly { pts, .. } => PolyIndex::new(pts.clone()),
+                    _ => PolyIndex::new(Vec::new()),
+                })
+                .collect()
+        };
         Model {
             b,
             r,
             cfg,
             objs,
+            fills,
+            fill_idx,
+            fill_zone,
+            filled_outline,
             routable,
             net_layers,
         }
@@ -436,6 +630,15 @@ impl<'a> Model<'a> {
         }
     }
 
+    /// copper item `i` of [`NetCopper`]: `objs[i]`, or `fills[i - objs.len()]`
+    pub fn cu(&self, i: usize) -> &Obj {
+        if i < self.objs.len() {
+            &self.objs[i]
+        } else {
+            &self.fills[i - self.objs.len()]
+        }
+    }
+
     pub fn is_mh(&self, fi: usize) -> bool {
         wild(&self.b.fps[fi].refd, &self.cfg.mh_pattern)
     }
@@ -490,11 +693,32 @@ pub fn class_layer_mask(cl: &[(String, u8)], cls: &str) -> Option<u8> {
 }
 
 /// pins of every net plus the copper components already formed by locked tracks/vias/zones
+/// and saved zone fills
 pub fn pins_by_net(m: &Model) -> HashMap<usize, Vec<Pin>> {
+    pins_and_copper(m).0
+}
+
+/// existing copper of a net as (copper index, component id of [`Pin::comp`]); the copper
+/// index points into `Model::objs` (tracks, vias) or, from `objs.len()` on, into
+/// `Model::fills` (see [`Model::cu`]); components without a pin are left out
+pub type NetCopper = HashMap<usize, Vec<(usize, usize)>>;
+
+/// [`pins_by_net`] plus the tracks, vias and zone fills that belong to each pin component: a
+/// connection may start or end on any copper of a component, not only at its pads
+pub fn pins_and_copper(m: &Model) -> (HashMap<usize, Vec<Pin>>, NetCopper) {
+    pins_and_copper_of(m, &|n| m.routable[n])
+}
+
+/// [`pins_and_copper`] for the nets selected by `sel` (also plane nets that are not routable)
+pub fn pins_and_copper_of(
+    m: &Model,
+    sel: &(dyn Fn(usize) -> bool + Sync),
+) -> (HashMap<usize, Vec<Pin>>, NetCopper) {
+    let mut copper: NetCopper = HashMap::new();
     let mut out: HashMap<usize, Vec<Pin>> = HashMap::new();
     for (fi, f) in m.b.fps.iter().enumerate() {
         for (pi, pd) in f.pads.iter().enumerate() {
-            if pd.net == 0 || pd.layers == 0 || !m.routable[pd.net] {
+            if pd.net == 0 || pd.layers == 0 || !sel(pd.net) {
                 continue;
             }
             let (c, _) = f.pad_world(pd);
@@ -507,7 +731,9 @@ pub fn pins_by_net(m: &Model) -> HashMap<usize, Vec<Pin>> {
             });
         }
     }
-    // union-find over same-net objects that touch on a shared layer
+    // union-find over same-net copper that touches on a shared layer; a zone with a saved fill
+    // takes part with its fill polygons instead of its outline
+    let no = m.objs.len();
     let mut by_net: HashMap<usize, Vec<usize>> = HashMap::new();
     for (i, o) in m.objs.iter().enumerate() {
         if o.net != 0
@@ -515,42 +741,216 @@ pub fn pins_by_net(m: &Model) -> HashMap<usize, Vec<Pin>> {
                 o.kind,
                 Kind::Pad { .. } | Kind::Track | Kind::Via | Kind::Zone
             )
+            && !m.filled_outline.contains(&i)
             && out.contains_key(&o.net)
         {
             by_net.entry(o.net).or_default().push(i);
         }
     }
-    for (net, pins) in out.iter_mut() {
-        let ids = by_net.get(net).cloned().unwrap_or_default();
-        let k = ids.len();
-        let mut par: Vec<usize> = (0..k).collect();
-        fn find(par: &mut [usize], x: usize) -> usize {
-            let mut x = x;
-            while par[x] != x {
-                par[x] = par[par[x]];
-                x = par[x];
-            }
-            x
-        }
-        for a in 0..k {
-            for c in a + 1..k {
-                let (oa, oc) = (&m.objs[ids[a]], &m.objs[ids[c]]);
-                if oa.layers & oc.layers == 0 || !oa.bbox.overlaps(&oc.bbox) {
-                    continue;
-                }
-                // pads of one footprint pad number are connected anyway via kind match below
-                if shape_dist(&oa.shape, &oc.shape) < 1e-3 {
-                    let (ra, rc) = (find(&mut par, a), find(&mut par, c));
-                    par[ra] = rc;
-                }
-            }
-        }
-        for pin in pins.iter_mut() {
-            let idx = ids.iter().position(|&i| matches!(m.objs[i].kind, Kind::Pad { fp, pad } if fp == pin.fp && pad == pin.pad));
-            pin.comp = idx.map(|j| find(&mut par, j)).unwrap_or(usize::MAX);
+    for (i, o) in m.fills.iter().enumerate() {
+        if out.contains_key(&o.net) {
+            by_net.entry(o.net).or_default().push(no + i);
         }
     }
-    out
+    let mut nets: Vec<usize> = out.keys().copied().collect();
+    nets.sort();
+    // (net, component per pin, copper items with their component)
+    type NetRes = (usize, Vec<usize>, Vec<(usize, usize)>);
+    let res: Vec<NetRes> = {
+        use rayon::prelude::*;
+        nets.par_iter()
+            .map(|net| {
+                let pins = &out[net];
+                let ids = by_net.get(net).cloned().unwrap_or_default();
+                let comp = components(m, &ids);
+                let mut pad_pos: HashMap<(usize, usize), usize> = HashMap::new();
+                for (j, &i) in ids.iter().enumerate() {
+                    if i < no {
+                        if let Kind::Pad { fp, pad } = m.objs[i].kind {
+                            pad_pos.entry((fp, pad)).or_insert(j);
+                        }
+                    }
+                }
+                let pin_comp: Vec<usize> = pins
+                    .iter()
+                    .map(|pin| {
+                        pad_pos
+                            .get(&(pin.fp, pin.pad))
+                            .map(|&j| comp[j])
+                            .unwrap_or(usize::MAX)
+                    })
+                    .collect();
+                let pin_comps: std::collections::HashSet<usize> =
+                    pin_comp.iter().copied().collect();
+                let cu: Vec<(usize, usize)> = (0..ids.len())
+                    .filter(|&j| {
+                        ids[j] >= no || matches!(m.objs[ids[j]].kind, Kind::Track | Kind::Via)
+                    })
+                    .map(|j| (ids[j], comp[j]))
+                    .filter(|(_, c)| pin_comps.contains(c))
+                    .collect();
+                (*net, pin_comp, cu)
+            })
+            .collect()
+    };
+    for (net, pin_comp, cu) in res {
+        for (pin, c) in out.get_mut(&net).unwrap().iter_mut().zip(pin_comp) {
+            pin.comp = c;
+        }
+        if !cu.is_empty() {
+            copper.insert(net, cu);
+        }
+    }
+    (out, copper)
+}
+
+/// two copper items `i`, `j` (see [`Model::cu`]) of one net touch (shared layer, distance
+/// below 1 um); zone fills use their edge index
+fn touch(m: &Model, i: usize, j: usize) -> bool {
+    let (a, b) = (m.cu(i), m.cu(j));
+    if a.layers & b.layers == 0 || !a.bbox.overlaps(&b.bbox) {
+        return false;
+    }
+    let no = m.objs.len();
+    const EPS: f64 = 1e-3;
+    match (i >= no, j >= no) {
+        (true, true) => m.fill_idx[i - no].touches(&m.fill_idx[j - no], EPS),
+        (true, false) => m.fill_idx[i - no].dist(&b.shape, EPS) < EPS,
+        (false, true) => m.fill_idx[j - no].dist(&a.shape, EPS) < EPS,
+        (false, false) => shape_dist(&a.shape, &b.shape) < EPS,
+    }
+}
+
+/// component id (union-find root, index into `ids`) of every copper item `ids` (see
+/// [`Model::cu`]); bounding-box sweep along x
+pub fn components(m: &Model, ids: &[usize]) -> Vec<usize> {
+    let k = ids.len();
+    let mut par: Vec<usize> = (0..k).collect();
+    fn find(par: &mut [usize], x: usize) -> usize {
+        let mut x = x;
+        while par[x] != x {
+            par[x] = par[par[x]];
+            x = par[x];
+        }
+        x
+    }
+    // the objects of one pad (outer pad shape + inner barrel) are one piece of copper
+    let mut first: HashMap<(usize, usize), usize> = HashMap::new();
+    for (j, &i) in ids.iter().enumerate() {
+        if let Kind::Pad { fp, pad } = m.cu(i).kind {
+            let f = *first.entry((fp, pad)).or_insert(j);
+            let (ra, rc) = (find(&mut par, j), find(&mut par, f));
+            par[ra] = rc;
+        }
+    }
+    let mut order: Vec<usize> = (0..k).collect();
+    order.sort_by(|&a, &b| m.cu(ids[a]).bbox.x0.total_cmp(&m.cu(ids[b]).bbox.x0));
+    for (ai, &a) in order.iter().enumerate() {
+        let oa = m.cu(ids[a]);
+        for &c in &order[ai + 1..] {
+            let oc = m.cu(ids[c]);
+            if oc.bbox.x0 > oa.bbox.x1 {
+                break;
+            }
+            if find(&mut par, a) == find(&mut par, c) {
+                continue;
+            }
+            if touch(m, ids[a], ids[c]) {
+                let (ra, rc) = (find(&mut par, a), find(&mut par, c));
+                par[ra] = rc;
+            }
+        }
+    }
+    (0..k).map(|j| find(&mut par, j)).collect()
+}
+
+/// copper of another net (or a rule area) near new copper of `net`, for reports: what an agent
+/// would have to move
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Blocker {
+    pub net: String,
+    /// "pad", "track", "via", "zone", "keepout", "graphic"
+    pub kind: &'static str,
+    /// footprint reference of a pad
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fp: Option<String>,
+    pub layer: String,
+    /// edge-to-edge distance (mm) from the probe shape
+    pub dist_mm: f64,
+    /// required clearance (mm) on that layer (DRU/net class incl. outer-layer creepage)
+    pub need_mm: f64,
+    pub locked: bool,
+    /// a point of the blocker (mm)
+    pub at: [f64; 2],
+}
+
+/// up to `k` objects that come closest to violating their clearance with the probe `shape` of
+/// `net` on `layers` (sorted by distance minus required clearance), within `reach` mm
+pub fn nearest_blockers(
+    m: &Model,
+    net: usize,
+    shape: &Shape,
+    layers: u8,
+    reach: f64,
+    k: usize,
+) -> Vec<Blocker> {
+    let bb = shape.bbox().inflate(reach);
+    let r4 = |v: f64| (v * 1e4).round() / 1e4;
+    let mut out: Vec<(f64, Blocker)> = Vec::new();
+    for o in &m.objs {
+        if o.layers & layers == 0 || !o.bbox.overlaps(&bb) {
+            continue;
+        }
+        let kind = match o.kind {
+            Kind::Pad { .. } => "pad",
+            Kind::Track => "track",
+            Kind::Via => "via",
+            Kind::Zone if o.net == 0 => "graphic",
+            Kind::Zone => "zone",
+            Kind::Keepout { .. } | Kind::ViaKeepout => "keepout",
+            Kind::Mask { .. } => continue,
+        };
+        if o.net == net && net != 0 && kind != "keepout" {
+            continue;
+        }
+        let l = (0..crate::board::NL)
+            .find(|l| o.layers & layers & (1 << l) != 0)
+            .unwrap_or(0);
+        let need = (0..crate::board::NL)
+            .filter(|l| o.layers & layers & (1 << l) != 0)
+            .map(|l| m.clr(net, o, l))
+            .fold(0.0f64, f64::max);
+        let d = shape_dist(shape, &o.shape);
+        if d > reach {
+            continue;
+        }
+        let at = match &o.shape {
+            Shape::Capsule { a, b, .. } => (*a + *b) * 0.5,
+            Shape::Poly { pts, .. } => o.bbox.center().min_by_dist(pts),
+        };
+        out.push((
+            d - need,
+            Blocker {
+                net: m.b.nets[o.net].clone(),
+                kind,
+                fp: match o.kind {
+                    Kind::Pad { fp, .. } => Some(m.b.fps[fp].refd.clone()),
+                    _ => None,
+                },
+                layer: if o.layers.count_ones() > 1 && kind == "via" {
+                    "through".into()
+                } else {
+                    crate::board::CU[l].to_string()
+                },
+                dist_mm: r4(d),
+                need_mm: r4(need),
+                locked: o.locked,
+                at: [r4(at.x), r4(at.y)],
+            },
+        ));
+    }
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+    out.into_iter().take(k).map(|(_, b)| b).collect()
 }
 
 /// two-pin connections: minimum spanning tree over the copper components of each net

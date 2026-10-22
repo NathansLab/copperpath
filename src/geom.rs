@@ -40,6 +40,13 @@ impl P {
         self.dot(self).sqrt()
     }
     /// KiCad rotation (degrees, y axis down, positive = counter-clockwise on screen)
+    /// the point of `pts` closest to self (self if empty)
+    pub fn min_by_dist(self, pts: &[P]) -> P {
+        pts.iter()
+            .copied()
+            .min_by(|a, b| (*a - self).len().total_cmp(&(*b - self).len()))
+            .unwrap_or(self)
+    }
     pub fn rot(self, deg: f64) -> P {
         if deg == 0.0 {
             return self;
@@ -124,6 +131,12 @@ impl BBox {
             x1: f64::NEG_INFINITY,
             y1: f64::NEG_INFINITY,
         }
+    }
+    /// the box of one point
+    pub fn empty_at(q: P) -> BBox {
+        let mut b = BBox::empty();
+        b.add(q);
+        b
     }
     pub fn add(&mut self, q: P) {
         self.x0 = self.x0.min(q.x);
@@ -238,6 +251,24 @@ impl Shape {
                 pts: pts.iter().rev().map(|q| p(q.x, -q.y)).collect(),
                 r: *r,
             },
+        }
+    }
+}
+
+/// how deep `q` lies inside the shape (distance to its outline, negative outside)
+pub fn depth(s: &Shape, q: P) -> f64 {
+    match s {
+        Shape::Capsule { a, b, r } => r - dist_seg(q, *a, *b),
+        Shape::Poly { pts, r } => {
+            let n = pts.len();
+            let d = (0..n)
+                .map(|i| dist_seg(q, pts[i], pts[(i + 1) % n]))
+                .fold(f64::INFINITY, f64::min);
+            if n >= 3 && point_in_poly(q, pts) {
+                r + d
+            } else {
+                r - d
+            }
         }
     }
 }
@@ -442,6 +473,193 @@ impl GridSpec {
     }
 }
 
+/// Large polygon (zone fill) with an edge bucket grid: point containment and "closer than d"
+/// queries cost a few edges instead of all of them.
+#[derive(Debug, Clone)]
+pub struct PolyIndex {
+    pub pts: Vec<P>,
+    pub bbox: BBox,
+    cs: f64,
+    nx: usize,
+    ny: usize,
+    /// edge ids per cell (row-major)
+    cells: Vec<Vec<u32>>,
+    /// edge ids per row of cells (ray casting along +x)
+    rows: Vec<Vec<u32>>,
+}
+
+impl PolyIndex {
+    pub fn new(pts: Vec<P>) -> PolyIndex {
+        let mut bb = BBox::empty();
+        for q in &pts {
+            bb.add(*q);
+        }
+        let n = pts.len().max(1);
+        // about 4 edges per occupied cell on average along the rim
+        let span = (bb.x1 - bb.x0).max(bb.y1 - bb.y0).max(1e-3);
+        let cs = (span / (n as f64 / 4.0).sqrt().max(1.0)).clamp(0.2, 5.0);
+        let nx = (((bb.x1 - bb.x0) / cs).floor() as usize + 1).min(4096);
+        let ny = (((bb.y1 - bb.y0) / cs).floor() as usize + 1).min(4096);
+        let mut cells = vec![Vec::new(); nx * ny];
+        let mut rows = vec![Vec::new(); ny];
+        let cx = |x: f64| (((x - bb.x0) / cs).floor().max(0.0) as usize).min(nx - 1);
+        let cy = |y: f64| (((y - bb.y0) / cs).floor().max(0.0) as usize).min(ny - 1);
+        for i in 0..pts.len() {
+            let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+            let (x0, x1) = (cx(a.x.min(b.x)), cx(a.x.max(b.x)));
+            let (y0, y1) = (cy(a.y.min(b.y)), cy(a.y.max(b.y)));
+            for y in y0..=y1 {
+                rows[y].push(i as u32);
+                for x in x0..=x1 {
+                    // keep only cells the segment's band passes (cheap test: cell box vs segment)
+                    let c = p(bb.x0 + (x as f64 + 0.5) * cs, bb.y0 + (y as f64 + 0.5) * cs);
+                    if dist_seg(c, a, b) <= cs * 0.75 {
+                        cells[y * nx + x].push(i as u32);
+                    }
+                }
+            }
+        }
+        PolyIndex {
+            pts,
+            bbox: bb,
+            cs,
+            nx,
+            ny,
+            cells,
+            rows,
+        }
+    }
+
+    fn edge(&self, i: u32) -> (P, P) {
+        let i = i as usize;
+        (self.pts[i], self.pts[(i + 1) % self.pts.len()])
+    }
+
+    /// even-odd containment
+    pub fn contains(&self, q: P) -> bool {
+        if !self.bbox.contains(q) {
+            return false;
+        }
+        let y = (((q.y - self.bbox.y0) / self.cs).floor().max(0.0) as usize).min(self.ny - 1);
+        let mut inside = false;
+        for &e in &self.rows[y] {
+            let (a, b) = self.edge(e);
+            if (a.y > q.y) != (b.y > q.y) {
+                let x = a.x + (q.y - a.y) * (b.x - a.x) / (b.y - a.y);
+                if x > q.x {
+                    inside = !inside;
+                }
+            }
+        }
+        inside
+    }
+
+    /// edges whose cells overlap `bb`
+    pub fn edges_near(&self, bb: &BBox, out: &mut Vec<u32>) {
+        out.clear();
+        if !self.bbox.inflate(self.cs).overlaps(bb) {
+            return;
+        }
+        let cx =
+            |x: f64| (((x - self.bbox.x0) / self.cs).floor().max(0.0) as usize).min(self.nx - 1);
+        let cy =
+            |y: f64| (((y - self.bbox.y0) / self.cs).floor().max(0.0) as usize).min(self.ny - 1);
+        for y in cy(bb.y0)..=cy(bb.y1) {
+            for x in cx(bb.x0)..=cx(bb.x1) {
+                out.extend_from_slice(&self.cells[y * self.nx + x]);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+    }
+
+    /// distance from the polygon (0 inside) to a shape, exact up to `limit` (larger distances
+    /// are reported as `limit` or more)
+    pub fn dist(&self, s: &Shape, limit: f64) -> f64 {
+        let (segs, r): (Vec<(P, P)>, f64) = match s {
+            Shape::Capsule { a, b, r } => (vec![(*a, *b)], *r),
+            Shape::Poly { pts, r } => {
+                let n = pts.len();
+                ((0..n).map(|i| (pts[i], pts[(i + 1) % n])).collect(), *r)
+            }
+        };
+        if let Some((a, _)) = segs.first() {
+            if self.contains(*a) {
+                return 0.0;
+            }
+        }
+        // the polygon inside the shape
+        if let Some(q) = self.pts.first() {
+            if s.dist(*q) <= 0.0 {
+                return 0.0;
+            }
+        }
+        let bb = s.bbox().inflate(limit + self.cs);
+        let mut es = Vec::new();
+        self.edges_near(&bb, &mut es);
+        let mut d = f64::INFINITY;
+        for &e in &es {
+            let (c, f) = self.edge(e);
+            for (a, b) in &segs {
+                d = d.min(seg_seg_dist(*a, *b, c, f));
+            }
+        }
+        (d - r).max(0.0)
+    }
+
+    /// distance from `q` to the polygon outline, exact up to `limit` (f64::INFINITY beyond)
+    pub fn boundary_dist(&self, q: P, limit: f64) -> f64 {
+        let mut bb = BBox::empty();
+        bb.add(q);
+        let mut es = Vec::new();
+        self.edges_near(&bb.inflate(limit + self.cs), &mut es);
+        es.iter()
+            .map(|&e| {
+                let (a, b) = self.edge(e);
+                dist_seg(q, a, b)
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// polygon area (absolute)
+    pub fn area(&self) -> f64 {
+        poly_area(&self.pts).abs()
+    }
+
+    /// the two polygons overlap or come closer than `eps`
+    pub fn touches(&self, o: &PolyIndex, eps: f64) -> bool {
+        if !self.bbox.inflate(eps).overlaps(&o.bbox) {
+            return false;
+        }
+        if self.pts.is_empty() || o.pts.is_empty() {
+            return false;
+        }
+        if self.contains(o.pts[0]) || o.contains(self.pts[0]) {
+            return true;
+        }
+        let (small, big) = if self.pts.len() <= o.pts.len() {
+            (self, o)
+        } else {
+            (o, self)
+        };
+        let mut es = Vec::new();
+        for i in 0..small.pts.len() {
+            let (a, b) = small.edge(i as u32);
+            let mut bb = BBox::empty();
+            bb.add(a);
+            bb.add(b);
+            big.edges_near(&bb.inflate(eps), &mut es);
+            for &e in &es {
+                let (c, f) = big.edge(e);
+                if seg_seg_dist(a, b, c, f) < eps {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 /// convex hull (monotone chain)
 pub fn hull(mut v: Vec<P>) -> Vec<P> {
     v.sort_by(|a, b| {
@@ -540,6 +758,40 @@ mod tests {
         let ov = oval_shape(p(0.0, 0.0), 3.0, 1.0, 0.0);
         assert!(close(ov.dist(p(0.0, 2.0)), 1.5));
         assert!(close(ov.dist(p(3.0, 0.0)), 1.5));
+    }
+
+    #[test]
+    fn poly_index_matches_brute_force() {
+        // comb-shaped polygon with many edges
+        let mut pts = vec![p(0.0, 0.0)];
+        for i in 0..50 {
+            let x = i as f64 * 0.4;
+            pts.push(p(x, 5.0));
+            pts.push(p(x + 0.2, 5.0));
+            pts.push(p(x + 0.2, 1.0));
+            pts.push(p(x + 0.4, 1.0));
+        }
+        pts.push(p(20.0, 0.0));
+        let ix = PolyIndex::new(pts.clone());
+        for k in 0..400 {
+            let q = p((k % 40) as f64 * 0.513 - 0.3, (k / 40) as f64 * 0.61 - 0.4);
+            assert_eq!(ix.contains(q), point_in_poly(q, &pts), "{q:?}");
+            let s = Shape::circle(q, 0.05);
+            let full = Shape::Poly {
+                pts: pts.clone(),
+                r: 0.0,
+            };
+            let (a, b) = (ix.dist(&s, 1.0), shape_dist(&full, &s));
+            assert!(b >= 1.0 && a >= 1.0 || close(a, b), "{q:?} {a} {b}");
+        }
+        let other = PolyIndex::new(vec![
+            p(3.0, 5.0005),
+            p(4.0, 5.0005),
+            p(4.0, 6.0),
+            p(3.0, 6.0),
+        ]);
+        assert!(ix.touches(&other, 1e-3));
+        assert!(!ix.touches(&other, 1e-4));
     }
 
     #[test]

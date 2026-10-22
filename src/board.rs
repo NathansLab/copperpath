@@ -80,6 +80,13 @@ pub struct Pad {
     pub mask: u8,
     /// local solder mask expansion (pad, else footprint); None = board setup value
     pub mask_margin: Option<f64>,
+    /// zone connection override (`zone_connect`: 0 none, 1 thermal, 2 solid, 3 THT thermal),
+    /// thermal gap and spoke width overrides (pad, else footprint)
+    pub zone_connect: Option<u8>,
+    pub thermal_gap: Option<f64>,
+    pub thermal_bridge: Option<f64>,
+    /// thermal spoke angle in degrees (KiCad: 45 for circle pads, 90 otherwise)
+    pub spoke_angle: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +106,9 @@ pub struct Footprint {
     pub pads: Vec<Pad>,
     /// courtyard polygon in the footprint frame (as stored, i.e. already mirrored for B)
     pub crtyd: Vec<P>,
+    /// the separate courtyard polygons when there are several (footprint frame; `crtyd` is
+    /// then their hull); empty for a single outline
+    pub crtyd_parts: Vec<Vec<P>>,
     /// solder mask graphics (fp_* on F.Mask / B.Mask) in the footprint frame, as (shape, mask of
     /// the copper layer they expose)
     pub mask: Vec<(Shape, u8)>,
@@ -127,6 +137,17 @@ impl Footprint {
             .map(|(s, lm)| (s.xform(self.at, self.rot), *lm))
             .collect()
     }
+    /// every courtyard polygon in world coordinates (the separate ones, else the single outline)
+    pub fn crtyd_parts_world(&self) -> Vec<Vec<P>> {
+        if self.crtyd_parts.is_empty() {
+            let c = self.crtyd_world();
+            return if c.len() >= 3 { vec![c] } else { vec![] };
+        }
+        self.crtyd_parts
+            .iter()
+            .map(|pl| pl.iter().map(|q| self.at + q.rot(self.rot)).collect())
+            .collect()
+    }
     pub fn crtyd_world(&self) -> Vec<P> {
         self.crtyd
             .iter()
@@ -141,6 +162,11 @@ impl Footprint {
         if back != self.back {
             f.back = back;
             f.crtyd = f.crtyd.iter().rev().map(|q| p(q.x, -q.y)).collect();
+            f.crtyd_parts = f
+                .crtyd_parts
+                .iter()
+                .map(|pl| pl.iter().rev().map(|q| p(q.x, -q.y)).collect())
+                .collect();
             for pd in &mut f.pads {
                 pd.pos = p(pd.pos.x, -pd.pos.y);
                 pd.rel_rot = -pd.rel_rot;
@@ -192,8 +218,20 @@ pub struct Zone {
     pub ko_pour: bool,
     pub ko_footprints: bool,
     pub priority: i64,
+    /// pad connection: 0 none, 1 thermal relief (KiCad default), 2 solid, 3 thermal for
+    /// through-hole pads only (SMD solid)
+    pub connect: u8,
+    /// zone clearance (`connect_pads (clearance X)`), mm
+    pub clearance: f64,
+    /// minimum copper width of the fill, mm
+    pub min_thickness: f64,
+    /// thermal relief gap and spoke width, mm
+    pub thermal_gap: f64,
+    pub thermal_bridge: f64,
     /// owning footprint (rule areas inside footprints)
     pub fp: Option<String>,
+    /// saved zone fill (`filled_polygon`): (copper layer index, polygon); empty if never filled
+    pub fills: Vec<(usize, Vec<P>)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -353,6 +391,12 @@ fn parse_pad(l: &List, b: &mut Board, fp_rot: f64, fp_margin: Option<f64>) -> Pa
         inner_barrel_only,
         mask: mask_layers(&l.atoms("layers")),
         mask_margin: l.valf("solder_mask_margin").or(fp_margin),
+        zone_connect: l.valf("zone_connect").map(|v| v as u8),
+        thermal_gap: l.valf("thermal_gap"),
+        thermal_bridge: l.valf("thermal_bridge_width").or(l.valf("thermal_width")),
+        spoke_angle: l
+            .valf("thermal_bridge_angle")
+            .unwrap_or(if shape == "circle" { 45.0 } else { 90.0 }),
     }
 }
 
@@ -544,7 +588,34 @@ fn parse_zone(z: &List, b: &mut Board, fp: Option<&str>, fp_at: Option<(P, f64)>
         ko_pour: na("copperpour"),
         ko_footprints: na("footprints"),
         priority: z.valf("priority").unwrap_or(0.0) as i64,
+        connect: match z.child("connect_pads").and_then(|c| c.arg(0)) {
+            Some("no") => 0,
+            Some("yes") => 2,
+            Some("thru_hole_only") => 3,
+            _ => 1,
+        },
+        clearance: z
+            .child("connect_pads")
+            .and_then(|c| c.valf("clearance"))
+            .unwrap_or(0.0),
+        min_thickness: z.valf("min_thickness").unwrap_or(0.25),
+        thermal_gap: z
+            .child("fill")
+            .and_then(|f| f.valf("thermal_gap"))
+            .unwrap_or(0.5),
+        thermal_bridge: z
+            .child("fill")
+            .and_then(|f| f.valf("thermal_bridge_width"))
+            .unwrap_or(0.5),
         fp: fp.map(|s| s.to_string()),
+        fills: z
+            .children("filled_polygon")
+            .filter_map(|fp| {
+                let l = fp.val("layer").and_then(layer_idx)?;
+                let pts = pts_of(fp);
+                (pts.len() >= 3).then_some((l, pts))
+            })
+            .collect(),
     }
 }
 
@@ -595,8 +666,10 @@ fn courtyard(f: &List) -> Vec<P> {
         return polys.pop().unwrap();
     }
     if !lines.is_empty() && polys.is_empty() {
-        if let Some(ch) = chain(&lines) {
-            return ch;
+        let mut lp = chain(&lines);
+        // exactly one loop that uses every line
+        if lp.len() == 1 && lp[0].len() == lines.len() {
+            return lp.pop().unwrap();
         }
     }
     let mut all: Vec<P> = polys.into_iter().flatten().collect();
@@ -607,39 +680,151 @@ fn courtyard(f: &List) -> Vec<P> {
     hull(all)
 }
 
-/// chain line segments into one closed polygon if they form exactly one loop
-fn chain(lines: &[(P, P)]) -> Option<Vec<P>> {
-    let close = |a: P, b: P| (a - b).len() < 1e-4;
-    let mut used = vec![false; lines.len()];
-    let mut poly = vec![lines[0].0, lines[0].1];
-    used[0] = true;
-    loop {
-        let last = *poly.last().unwrap();
-        let mut found = false;
-        for (i, (a, b)) in lines.iter().enumerate() {
-            if used[i] {
-                continue;
-            }
-            if close(*a, last) {
-                poly.push(*b);
-            } else if close(*b, last) {
-                poly.push(*a);
-            } else {
-                continue;
-            }
-            used[i] = true;
-            found = true;
-            break;
+/// the separate closed courtyard polygons of a footprint when it has more than one (rects,
+/// polys, circles and closed line loops); empty otherwise
+fn courtyard_parts(f: &List) -> Vec<Vec<P>> {
+    let mut polys: Vec<Vec<P>> = Vec::new();
+    let mut lines: Vec<(P, P)> = Vec::new();
+    for g in f.lists() {
+        if !g.val("layer").unwrap_or("").ends_with("CrtYd") {
+            continue;
         }
-        if !found {
-            break;
+        match g.head() {
+            "fp_rect" => {
+                if let (Some(s), Some(e)) = (g.xy("start"), g.xy("end")) {
+                    polys.push(vec![p(s.0, s.1), p(e.0, s.1), p(e.0, e.1), p(s.0, e.1)]);
+                }
+            }
+            "fp_poly" => polys.push(pts_of(g)),
+            "fp_line" => {
+                if let (Some(s), Some(e)) = (g.xy("start"), g.xy("end")) {
+                    lines.push((p(s.0, s.1), p(e.0, e.1)));
+                }
+            }
+            "fp_arc" => {
+                if let (Some(s), Some(m), Some(e)) = (g.xy("start"), g.xy("mid"), g.xy("end")) {
+                    lines.push((p(s.0, s.1), p(m.0, m.1)));
+                    lines.push((p(m.0, m.1), p(e.0, e.1)));
+                }
+            }
+            "fp_circle" => {
+                if let (Some(c), Some(e)) = (g.xy("center"), g.xy("end")) {
+                    let r = ((e.0 - c.0).powi(2) + (e.1 - c.1).powi(2)).sqrt();
+                    polys.push(
+                        (0..16)
+                            .map(|k| {
+                                let t = k as f64 * std::f64::consts::PI / 8.0;
+                                p(c.0 + r * t.cos(), c.1 + r * t.sin())
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            _ => {}
         }
     }
-    if used.iter().all(|u| *u) && close(poly[0], *poly.last().unwrap()) {
-        poly.pop();
-        Some(poly)
-    } else {
-        None
+    polys.retain(|pl| pl.len() >= 3);
+    polys.extend(chain(&lines).into_iter().filter(|pl| pl.len() >= 3));
+    if polys.len() < 2 {
+        return Vec::new();
+    }
+    polys
+}
+
+/// chain line segments into closed loops (several board outlines in one file, cut-outs);
+/// segments that close no loop are left out
+fn chain(lines: &[(P, P)]) -> Vec<Vec<P>> {
+    let close = |a: P, b: P| (a - b).len() < 1e-4;
+    let mut used = vec![false; lines.len()];
+    let mut loops = Vec::new();
+    for s0 in 0..lines.len() {
+        if used[s0] {
+            continue;
+        }
+        let mut idx = vec![s0];
+        used[s0] = true;
+        let mut poly = vec![lines[s0].0, lines[s0].1];
+        loop {
+            if poly.len() > 2 && close(poly[0], *poly.last().unwrap()) {
+                break;
+            }
+            let last = *poly.last().unwrap();
+            let mut found = false;
+            for (i, (a, b)) in lines.iter().enumerate() {
+                if used[i] {
+                    continue;
+                }
+                if close(*a, last) {
+                    poly.push(*b);
+                } else if close(*b, last) {
+                    poly.push(*a);
+                } else {
+                    continue;
+                }
+                used[i] = true;
+                idx.push(i);
+                found = true;
+                break;
+            }
+            if !found {
+                break;
+            }
+        }
+        if poly.len() > 3 && close(poly[0], *poly.last().unwrap()) {
+            poly.pop();
+            loops.push(poly);
+        } else {
+            // open chain: release its segments (they stay plain edge segments)
+            for i in idx.into_iter().skip(1) {
+                used[i] = false;
+            }
+        }
+    }
+    loops
+}
+
+impl Board {
+    /// inside the board: inside an odd number of closed Edge.Cuts outlines (several outlines
+    /// side by side = a panel, an outline inside another = a cut-out); no outline = everywhere
+    pub fn inside(&self, q: P) -> bool {
+        self.edge.is_empty() || self.edge.iter().filter(|o| point_in_poly(q, o)).count() % 2 == 1
+    }
+    /// indices of the outer board outlines (closed outlines not inside another one), in file order
+    pub fn outer_outlines(&self) -> Vec<usize> {
+        (0..self.edge.len())
+            .filter(|&i| {
+                let q = self.edge[i][0];
+                !(0..self.edge.len()).any(|j| j != i && point_in_poly(q, &self.edge[j]))
+            })
+            .collect()
+    }
+    /// keep only outer outline `n` (1-based, see `outer_outlines`) and the cut-outs inside it;
+    /// edge segments and the board box shrink to it (`--outline N`)
+    pub fn select_outline(&mut self, n: usize) -> Result<(), String> {
+        let outer = self.outer_outlines();
+        let Some(&oi) = n.checked_sub(1).and_then(|k| outer.get(k)) else {
+            return Err(format!(
+                "--outline {n}: the board has {} closed Edge.Cuts outline(s)",
+                outer.len()
+            ));
+        };
+        let o = self.edge[oi].clone();
+        let mut bb = BBox::empty();
+        for q in &o {
+            bb.add(*q);
+        }
+        let near = bb.inflate(1e-3);
+        self.edge = self
+            .edge
+            .iter()
+            .enumerate()
+            .filter(|(i, pl)| *i == oi || point_in_poly(pl[0], &o))
+            .map(|(_, pl)| pl.clone())
+            .collect();
+        self.edge_segs
+            .retain(|(a, b)| near.contains(*a) && near.contains(*b));
+        self.bbox = bb;
+        Ok(())
     }
 }
 
@@ -684,7 +869,14 @@ pub fn parse_board(text: String) -> Result<Board, String> {
                 }
                 let pads: Vec<Pad> = it
                     .children("pad")
-                    .map(|pd| parse_pad(pd, &mut b, r, it.valf("solder_mask_margin")))
+                    .map(|pd| {
+                        let mut q = parse_pad(pd, &mut b, r, it.valf("solder_mask_margin"));
+                        q.zone_connect =
+                            q.zone_connect.or(it.valf("zone_connect").map(|v| v as u8));
+                        q.thermal_gap = q.thermal_gap.or(it.valf("thermal_gap"));
+                        q.thermal_bridge = q.thermal_bridge.or(it.valf("thermal_width"));
+                        q
+                    })
                     .collect();
                 let fpz: Vec<Zone> = it
                     .children("zone")
@@ -745,6 +937,7 @@ pub fn parse_board(text: String) -> Result<Board, String> {
                     board,
                     pads,
                     crtyd: courtyard(it),
+                    crtyd_parts: courtyard_parts(it),
                     mask,
                     span: it.span,
                 });
@@ -875,9 +1068,8 @@ pub fn parse_board(text: String) -> Result<Board, String> {
         }
     }
     if !b.edge_segs.is_empty() {
-        if let Some(ch) = chain(&b.edge_segs) {
-            b.edge.push(ch);
-        }
+        let loops = chain(&b.edge_segs);
+        b.edge.extend(loops);
     }
     let mut bb = BBox::empty();
     for poly in &b.edge {
