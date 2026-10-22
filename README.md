@@ -78,7 +78,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 
 | option | default | meaning |
 |---|---|---|
-| `--res` | 0.05 | grid resolution in mm |
+| `--res` | 0.05 | grid resolution in mm; `auto`: 0.1 mm when every routed net has at least 0.2 mm clearance and width and no pad pitch is under 0.5 mm (4x fewer cells) |
 | `--via-cost` | 30 | via cost (in grid steps) |
 | `--bend-cost` / `--bend90` | 4 / 1.4 | cost of a 45° bend / factor for 90° bends |
 | `--hweight` | 1.02 | A\* heuristic weight (>1: faster, less optimal) |
@@ -230,7 +230,15 @@ nets marked `first` are routed before the others:
 | `first` | routed before the other nets | the nets that matter most |
 | `via:X` `bend:X` `dir:X` `width:X` | the multipliers themselves | fine tuning |
 
-Profiles combine with `+` (`CLK=low_l+wide`). `netinfo` reports the result per net: length, vias,
+Profiles combine with `+` (`CLK=low_l+wide`). A key `class:PATTERN` applies to the nets of the
+matching net classes (`--prio 'class:Power=low_r'`). The intents can live in the KiCad project
+next to its net classes, as a `copperpath` block in the `.kicad_pro` (KiCad keeps unknown keys):
+
+```json
+"copperpath": { "net_prio": { "class:Power": "low_r", "CLK*": "low_l", "SW": { "via": 3, "width": 2 } } }
+```
+
+Order: `--prio` first, then `net_prio` of `--cfg`, then the project block; the first match wins. `netinfo` reports the result per net: length, vias,
 width and rough DC resistance (copper 35 µm, `--cu-um`) and partial inductance (Grover formula
 for the total length plus about 1.3 nH per 1.6 mm via). Demo board, `route` without and with
 `--prio '+5V=low_r,CLK=low_l,ADC1=few_vias'` (both DRC-clean):

@@ -62,3 +62,38 @@ fn bad_profile_is_refused() {
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("unknown profile"));
 }
+
+/// intents per net class, from the project file's `copperpath` block (next to the net classes)
+#[test]
+fn class_intent_from_the_project_file() {
+    let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("net_prio_class");
+    std::fs::create_dir_all(&d).unwrap();
+    let pcb = d.join("demo.kicad_pcb");
+    std::fs::copy(DEMO, &pcb).unwrap();
+    std::fs::copy(
+        DEMO.replace("kicad_pcb", "kicad_dru"),
+        d.join("demo.kicad_dru"),
+    )
+    .unwrap();
+    let mut pro: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(DEMO.replace("kicad_pcb", "kicad_pro")).unwrap(),
+    )
+    .unwrap();
+    pro["copperpath"] = serde_json::json!({"net_prio": {"class:Power": "low_r"}});
+    std::fs::write(d.join("demo.kicad_pro"), pro.to_string()).unwrap();
+    let out = d.join("routed.kicad_pcb");
+    let out = out.to_str().unwrap();
+    let r = cp(&["route", "--pcb", pcb.to_str().unwrap(), "--out", out]);
+    assert_eq!(r["opens"], 0, "{r}");
+    let pro_path = d.join("demo.kicad_pro");
+    let info = cp(&["netinfo", "--pcb", out, "--pro", pro_path.to_str().unwrap()]);
+    // Power class (0.4 mm) doubled; a Default net stays at 0.25 mm
+    assert!(
+        net(&info, "+5V")["width_max_mm"].as_f64().unwrap() >= 0.79,
+        "{info}"
+    );
+    assert!(
+        net(&info, "CLK")["width_max_mm"].as_f64().unwrap() <= 0.26,
+        "{info}"
+    );
+}

@@ -217,9 +217,16 @@ pub fn load_ctx(a: &Args) -> Result<Ctx, String> {
         cfg.yield_pours
             .extend(y.split(',').filter(|s| !s.is_empty()).map(String::from));
     }
-    // routing intent per net: --prio 'VBUS=low_r,CLK*=low_l+first'
+    // routing intent per net or class: --prio 'VBUS=low_r,class:Power=low_r' before --cfg, then
+    // the project's "copperpath": {"net_prio": ...} block next to its net classes
     if let Some(p) = a.get("prio") {
         cfg.add_prio(p)?;
+    }
+    if let Ok(t) = std::fs::read_to_string(&pro) {
+        if let Ok(j) = serde_json::from_str::<Value>(&t) {
+            cfg.add_prio_json(&j["copperpath"]["net_prio"])
+                .map_err(|e| format!("{pro}: copperpath.{e}"))?;
+        }
     }
     eprintln!(
         "[load] {} footprints, {} tracks, {} vias, {} zones, {} copper graphics, {} nets, {} DRU rules in {:.2} s",
@@ -1127,6 +1134,7 @@ fn route_once(a: &Args) -> CmdResult {
         model::CopperMode::All
     };
     let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), mode);
+    let filt_early = net_filter(a, &c.board.nets);
     if !c.cfg.class_layers.is_empty() {
         for cl in &c.rules.classes {
             if let Some(mk) = model::class_layer_mask(&c.cfg.class_layers, &cl.name) {
@@ -1139,7 +1147,7 @@ fn route_once(a: &Args) -> CmdResult {
         }
     }
     let mut p = droute::DParams::default();
-    p.res = a.f("res", p.res);
+    p.res = grid_res(a, &m, filt_early.as_ref());
     p.via_cost = a.f("via-cost", p.via_cost as f64) as f32;
     p.hweight = a.f("hweight", p.hweight as f64) as f32;
     p.max_expand = a.f("max-expand", p.max_expand as f64) as u64;
@@ -1573,6 +1581,57 @@ fn native_report(c: &Ctx) -> (Value, Vec<drc::Violation>, usize) {
         }
     }
     (drc::report(&v, &unc), v, opens)
+}
+
+/// grid resolution of the detailed router: `--res MM` (default 0.05), or `--res auto`: 0.1 mm when
+/// every net to route has at least 0.2 mm clearance and track width and no footprint with such
+/// nets has a pad pitch under 0.5 mm (4x fewer cells; same result on the coarse PCBench boards),
+/// else 0.05 mm
+fn grid_res(a: &Args, m: &model::Model, filt: Option<&std::collections::HashSet<usize>>) -> f64 {
+    match a.get("res") {
+        None => return 0.05,
+        Some(v) if v != "auto" => return v.parse().unwrap_or(0.05),
+        _ => {}
+    }
+    let r = m.r;
+    let nets: Vec<usize> = (1..m.b.nets.len())
+        .filter(|&n| m.routable[n] && filt.is_none_or(|f| f.contains(&n)))
+        .collect();
+    let mut clr = f64::INFINITY;
+    let mut width = f64::INFINITY;
+    for &i in &nets {
+        width = width.min(r.track_width(i).0);
+        for j in 0..m.b.nets.len() {
+            if j != i {
+                clr = clr.min(r.clr(i, j, true)).min(r.clr(i, j, false));
+            }
+        }
+    }
+    let mut pitch = f64::INFINITY;
+    for f in &m.b.fps {
+        if !f.pads.iter().any(|p| nets.binary_search(&p.net).is_ok()) {
+            continue;
+        }
+        let c: Vec<geom::P> = f.pads.iter().map(|p| f.pad_world(p).0).collect();
+        for i in 0..c.len() {
+            for j in i + 1..c.len() {
+                let d = (c[i] - c[j]).len();
+                if d > 1e-6 {
+                    pitch = pitch.min(d);
+                }
+            }
+        }
+    }
+    let res = if clr >= 0.2 - 1e-9 && width >= 0.2 - 1e-9 && pitch >= 0.5 - 1e-9 {
+        0.1
+    } else {
+        0.05
+    };
+    eprintln!(
+        "[route] grid {res} mm (auto: min clearance {:.3}, width {:.3}, pad pitch {:.3} mm)",
+        clr, width, pitch
+    );
+    res
 }
 
 /// output path for a command that writes a board copy: must end in .kicad_pcb and differ from

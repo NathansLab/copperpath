@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Routing intents per net class (`class:PATTERN` keys) and from the project file
+  (`.kicad_pro` block `"copperpath": {"net_prio": ...}`, next to the net classes).
+- `route --res auto`: 0.1 mm grid when the rules and pad pitches allow it (2.6-4x faster on
+  coarse two-layer boards, same result), else 0.05 mm.
 - `route --stall-gain F` (stop negotiating when iterations gain less than F) and `--no-fallback`
   (no extra full routes for nets the exact check dropped).
 - Routing intents per net (`--prio NET=PROFILE`, config `net_prio`): `low_r`, `low_l`, `short`,

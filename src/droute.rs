@@ -752,7 +752,7 @@ impl<'a> Router<'a> {
                 hn = mn / 2.0;
             }
             // routing intent: a wider track (capped at 5 mm), never narrower than the class
-            let prio = m.cfg.prio(&m.b.nets[net]);
+            let prio = m.cfg.prio(&m.b.nets[net], &m.r.class_of(net).name);
             let w = (w * prio.width).clamp(w.min(wmin), w.max(5.0));
             jobs.push(NetJob {
                 net,

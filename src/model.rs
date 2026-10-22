@@ -198,13 +198,44 @@ impl NetPrio {
 }
 
 impl BoardCfg {
-    /// routing intent of net `name` (the first matching wildcard; default: neutral)
-    pub fn prio(&self, name: &str) -> NetPrio {
+    /// routing intent of net `name` in net class `class`: the first entry whose wildcard matches
+    /// the net name, or the class name for entries written `class:PATTERN` (default: neutral)
+    pub fn prio(&self, name: &str, class: &str) -> NetPrio {
         self.net_prio
             .iter()
-            .find(|(pat, _)| wild(name, pat))
+            .find(|(pat, _)| match pat.strip_prefix("class:") {
+                Some(cp) => wild(class, cp),
+                None => wild(name, pat),
+            })
             .map(|(_, p)| *p)
             .unwrap_or_default()
+    }
+
+    /// add the `net_prio` object of a JSON value (config or `.kicad_pro` `copperpath` block)
+    /// behind the entries already there
+    pub fn add_prio_json(&mut self, np: &Value) -> Result<(), String> {
+        let Some(np) = np.as_object() else {
+            return Ok(());
+        };
+        for (k, v) in np {
+            let p = match v {
+                Value::String(s) => NetPrio::parse(s)?,
+                Value::Object(o) => {
+                    let spec: Vec<String> = o
+                        .iter()
+                        .filter(|(kk, vv)| !(*kk == "first" && vv.as_bool() == Some(false)))
+                        .map(|(kk, vv)| match vv {
+                            Value::Bool(true) if kk == "first" => "first".to_string(),
+                            _ => format!("{kk}:{}", vv.as_f64().unwrap_or(1.0)),
+                        })
+                        .collect();
+                    NetPrio::parse(&spec.join("+"))?
+                }
+                _ => return Err(format!("net_prio.{k}: expected a string or object")),
+            };
+            self.net_prio.push((k.clone(), p));
+        }
+        Ok(())
     }
 
     /// add `NET=PROFILE,...` (CLI `--prio`) in front of the configured ones
@@ -287,26 +318,8 @@ pub fn parse_cfg(j: &Value, board: Option<&str>) -> Result<BoardCfg, String> {
     c.skip_nets = strs(&b["skip_nets"]);
     c.yield_pours = strs(&b["yield_pours"]);
     c.via_keepout_refs = strs(&b["via_keepout_refs"]);
-    if let Some(np) = b["net_prio"].as_object() {
-        for (k, v) in np {
-            let p = match v {
-                Value::String(s) => NetPrio::parse(s)?,
-                Value::Object(o) => {
-                    let spec: Vec<String> = o
-                        .iter()
-                        .map(|(kk, vv)| match vv {
-                            Value::Bool(true) if kk == "first" => "first".to_string(),
-                            _ => format!("{kk}:{}", vv.as_f64().unwrap_or(1.0)),
-                        })
-                        .filter(|s| !s.starts_with("first:"))
-                        .collect();
-                    NetPrio::parse(&spec.join("+"))?
-                }
-                _ => return Err(format!("config: net_prio.{k}: expected a string or object")),
-            };
-            c.net_prio.push((k.clone(), p));
-        }
-    }
+    c.add_prio_json(&b["net_prio"])
+        .map_err(|e| format!("config: {e}"))?;
     if let Some(cl) = b["class_layers"].as_object() {
         for (k, v) in cl {
             c.class_layers.push((k.clone(), layer_mask(&strs(v))));
