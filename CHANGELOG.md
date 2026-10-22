@@ -21,6 +21,11 @@ All notable changes to this project are documented here. The format follows
   footprints (about their origin) in the `.kicad_pcb` text: the footprint `at`, the absolute pad
   and field angles and the board-coordinate outlines of rule areas inside the footprint change,
   everything else stays byte for byte.
+- `render`: PNG of a board region for AI agents (native rasteriser, about 0.05 s for 1200 px):
+  copper layers colour-coded and semi-transparent, zone fills, pads with `REF.PIN`/net labels
+  without overlaps, vias, courtyards, rule areas, HV clearance halos, ratsnest of the open
+  connections, DRC markers from a kicad-cli JSON report, mm grid, scale bar; `--per-layer`
+  small multiples; `--json` lists the open connections in the region.
 - `route --reroute-blockers [--max-ripped 3] [--max-targets 10]`: for every net left open, the
   unlocked copper of other nets on its cheapest corridor (search with that copper passable at a
   high cost) is ripped and the net is rerouted together with the ripped nets; kept only if no
