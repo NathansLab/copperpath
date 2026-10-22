@@ -3077,8 +3077,33 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
             }
         }
     }
+    // pour nets: zones on outer layers only (two-layer boards); routed after the signals, on the
+    // filled pours, so tracks only join the islands the pours leave apart
+    let pour_nets: Vec<String> = {
+        let b = board::load(&cur)?;
+        let mut v: Vec<String> = Vec::new();
+        for z in b.zones.iter().filter(|z| !z.keepout && z.net != 0) {
+            let n = &b.nets[z.net];
+            if !plane_nets.contains(n) && !v.contains(n) && !n.contains(',') {
+                v.push(n.clone());
+            }
+        }
+        v
+    };
     let pn = plane_nets.join(",");
     eprintln!("[autoroute] plane nets: {pn}");
+    let skip_sig = plane_nets
+        .iter()
+        .chain(&pour_nets)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
+    if !pour_nets.is_empty() {
+        eprintln!(
+            "[autoroute] pour nets (routed after the signals): {}",
+            pour_nets.join(",")
+        );
+    }
     // zone name patterns per plane net: inner zones are the plane, outer ones the pours
     let zone_pats = |pcb: &str, net: &str| -> Result<(String, String), String> {
         let b = board::load(pcb)?;
@@ -3153,8 +3178,8 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
         let o = format!("{work}/3_route.kicad_pcb");
         let tls = format!("{tl:.0}");
         let mut kv: Vec<(&str, &str)> = vec![("pcb", &cur), ("out", &o), ("time-limit", &tls)];
-        if !pn.is_empty() {
-            kv.push(("plane-nets", &pn));
+        if !skip_sig.is_empty() {
+            kv.push(("plane-nets", &skip_sig));
         }
         if a.get("no-reroute").is_none() {
             kv.push(("reroute-blockers", "1"));
@@ -3212,8 +3237,8 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
             ("max-expand", "20000000"),
             ("reroute-blockers", "1"),
         ];
-        if !pn.is_empty() {
-            kv.push(("plane-nets", &pn));
+        if !skip_sig.is_empty() {
+            kv.push(("plane-nets", &skip_sig));
         }
         match cmd_route_core(&sub_args("route", &kv)) {
             Ok(v) => {
@@ -3239,6 +3264,71 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
                 detail: json!(null),
             }),
         }
+    }
+    // 3c. pour nets: fill the zones natively, then route only what the fill leaves open (the
+    // router starts on the fill), without ripping signals; new tracks can cut another pour, so
+    // refill and repeat (up to 3 rounds) until the refilled board has no open pour net
+    if !pour_nets.is_empty() && left() > 5.0 {
+        let t = Instant::now();
+        let mut rounds = Vec::new();
+        for round in 1..=3 {
+            let fo = format!("{work}/3c_fill_{round}.kicad_pcb");
+            let o = format!("{work}/3c_pours_{round}.kicad_pcb");
+            let tls = format!(
+                "{:.0}",
+                (left() - (budget * 0.05).clamp(2.0, 30.0)).max(5.0)
+            );
+            let nets = pour_nets.join(",");
+            let mut kv: Vec<(&str, &str)> = vec![
+                ("pcb", &fo),
+                ("out", &o),
+                ("time-limit", &tls),
+                ("nets", &nets),
+            ];
+            if !pn.is_empty() {
+                kv.push(("plane-nets", &pn));
+            }
+            let r = cmd_plane(&sub_args(
+                "plane",
+                &[("pcb", &cur), ("out", &fo), ("_sub", "fill")],
+            ))
+            .and_then(|_| cmd_route_core(&sub_args("route", &kv)));
+            match r {
+                Ok(v) => {
+                    cur = o;
+                    let (left_open, per) = opens_all(a, &cur, &c)?;
+                    let pour_open = per
+                        .iter()
+                        .filter(|n| {
+                            n["net"]
+                                .as_str()
+                                .is_some_and(|x| pour_nets.iter().any(|p| p == x))
+                        })
+                        .count();
+                    rounds.push(json!({"round": round, "segments": v["segments"], "vias": v["vias"], "opens": left_open, "open_pour_nets": pour_open}));
+                    if pour_open == 0 || left() < 5.0 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    rounds.push(json!({"round": round, "error": e}));
+                    break;
+                }
+            }
+        }
+        let opens = rounds
+            .last()
+            .and_then(|r| r["opens"].as_u64())
+            .map(|x| x as usize);
+        stages.push(Stage {
+            name: "pours",
+            out: cur.clone(),
+            secs: t.elapsed().as_secs_f64(),
+            opens,
+            ok: opens.is_some(),
+            note: format!("{} pour net(s), {} round(s)", pour_nets.len(), rounds.len()),
+            detail: json!({"nets": pour_nets, "rounds": rounds}),
+        });
     }
     // 4. stitching vias for outer pours of the plane nets
     if a.get("no-stitch").is_none() && left() > 5.0 {

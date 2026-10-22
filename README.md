@@ -180,13 +180,16 @@ Stages (each writes its board to `OUT_stages/`, the input is never modified):
 1. **planes**: `--planes LAYER=NET[+NET],...` creates the missing plane zones (`plane create`).
    Plane nets = the nets of `--plane-nets A,B`, of `--planes` and every net with a copper zone
    on an inner layer; they are not routed as signals. Nets with outer pours only (two-layer
-   boards) are routed as signals.
+   boards) are pour nets, see stage 3c.
 2. **fanout**: every open island of each plane net gets a track + via onto its plane
    (`fanout --native-fill`; the plane = its zones on inner layers).
 3. **route**: the negotiated router for all other nets with `--time-limit` = the time left minus
    a reserve, plus `--reroute-blockers` (off with `--no-reroute`).
    `--second-pass` retries the nets left open with `--job-margin 20 --max-expand 2e7` in the
    time left.
+3c. **pours**: the pour nets are routed after the signals: the zones are filled natively and
+   the router only joins what the fill leaves apart, starting on the fill (no signal is
+   ripped); new tracks can cut another pour, so fill and route repeat up to 3 times.
 4. **stitch**: stitching vias for outer pours of the plane nets onto their inner planes
    (`--stitch-grid G` adds a grid; off with `--no-stitch`).
 5. **gate**: opens of every net counted with native fills; with `--drc` KiCad DRC of the result
