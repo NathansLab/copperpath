@@ -1,8 +1,8 @@
 //! copperpath command line: check, place, route, opens, hints, pads, netclass (see README.md).
 
 use copperpath::{
-    board, check, delta, droute, explain, fanout, geom, groute, model, nudge, place, plane, render,
-    reroute, rules, sch, sites, stitch,
+    board, check, delta, drc, droute, elec, explain, fanout, geom, groute, model, nudge, place,
+    plane, render, reroute, rules, sch, sites, stitch,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -23,6 +23,8 @@ commands:
   place     simulated-annealing placement inside zones (--zones zones.json)
   route     detailed router for a region (--region x0,y0,x1,y1 --out OUT.kicad_pcb
             and/or --delta-json DELTA.json: added/removed items in nm for the KiCad IPC API)
+  netinfo   length, vias, width, est. resistance (mOhm) and inductance (nH) per net
+  drc       native copper DRC (KiCad rule names, ms instead of s): [-o report.json]
   opens     unconnected connections per net, counted from the copper
   hints     near-collinear pad pairs that force jogs between straight pad exits
   pads      pad world positions, sizes and nets (tab separated)
@@ -215,6 +217,17 @@ pub fn load_ctx(a: &Args) -> Result<Ctx, String> {
         cfg.yield_pours
             .extend(y.split(',').filter(|s| !s.is_empty()).map(String::from));
     }
+    // routing intent per net or class: --prio 'VBUS=low_r,class:Power=low_r' before --cfg, then
+    // the project's "copperpath": {"net_prio": ...} block next to its net classes
+    if let Some(p) = a.get("prio") {
+        cfg.add_prio(p)?;
+    }
+    if let Ok(t) = std::fs::read_to_string(&pro) {
+        if let Ok(j) = serde_json::from_str::<Value>(&t) {
+            cfg.add_prio_json(&j["copperpath"]["net_prio"])
+                .map_err(|e| format!("{pro}: copperpath.{e}"))?;
+        }
+    }
     eprintln!(
         "[load] {} footprints, {} tracks, {} vias, {} zones, {} copper graphics, {} nets, {} DRU rules in {:.2} s",
         board.fps.len(),
@@ -262,6 +275,8 @@ fn main() {
         "place" => cmd_place(&a),
         "route" => cmd_route(&a),
         "opens" => cmd_opens(&a),
+        "drc" => cmd_drc(&a),
+        "netinfo" => cmd_netinfo(&a),
         "pads" => cmd_pads(&a),
         "hints" => cmd_hints(&a),
         "netclass" => cmd_netclass(&a),
@@ -1119,6 +1134,7 @@ fn route_once(a: &Args) -> CmdResult {
         model::CopperMode::All
     };
     let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), mode);
+    let filt_early = net_filter(a, &c.board.nets);
     if !c.cfg.class_layers.is_empty() {
         for cl in &c.rules.classes {
             if let Some(mk) = model::class_layer_mask(&c.cfg.class_layers, &cl.name) {
@@ -1131,7 +1147,7 @@ fn route_once(a: &Args) -> CmdResult {
         }
     }
     let mut p = droute::DParams::default();
-    p.res = a.f("res", p.res);
+    p.res = grid_res(a, &m, filt_early.as_ref());
     p.via_cost = a.f("via-cost", p.via_cost as f64) as f32;
     p.hweight = a.f("hweight", p.hweight as f64) as f32;
     p.max_expand = a.f("max-expand", p.max_expand as f64) as u64;
@@ -1146,6 +1162,7 @@ fn route_once(a: &Args) -> CmdResult {
     droute::install_stop_handler();
     watch_cancel(a.get("cancel-file"), a.get("cancel-on-stdin-eof").is_some());
     p.stall_iters = a.u("stall-iters", p.stall_iters);
+    p.stall_gain = a.f("stall-gain", p.stall_gain as f64) as f32;
     p.par_conn = a.u("par-conn", p.par_conn);
     p.bend_cost = a.f("bend-cost", p.bend_cost as f64) as f32;
     p.bend90 = a.f("bend90", p.bend90 as f64) as f32;
@@ -1187,7 +1204,10 @@ fn route_once(a: &Args) -> CmdResult {
             res.failed.len()
         );
     }
-    if !res.failed.is_empty() && cleanup_suspect && p.clean && !halted() {
+    // --no-fallback: no extra full routes; such nets are dropped and reported (an agent reroutes
+    // them with --nets)
+    let fallback = a.get("no-fallback").is_none();
+    if !res.failed.is_empty() && cleanup_suspect && p.clean && fallback && !halted() {
         // both fallback levels run at the same time (a route mostly uses one core); the choice
         // is the same as trying them one after the other
         let run_level = |slide: bool, clean: bool| {
@@ -1356,9 +1376,53 @@ fn route_once(a: &Args) -> CmdResult {
     Ok(summary)
 }
 
+/// cache key of a kicad-cli DRC report: board, project and rules text plus the kicad-cli binary
+/// (path, size, mtime), so an edited board or rule file or another KiCad version runs again
+fn drc_key(cli: &str, pcb: &str) -> Option<u64> {
+    let base = pcb.trim_end_matches(".kicad_pcb");
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut eat = |b: &[u8]| {
+        for &x in b.iter().chain(&b.len().to_le_bytes()) {
+            h = (h ^ x as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    };
+    eat(&std::fs::read(pcb).ok()?);
+    for ext in ["kicad_pro", "kicad_dru"] {
+        eat(&std::fs::read(format!("{base}.{ext}")).unwrap_or_default());
+    }
+    let bin = which(cli).unwrap_or_else(|| cli.into());
+    eat(bin.as_bytes());
+    if let Ok(m) = std::fs::metadata(&bin) {
+        eat(&m.len().to_le_bytes());
+        let t = m
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        eat(&t.as_nanos().to_le_bytes());
+    }
+    Some(h)
+}
+
+/// `cli` resolved on the PATH (a path with a separator is taken as is)
+fn which(cli: &str) -> Option<String> {
+    if cli.contains(std::path::MAIN_SEPARATOR) || cli.contains('/') {
+        return Some(cli.into());
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .flat_map(|d| [d.join(cli), d.join(format!("{cli}.exe"))])
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// kicad-cli DRC on the input and the routed board; violations only the routed board has.
 /// kicad-cli: --kicad-cli PATH, else $KICAD_CLI, else `kicad-cli` on the PATH.
+/// The input's report is cached (in this process and in the temp dir, keyed by `drc_key`), so
+/// the autoroute gate and repeated runs on one input check it once; both boards run in parallel.
 fn drc_delta(a: &Args, before: &str, after: &str) -> Result<Value, String> {
+    if a.get("drc") == Some("native") {
+        return drc_delta_native(a, before, after);
+    }
     let cli = a
         .get("kicad-cli")
         .map(String::from)
@@ -1390,7 +1454,48 @@ fn drc_delta(a: &Args, before: &str, after: &str) -> Result<Value, String> {
     };
     let base = after.replace(".kicad_pcb", "_drc_before.json");
     let new = after.replace(".kicad_pcb", "_drc_after.json");
-    let (b, n) = (run(before, &base)?, run(after, &new)?);
+    static MEM: std::sync::Mutex<Option<HashMap<u64, Value>>> = std::sync::Mutex::new(None);
+    let key = drc_key(&cli, before);
+    let disk = key.map(|k| {
+        std::env::temp_dir()
+            .join("copperpath-drc")
+            .join(format!("{k:016x}.json"))
+    });
+    let cached = key
+        .and_then(|k| MEM.lock().ok()?.as_ref()?.get(&k).cloned())
+        .or_else(|| {
+            let t = std::fs::read_to_string(disk.as_ref()?).ok()?;
+            serde_json::from_str::<Value>(&t).ok()
+        });
+    let (b, n) = std::thread::scope(|sc| {
+        let hb = cached.is_none().then(|| sc.spawn(|| run(before, &base)));
+        let n = run(after, &new);
+        let b = match hb {
+            Some(h) => h
+                .join()
+                .unwrap_or_else(|_| Err("--drc: thread panicked".into())),
+            None => Ok(cached.clone().unwrap_or_default()),
+        };
+        (b, n)
+    });
+    let (b, n) = (b?, n?);
+    if cached.is_some() {
+        write_file(&base, &serde_json::to_string_pretty(&b).unwrap_or_default())?;
+    }
+    if let Some(k) = key {
+        if let Ok(mut m) = MEM.lock() {
+            m.get_or_insert_with(HashMap::new).insert(k, b.clone());
+        }
+        if let Some(d) = disk.as_ref().filter(|_| cached.is_none()) {
+            let _ = std::fs::create_dir_all(d.parent().unwrap_or(std::path::Path::new(".")));
+            let _ = std::fs::write(d, b.to_string());
+        }
+    }
+    drc_compare(&b, &n, base, new)
+}
+
+/// violations only the routed report has (by severity, type and items), unconnected counts
+fn drc_compare(b: &Value, n: &Value, base: String, new: String) -> Result<Value, String> {
     let keys = |d: &Value| -> HashMap<String, usize> {
         let mut m = HashMap::new();
         for v in d["violations"].as_array().into_iter().flatten() {
@@ -1411,7 +1516,7 @@ fn drc_delta(a: &Args, before: &str, after: &str) -> Result<Value, String> {
         }
         m
     };
-    let (kb, kn) = (keys(&b), keys(&n));
+    let (kb, kn) = (keys(b), keys(n));
     let mut added: Vec<String> = Vec::new();
     for (k, cnt) in &kn {
         for _ in kb.get(k).copied().unwrap_or(0)..*cnt {
@@ -1429,8 +1534,104 @@ fn drc_delta(a: &Args, before: &str, after: &str) -> Result<Value, String> {
         "violations_before": kb.values().sum::<usize>(), "violations_after": kn.values().sum::<usize>(),
         "new_violations": added.len(), "new_errors": added.iter().filter(|k| k.starts_with("error ")).count(),
         "new": added.iter().take(50).collect::<Vec<_>>(),
-        "unconnected_before": unc(&b), "unconnected_after": unc(&n), "reports": [base, new],
+        "unconnected_before": unc(b), "unconnected_after": unc(n), "reports": [base, new],
     }))
+}
+
+/// `--drc native`: the native copper DRC (`drc.rs`, saved or native fills) on both boards with
+/// the input's rules; milliseconds instead of two kicad-cli runs
+fn drc_delta_native(a: &Args, before: &str, after: &str) -> Result<Value, String> {
+    let mut kv = a.kv.clone();
+    kv.insert("pcb".into(), before.into());
+    let c0 = load_ctx(&Args {
+        cmd: "drc".into(),
+        kv: kv.clone(),
+    })?;
+    let report = |pcb: &str| -> Result<Value, String> {
+        let mut kv = kv.clone();
+        kv.insert("pcb".into(), pcb.into());
+        kv.insert("pro".into(), c0.pro.clone());
+        kv.insert("dru".into(), c0.dru.clone());
+        let c = load_ctx_filled(&Args {
+            cmd: "drc".into(),
+            kv,
+        })?;
+        Ok(native_report(&c).0)
+    };
+    let base = after.replace(".kicad_pcb", "_drc_before.json");
+    let new = after.replace(".kicad_pcb", "_drc_after.json");
+    let (b, n) = (report(before)?, report(after)?);
+    write_file(&base, &serde_json::to_string_pretty(&b).unwrap_or_default())?;
+    write_file(&new, &serde_json::to_string_pretty(&n).unwrap_or_default())?;
+    let mut d = drc_compare(&b, &n, base, new)?;
+    d["engine"] = json!("native");
+    Ok(d)
+}
+
+/// native DRC report of a loaded board: (kicad-style report, violations, unconnected count)
+fn native_report(c: &Ctx) -> (Value, Vec<drc::Violation>, usize) {
+    let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
+    let v = drc::check(&m);
+    let all: std::collections::HashSet<usize> = (1..c.board.nets.len()).collect();
+    let (opens, per) = count_opens(c, None, Some(&all));
+    let mut unc = Vec::new();
+    for (n, k, isl) in &per {
+        for i in 0..*k {
+            unc.push((n.clone(), isl.get(i + 1).cloned().unwrap_or_default()));
+        }
+    }
+    (drc::report(&v, &unc), v, opens)
+}
+
+/// grid resolution of the detailed router: `--res MM` (default 0.05), or `--res auto`: 0.1 mm when
+/// every net to route has at least 0.2 mm clearance and track width and no footprint with such
+/// nets has a pad pitch under 0.5 mm (4x fewer cells; same result on the coarse PCBench boards),
+/// else 0.05 mm
+fn grid_res(a: &Args, m: &model::Model, filt: Option<&std::collections::HashSet<usize>>) -> f64 {
+    match a.get("res") {
+        None => return 0.05,
+        Some(v) if v != "auto" => return v.parse().unwrap_or(0.05),
+        _ => {}
+    }
+    let r = m.r;
+    let nets: Vec<usize> = (1..m.b.nets.len())
+        .filter(|&n| m.routable[n] && filt.is_none_or(|f| f.contains(&n)))
+        .collect();
+    let mut clr = f64::INFINITY;
+    let mut width = f64::INFINITY;
+    for &i in &nets {
+        width = width.min(r.track_width(i).0);
+        for j in 0..m.b.nets.len() {
+            if j != i {
+                clr = clr.min(r.clr(i, j, true)).min(r.clr(i, j, false));
+            }
+        }
+    }
+    let mut pitch = f64::INFINITY;
+    for f in &m.b.fps {
+        if !f.pads.iter().any(|p| nets.binary_search(&p.net).is_ok()) {
+            continue;
+        }
+        let c: Vec<geom::P> = f.pads.iter().map(|p| f.pad_world(p).0).collect();
+        for i in 0..c.len() {
+            for j in i + 1..c.len() {
+                let d = (c[i] - c[j]).len();
+                if d > 1e-6 {
+                    pitch = pitch.min(d);
+                }
+            }
+        }
+    }
+    let res = if clr >= 0.2 - 1e-9 && width >= 0.2 - 1e-9 && pitch >= 0.5 - 1e-9 {
+        0.1
+    } else {
+        0.05
+    };
+    eprintln!(
+        "[route] grid {res} mm (auto: min clearance {:.3}, width {:.3}, pad pitch {:.3} mm)",
+        clr, width, pitch
+    );
+    res
 }
 
 /// output path for a command that writes a board copy: must end in .kicad_pcb and differ from
@@ -1676,6 +1877,70 @@ fn cmd_opens(a: &Args) -> CmdResult {
         .collect::<Vec<_>>()}))
 }
 
+/// copper stack for the electrical estimates: --cu-um 35, --plating-um 25, --thickness 1.6 (mm)
+fn stack(a: &Args) -> elec::Stack {
+    let d = elec::Stack::default();
+    elec::Stack {
+        cu: a.f("cu-um", d.cu * 1000.0) / 1000.0,
+        plating: a.f("plating-um", d.plating * 1000.0) / 1000.0,
+        thickness: a.f("thickness", d.thickness),
+    }
+}
+
+/// per-net length, vias, widths and estimated resistance / inductance of the board's copper
+fn cmd_netinfo(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let filt = net_filter(a, &c.board.nets);
+    let v = elec::nets(&c.board, &stack(a), &|n| {
+        filt.as_ref().is_none_or(|f| f.contains(&n))
+    });
+    if !a.json() {
+        println!("net\tlength_mm\tvias\twidth_mm\tR_mOhm\tL_nH");
+        for e in &v {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                e.net, e.length_mm, e.vias, e.width_min_mm, e.r_mohm, e.l_nh
+            );
+        }
+    }
+    Ok(json!({"nets": v}))
+}
+
+/// native copper DRC with KiCad's rule names (see `drc.rs`); `-o` writes a KiCad-style JSON
+/// report; unconnected items are the opens of every net with zones refilled natively
+fn cmd_drc(a: &Args) -> CmdResult {
+    let mut kv = a.kv.clone();
+    // the native fill needs a finer raster than routing to match KiCad's polygon fill
+    if a.get("refill-zones").is_some() && a.get("fill-res").is_none() {
+        kv.insert("fill-res".into(), "0.05".into());
+    }
+    let c = load_ctx_filled(&Args {
+        cmd: a.cmd.clone(),
+        kv,
+    })?;
+    let t = Instant::now();
+    let (rep, v, opens) = native_report(&c);
+    let dt = t.elapsed().as_secs_f64();
+    let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
+    for x in &v {
+        *by.entry(x.typ).or_default() += 1;
+    }
+    if let Some(o) = a.get("out") {
+        write_file(o, &serde_json::to_string_pretty(&rep).unwrap_or_default())?;
+    }
+    if !a.json() {
+        for (k, n) in &by {
+            println!("{k}\t{n}");
+        }
+        println!("unconnected_items\t{opens}");
+    }
+    eprintln!(
+        "[drc] {} violations, {opens} unconnected in {dt:.3} s",
+        v.len()
+    );
+    Ok(json!({"violations": v.len(), "by_type": by, "unconnected": opens, "s": check::round2(dt)}))
+}
+
 /// unconnected connections (copper components - 1) per routable net (plus the nets named in
 /// the filter, e.g. plane nets), and the islands (pad names per component, largest first)
 type OpenNets = Vec<(String, usize, Vec<Vec<String>>)>;
@@ -1696,13 +1961,31 @@ fn count_opens(
         if filt.is_some_and(|f| !f.contains(&n)) {
             continue;
         }
+        // pads with the same number in one footprint are one terminal (KiCad: no missing
+        // connection between them), so their components are merged
+        let mut comp: HashMap<usize, usize> = HashMap::new();
+        let mut first: HashMap<(usize, &str), usize> = HashMap::new();
+        fn root(m: &mut HashMap<usize, usize>, mut c: usize) -> usize {
+            while let Some(&p) = m.get(&c).filter(|&&p| p != c) {
+                c = p;
+            }
+            c
+        }
+        for p in &pins[&n] {
+            let key = (p.fp, c.board.fps[p.fp].pads[p.pad].num.as_str());
+            let f = *first.entry(key).or_insert(p.comp);
+            let (a, b) = (root(&mut comp, f), root(&mut comp, p.comp));
+            if a != b {
+                comp.insert(b, a);
+            }
+        }
         let mut isl: std::collections::BTreeMap<usize, Vec<String>> = Default::default();
         for p in pins[&n]
             .iter()
             .filter(|p| region.map(|r| r.contains(p.at)).unwrap_or(true))
         {
             let f = &c.board.fps[p.fp];
-            isl.entry(p.comp)
+            isl.entry(root(&mut comp, p.comp))
                 .or_default()
                 .push(format!("{}.{}", f.refd, f.pads[p.pad].num));
         }
@@ -2162,7 +2445,8 @@ fn write_bytes(path: &str, data: &[u8]) -> Result<(), String> {
 /// saved fills), so `stitch`, `fanout`, `opens` and `render` work without kicad-cli
 fn load_ctx_filled(a: &Args) -> Result<Ctx, String> {
     let mut c = load_ctx(a)?;
-    if a.get("native-fill").is_some() {
+    // --refill-zones: kicad-cli's name for the same thing
+    if a.get("native-fill").or(a.get("refill-zones")).is_some() {
         let t = Instant::now();
         let fp = fill_params(a);
         let k = plane::fill_board(&mut c.board, &c.rules, &c.cfg, &|_| true, &fp);
@@ -2908,18 +3192,49 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
             detail: json!(made),
         });
     }
-    // plane nets: given, plus every net with a copper zone
+    // plane nets: given, plus every net with a copper zone on an inner layer (its plane); a net
+    // with outer pours only has no plane to fan out to, so it is routed like a signal
     {
         let b = board::load(&cur)?;
-        for z in b.zones.iter().filter(|z| !z.keepout && z.net != 0) {
+        let inner = 0b01_1110u8; // In1.Cu..In4.Cu in board::CU order
+        for z in b
+            .zones
+            .iter()
+            .filter(|z| !z.keepout && z.net != 0 && z.layers & inner != 0)
+        {
             let n = &b.nets[z.net];
             if !plane_nets.contains(n) {
                 plane_nets.push(n.clone());
             }
         }
     }
+    // pour nets: zones on outer layers only (two-layer boards); routed after the signals, on the
+    // filled pours, so tracks only join the islands the pours leave apart
+    let pour_nets: Vec<String> = {
+        let b = board::load(&cur)?;
+        let mut v: Vec<String> = Vec::new();
+        for z in b.zones.iter().filter(|z| !z.keepout && z.net != 0) {
+            let n = &b.nets[z.net];
+            if !plane_nets.contains(n) && !v.contains(n) && !n.contains(',') {
+                v.push(n.clone());
+            }
+        }
+        v
+    };
     let pn = plane_nets.join(",");
     eprintln!("[autoroute] plane nets: {pn}");
+    let skip_sig = plane_nets
+        .iter()
+        .chain(&pour_nets)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
+    if !pour_nets.is_empty() {
+        eprintln!(
+            "[autoroute] pour nets (routed after the signals): {}",
+            pour_nets.join(",")
+        );
+    }
     // zone name patterns per plane net: inner zones are the plane, outer ones the pours
     let zone_pats = |pcb: &str, net: &str| -> Result<(String, String), String> {
         let b = board::load(pcb)?;
@@ -2994,8 +3309,8 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
         let o = format!("{work}/3_route.kicad_pcb");
         let tls = format!("{tl:.0}");
         let mut kv: Vec<(&str, &str)> = vec![("pcb", &cur), ("out", &o), ("time-limit", &tls)];
-        if !pn.is_empty() {
-            kv.push(("plane-nets", &pn));
+        if !skip_sig.is_empty() {
+            kv.push(("plane-nets", &skip_sig));
         }
         if a.get("no-reroute").is_none() {
             kv.push(("reroute-blockers", "1"));
@@ -3053,8 +3368,8 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
             ("max-expand", "20000000"),
             ("reroute-blockers", "1"),
         ];
-        if !pn.is_empty() {
-            kv.push(("plane-nets", &pn));
+        if !skip_sig.is_empty() {
+            kv.push(("plane-nets", &skip_sig));
         }
         match cmd_route_core(&sub_args("route", &kv)) {
             Ok(v) => {
@@ -3080,6 +3395,71 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
                 detail: json!(null),
             }),
         }
+    }
+    // 3c. pour nets: fill the zones natively, then route only what the fill leaves open (the
+    // router starts on the fill), without ripping signals; new tracks can cut another pour, so
+    // refill and repeat (up to 3 rounds) until the refilled board has no open pour net
+    if !pour_nets.is_empty() && left() > 5.0 {
+        let t = Instant::now();
+        let mut rounds = Vec::new();
+        for round in 1..=3 {
+            let fo = format!("{work}/3c_fill_{round}.kicad_pcb");
+            let o = format!("{work}/3c_pours_{round}.kicad_pcb");
+            let tls = format!(
+                "{:.0}",
+                (left() - (budget * 0.05).clamp(2.0, 30.0)).max(5.0)
+            );
+            let nets = pour_nets.join(",");
+            let mut kv: Vec<(&str, &str)> = vec![
+                ("pcb", &fo),
+                ("out", &o),
+                ("time-limit", &tls),
+                ("nets", &nets),
+            ];
+            if !pn.is_empty() {
+                kv.push(("plane-nets", &pn));
+            }
+            let r = cmd_plane(&sub_args(
+                "plane",
+                &[("pcb", &cur), ("out", &fo), ("_sub", "fill")],
+            ))
+            .and_then(|_| cmd_route_core(&sub_args("route", &kv)));
+            match r {
+                Ok(v) => {
+                    cur = o;
+                    let (left_open, per) = opens_all(a, &cur, &c)?;
+                    let pour_open = per
+                        .iter()
+                        .filter(|n| {
+                            n["net"]
+                                .as_str()
+                                .is_some_and(|x| pour_nets.iter().any(|p| p == x))
+                        })
+                        .count();
+                    rounds.push(json!({"round": round, "segments": v["segments"], "vias": v["vias"], "opens": left_open, "open_pour_nets": pour_open}));
+                    if pour_open == 0 || left() < 5.0 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    rounds.push(json!({"round": round, "error": e}));
+                    break;
+                }
+            }
+        }
+        let opens = rounds
+            .last()
+            .and_then(|r| r["opens"].as_u64())
+            .map(|x| x as usize);
+        stages.push(Stage {
+            name: "pours",
+            out: cur.clone(),
+            secs: t.elapsed().as_secs_f64(),
+            opens,
+            ok: opens.is_some(),
+            note: format!("{} pour net(s), {} round(s)", pour_nets.len(), rounds.len()),
+            detail: json!({"nets": pour_nets, "rounds": rounds}),
+        });
     }
     // 4. stitching vias for outer pours of the plane nets
     if a.get("no-stitch").is_none() && left() > 5.0 {

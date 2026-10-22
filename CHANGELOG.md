@@ -6,6 +6,25 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Routing intents per net class (`class:PATTERN` keys) and from the project file
+  (`.kicad_pro` block `"copperpath": {"net_prio": ...}`, next to the net classes).
+- `route --res auto`: 0.1 mm grid when the rules and pad pitches allow it (2.6-4x faster on
+  coarse two-layer boards, same result), else 0.05 mm.
+- `route --stall-gain F` (stop negotiating when iterations gain less than F) and `--no-fallback`
+  (no extra full routes for nets the exact check dropped).
+- Routing intents per net (`--prio NET=PROFILE`, config `net_prio`): `low_r`, `low_l`, `short`,
+  `few_vias`, `wide`, `first` and raw multipliers scale the via, bend and layer-direction costs
+  and the track width per net and route marked nets first.
+- `netinfo`: length, vias, widths and estimated DC resistance and partial inductance per net.
+- `--drc native` for `route`, `nudge` and `autoroute`: the DRC gate with the native copper DRC
+  (milliseconds, the input's rules for both boards) instead of two kicad-cli runs.
+- `drc`: native copper DRC with kicad-cli's rule names and JSON layout (clearance, shorts,
+  crossings, hole and edge clearance, track width, unconnected items) in milliseconds; same
+  counts as kicad-cli 10 on the PCBench benchmark boards.
+- Native zone filler: thermal reliefs (spokes along the pad axes, 45 degrees for round pads; a
+  spoke that does not reach the fill or hits foreign copper is dropped, so a pad with no spoke
+  stays unconnected like in KiCad), the zone's own clearance and minimum width, pad and
+  footprint `zone_connect` overrides (#86).
 - `autoroute`: placed board to routed board in one command within a time budget (`--time`):
   plane zones (`--planes In1.Cu=GND`), plane fanout, negotiated signal routing with rip-up of
   blockers, stitching, quality gate (opens with native fills, optional KiCad DRC against the
@@ -80,7 +99,28 @@ All notable changes to this project are documented here. The format follows
   net's search window. Connectivity uses a bounding-box sweep and an edge index per fill
   (all nets of a 6-layer board with 217 fills in about 1 s; per-net opens equal KiCad's DRC).
 
+### Changed
+- Router: the A* buffers are kept per thread and only the nodes a search touched are reset, so
+  a search costs the nodes it expands instead of its whole window. Same result; the first
+  negotiation iteration on the PCBench sizif128 board (2801 x 1701 cells, a 56-pin GND) takes
+  26 s instead of 52 s, the demo 4.4 s instead of 5.5 s.
+- `--drc`: the kicad-cli report of the input board is cached (per process and in the temp dir,
+  keyed by board, project, rules and the kicad-cli binary) and the routed board is checked in
+  parallel, so the autoroute quality gate and repeated runs check an unchanged input once.
+
 ### Fixed
+- The board setup minimum clearance defaults to 0 like in KiCad (was 0.2 mm), so net classes
+  below 0.2 mm are honoured: the router was too strict and `drc` flagged legal pad pairs (28 on
+  PCBench rxadc_14, where kicad-cli reports none).
+- Board setup minimums missing from the project (via diameter, annular ring, hole) now take
+  KiCad's defaults (0.5 / 0.1 / 0.3 mm) instead of 0; the router placed 0.46 mm vias that
+  kicad-cli flagged (`via_diameter`, `drill_out_of_range`).
+- `opens`: pads with the same number in one footprint (split exposed pads) are one terminal, as
+  in KiCad, instead of separate islands.
+- `autoroute`: a net with outer pours only is no longer a plane net. It had no inner plane to fan
+  out to and stayed open (two-layer boards: all GND/supply pads unconnected). Such pour nets are
+  now routed after the signals, on the natively filled pours, only where the fill leaves pads
+  apart (new stage `pours`, up to 3 fill/route rounds).
 - `route`: the cleanup fallback ladder (two more full routes) only runs when a failed net may have
   been broken by the cleanup; pure search failures (no path, node cap, window) skip it (#54).
   Route stage of the 800-part stress board: 217 s to 70 s, same opens.

@@ -80,6 +80,13 @@ pub struct Pad {
     pub mask: u8,
     /// local solder mask expansion (pad, else footprint); None = board setup value
     pub mask_margin: Option<f64>,
+    /// zone connection override (`zone_connect`: 0 none, 1 thermal, 2 solid, 3 THT thermal),
+    /// thermal gap and spoke width overrides (pad, else footprint)
+    pub zone_connect: Option<u8>,
+    pub thermal_gap: Option<f64>,
+    pub thermal_bridge: Option<f64>,
+    /// thermal spoke angle in degrees (KiCad: 45 for circle pads, 90 otherwise)
+    pub spoke_angle: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +218,16 @@ pub struct Zone {
     pub ko_pour: bool,
     pub ko_footprints: bool,
     pub priority: i64,
+    /// pad connection: 0 none, 1 thermal relief (KiCad default), 2 solid, 3 thermal for
+    /// through-hole pads only (SMD solid)
+    pub connect: u8,
+    /// zone clearance (`connect_pads (clearance X)`), mm
+    pub clearance: f64,
+    /// minimum copper width of the fill, mm
+    pub min_thickness: f64,
+    /// thermal relief gap and spoke width, mm
+    pub thermal_gap: f64,
+    pub thermal_bridge: f64,
     /// owning footprint (rule areas inside footprints)
     pub fp: Option<String>,
     /// saved zone fill (`filled_polygon`): (copper layer index, polygon); empty if never filled
@@ -374,6 +391,12 @@ fn parse_pad(l: &List, b: &mut Board, fp_rot: f64, fp_margin: Option<f64>) -> Pa
         inner_barrel_only,
         mask: mask_layers(&l.atoms("layers")),
         mask_margin: l.valf("solder_mask_margin").or(fp_margin),
+        zone_connect: l.valf("zone_connect").map(|v| v as u8),
+        thermal_gap: l.valf("thermal_gap"),
+        thermal_bridge: l.valf("thermal_bridge_width").or(l.valf("thermal_width")),
+        spoke_angle: l
+            .valf("thermal_bridge_angle")
+            .unwrap_or(if shape == "circle" { 45.0 } else { 90.0 }),
     }
 }
 
@@ -565,6 +588,25 @@ fn parse_zone(z: &List, b: &mut Board, fp: Option<&str>, fp_at: Option<(P, f64)>
         ko_pour: na("copperpour"),
         ko_footprints: na("footprints"),
         priority: z.valf("priority").unwrap_or(0.0) as i64,
+        connect: match z.child("connect_pads").and_then(|c| c.arg(0)) {
+            Some("no") => 0,
+            Some("yes") => 2,
+            Some("thru_hole_only") => 3,
+            _ => 1,
+        },
+        clearance: z
+            .child("connect_pads")
+            .and_then(|c| c.valf("clearance"))
+            .unwrap_or(0.0),
+        min_thickness: z.valf("min_thickness").unwrap_or(0.25),
+        thermal_gap: z
+            .child("fill")
+            .and_then(|f| f.valf("thermal_gap"))
+            .unwrap_or(0.5),
+        thermal_bridge: z
+            .child("fill")
+            .and_then(|f| f.valf("thermal_bridge_width"))
+            .unwrap_or(0.5),
         fp: fp.map(|s| s.to_string()),
         fills: z
             .children("filled_polygon")
@@ -827,7 +869,14 @@ pub fn parse_board(text: String) -> Result<Board, String> {
                 }
                 let pads: Vec<Pad> = it
                     .children("pad")
-                    .map(|pd| parse_pad(pd, &mut b, r, it.valf("solder_mask_margin")))
+                    .map(|pd| {
+                        let mut q = parse_pad(pd, &mut b, r, it.valf("solder_mask_margin"));
+                        q.zone_connect =
+                            q.zone_connect.or(it.valf("zone_connect").map(|v| v as u8));
+                        q.thermal_gap = q.thermal_gap.or(it.valf("thermal_gap"));
+                        q.thermal_bridge = q.thermal_bridge.or(it.valf("thermal_width"));
+                        q
+                    })
                     .collect();
                 let fpz: Vec<Zone> = it
                     .children("zone")

@@ -443,6 +443,10 @@ fn r3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
 
+/// an own pad with a thermal relief: centre, angle (deg), half size, gap, spoke width, spoke
+/// angle (deg)
+type Thermal = (P, f64, (f64, f64), f64, f64, f64);
+
 /// native fill of zone `zi` on copper layer `l`
 pub fn fill_zone(m: &Model, zi: usize, l: usize, fp: &FillParams) -> ZoneFill {
     let b = m.b;
@@ -457,7 +461,12 @@ pub fn fill_zone(m: &Model, zi: usize, l: usize, fp: &FillParams) -> ZoneFill {
     let bb = bb.inflate(2.0 * res);
     let gs = GridSpec::new(bb, res);
     let n = gs.n();
-    let rt = fp.min_width / 2.0;
+    // the zone's own minimum width (KiCad min_thickness), the global one for zones without it
+    let rt = if z.min_thickness > 0.0 {
+        z.min_thickness
+    } else {
+        fp.min_width
+    } / 2.0;
     // inside the outline and the board
     let mut outl = vec![false; n];
     gs.fill_poly(&z.outline, &mut |x, y| outl[gs.idx(x, y)] = true);
@@ -468,32 +477,41 @@ pub fn fill_zone(m: &Model, zi: usize, l: usize, fp: &FillParams) -> ZoneFill {
     let dout = edt(&outside, gs.nx, gs.ny);
     let rc = rt / res;
     let mut ok: Vec<bool> = (0..n).map(|i| dout[i] >= (rc * rc) as f32).collect();
+    // `bad`: cells no copper of the zone may cover (foreign copper plus its clearance); thermal
+    // spokes are checked against it
+    let mut bad = vec![false; n];
     let block = |s: &Shape, d: f64, ok: &mut Vec<bool>| {
         gs.stamp(s, d, |x, y| ok[gs.idx(x, y)] = false);
+    };
+    let block2 = |s: &Shape, d: f64, ok: &mut Vec<bool>, bad: &mut Vec<bool>| {
+        gs.stamp(s, d + rt, |x, y| ok[gs.idx(x, y)] = false);
+        gs.stamp(s, d, |x, y| bad[gs.idx(x, y)] = true);
     };
     // board edge
     let ec = m.r.edge_clearance(net) + rt;
     for (a, e) in &b.edge_segs {
-        block(
+        block2(
             &Shape::Capsule {
                 a: *a,
                 b: *e,
                 r: 0.0,
             },
-            ec,
+            ec - rt,
             &mut ok,
+            &mut bad,
         );
     }
     for ol in &b.edge {
         for i in 0..ol.len() {
-            block(
+            block2(
                 &Shape::Capsule {
                     a: ol[i],
                     b: ol[(i + 1) % ol.len()],
                     r: 0.0,
                 },
-                ec,
+                ec - rt,
                 &mut ok,
+                &mut bad,
             );
         }
     }
@@ -501,6 +519,8 @@ pub fn fill_zone(m: &Model, zi: usize, l: usize, fp: &FillParams) -> ZoneFill {
     let gb = gs.bbox();
     let mut own = vec![false; n];
     let mut vias = vec![false; n];
+    // own pads with a thermal relief: (centre, angle, half size, gap, spoke width)
+    let mut thermals: Vec<Thermal> = Vec::new();
     for o in &m.objs {
         if o.layers & bit == 0 || !o.bbox.inflate(2.0).overlaps(&gb) {
             continue;
@@ -512,15 +532,42 @@ pub fn fill_zone(m: &Model, zi: usize, l: usize, fp: &FillParams) -> ZoneFill {
                     if o.hole_r > 0.0 {
                         gs.stamp(&o.shape, 0.0, |x, y| vias[gs.idx(x, y)] = true);
                     }
+                    // pads connect as the pad / footprint / zone says (vias and tracks solid)
+                    if let Kind::Pad { fp: fi, pad } = o.kind {
+                        let f = &b.fps[fi];
+                        let pd = &f.pads[pad];
+                        let mode = match pd.zone_connect.unwrap_or(z.connect) {
+                            3 if pd.drill > 0.0 => 1,
+                            3 => 2,
+                            k => k,
+                        };
+                        if mode == 0 {
+                            let c = m.r.clr(net, 0, is_outer(l)).max(z.clearance);
+                            block(&o.shape, c + rt, &mut ok);
+                        } else if mode == 1 {
+                            let gap = pd.thermal_gap.unwrap_or(z.thermal_gap);
+                            let w = pd.thermal_bridge.unwrap_or(z.thermal_bridge);
+                            block(&o.shape, gap + rt, &mut ok);
+                            let (c, a) = f.pad_world(pd);
+                            thermals.push((
+                                c,
+                                a,
+                                (pd.size.0 / 2.0, pd.size.1 / 2.0),
+                                gap,
+                                w.max(2.0 * rt),
+                                pd.spoke_angle,
+                            ));
+                        }
+                    }
                 } else {
-                    let c = m.clr(net, o, l).max(0.0);
+                    let c = m.clr(net, o, l).max(0.0).max(z.clearance);
                     // a hole needs its hole clearance too (NPTH without copper)
                     let c = if o.hole_r > 0.0 {
                         c.max(m.r.min_hole_clearance)
                     } else {
                         c
                     };
-                    block(&o.shape, c + rt, &mut ok);
+                    block2(&o.shape, c, &mut ok, &mut bad);
                 }
             }
             _ => {}
@@ -529,7 +576,12 @@ pub fn fill_zone(m: &Model, zi: usize, l: usize, fp: &FillParams) -> ZoneFill {
     // copper graphics (net-less)
     for (s, gl) in &b.graphics {
         if gl & bit != 0 && s.bbox().inflate(2.0).overlaps(&gb) {
-            block(s, m.r.clr(net, 0, is_outer(l)) + rt, &mut ok);
+            block2(
+                s,
+                m.r.clr(net, 0, is_outer(l)).max(z.clearance),
+                &mut ok,
+                &mut bad,
+            );
         }
     }
     // other zones: pour keep-outs, zones of other nets with a higher priority
@@ -546,13 +598,59 @@ pub fn fill_zone(m: &Model, zi: usize, l: usize, fp: &FillParams) -> ZoneFill {
                 block(&s, rt, &mut ok);
             }
         } else if o.net != net && o.priority > z.priority {
+            // the outline stands in for that zone's fill; spokes are not checked against it
+            // (its fill keeps clear of this zone's pads, e.g. a pad inside its outline)
             block(&s, m.r.clr(net, o.net, is_outer(l)) + rt, &mut ok);
         }
     }
     // grow back by rt
     let dok = edt(&ok, gs.nx, gs.ny);
     let r2 = (rc * rc) as f32 + 1e-3;
-    let fill: Vec<bool> = (0..n).map(|i| dok[i] <= r2 && inb[i]).collect();
+    let mut fill: Vec<bool> = (0..n).map(|i| dok[i] <= r2 && inb[i]).collect();
+    // thermal spokes (KiCad: four, along the pad axes, 45 degrees for round pads): a spoke is
+    // kept when it is clear of foreign copper and its end reaches the fill
+    let mut spokes: Vec<Shape> = Vec::new();
+    for &(c, a, (hx, hy), gap, w, sa) in &thermals {
+        // spokes leave along the pad axes rotated by the spoke angle (90 = along the axes)
+        let diag = (sa - 90.0).abs() > 1e-6;
+        for k in 0..4 {
+            let ang = a.to_radians()
+                + if diag { sa.to_radians() } else { 0.0 }
+                + k as f64 * std::f64::consts::FRAC_PI_2;
+            let (dx, dy) = (ang.cos(), ang.sin());
+            // pad half extent along the spoke (pad frame axes; the larger one on a diagonal)
+            let ext = if diag {
+                hx.max(hy)
+            } else if k % 2 == 0 {
+                hx
+            } else {
+                hy
+            };
+            // KiCad's spoke ends where the relief gap ends; one cell more joins it to the fill
+            let e = P {
+                x: c.x + dx * (ext + gap + res),
+                y: c.y + dy * (ext + gap + res),
+            };
+            let sp = Shape::Capsule {
+                a: c,
+                b: e,
+                r: w / 2.0,
+            };
+            let (mut clear, mut reach) = (true, false);
+            let tip = Shape::circle(e, w / 2.0);
+            gs.stamp(&sp, 0.0, |x, y| clear &= !bad[gs.idx(x, y)]);
+            gs.stamp(&tip, 0.0, |x, y| reach |= fill[gs.idx(x, y)]);
+            if clear && reach {
+                spokes.push(sp);
+            }
+        }
+    }
+    for sp in &spokes {
+        gs.stamp(sp, 0.0, |x, y| {
+            let i = gs.idx(x, y);
+            fill[i] = inb[i];
+        });
+    }
     let (lab, k) = label(&fill, gs.nx, gs.ny, true);
     let mut isl: Vec<Island> = (0..k)
         .map(|_| Island {

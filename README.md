@@ -58,6 +58,8 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `route [--region x0,y0,x1,y1] [--nets PATTERNS] --out OUT.kicad_pcb [--delta-json DELTA.json] [--drc]` | Detailed router (below). Routes every routable net whose pads lie in the region (default: whole board). Appends unlocked tracks/vias to a copy and writes `OUT_route.json`; `--delta-json` writes the added/removed items in nm for the KiCad IPC API ([schema](#change-set-for-the-kicad-ipc-api---delta-json)). `--drc` runs `kicad-cli` on input and output and reports the new violations. |
 | `check [--out DIR] [--res 0.25] [--tile 1.0] [--copper locked\|all] [--crop x0,y0,x1,y1 --crop-class C]` | Routability report: via-site maps per net class, region analysis per schematic sheet, what-if ablation (without rule areas, via keepouts, locked copper), global route with congestion per tile and layer, hotspot list. Writes `report.json`, `groute.json`, `congestion.json` and PNG maps. |
 | `place --zones zones.json [--init keep\|schematic\|both] [--moves N] [--starts K] [--out DIR]` | Parallel simulated-annealing placement of the movable parts inside zones (see `examples/zones.json`). Writes `place.json`; apply it to a copy with `scripts/apply_place.py`. |
+| `netinfo [--nets] [--cu-um 35]` | Length, vias, track width and estimated DC resistance (mΩ) and inductance (nH) per net, in milliseconds. See [Routing intents](#routing-intents-per-net---prio). |
+| `drc [--refill-zones] [--out report.json]` | Native copper DRC with KiCad's rule names in milliseconds. See [Native DRC](#native-drc-drc). |
 | `opens [--region] [--nets] [--max-islands 50]` | Unconnected connections per net, counted from all copper including saved zone fills (no 499-item cap as in kicad-cli). Nets named in `--nets` are counted even if they are plane nets. `--json` lists the islands of each open net (pads per copper component, largest first). |
 | `hints [--region] [--nets] [--tol 1.0]` | Pad pairs of a net that are *almost* in one row or column (offset 0.02..tol mm). Each forces a jog between two straight pad exits; align the pads before routing. |
 | `stitch --net GND --zones REGEX --plane REGEX [--grid G] --out OUT.kicad_pcb` | Stitching vias for a plane net from the saved zone fills: one via in every fill island of the `--zones` zones (zone name, full match) that has no via or plated hole of the net, optionally a via grid of pitch G per island. A via must lie on a fill of a `--plane` zone of the same net (fully on its copper), keep the DRU/net-class clearance to every other net on every layer (outer layers incl. creepage, last matching rule wins) plus `--margin` (0.05), 0.2 mm to every pad, the hole and edge rules, and stay out of no-via rule areas. Unlocked zones of other nets are ignored (they refill around the via), locked ones are copper. Options: `--via D,DRILL` (default: the net class via), `--min-clr` (floor on the clearance to other nets), `--min-area` (0.3 mm²), `--base B.kicad_pcb` (write the vias into this board instead of the input, e.g. the unfilled original). `--json` lists the vias, the islands without a legal spot (with the nearest blockers of a via there) and the rejection causes. |
@@ -76,7 +78,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 
 | option | default | meaning |
 |---|---|---|
-| `--res` | 0.05 | grid resolution in mm |
+| `--res` | 0.05 | grid resolution in mm; `auto`: 0.1 mm when every routed net has at least 0.2 mm clearance and width and no pad pitch is under 0.5 mm (4x fewer cells) |
 | `--via-cost` | 30 | via cost (in grid steps) |
 | `--bend-cost` / `--bend90` | 4 / 1.4 | cost of a 45° bend / factor for 90° bends |
 | `--hweight` | 1.02 | A\* heuristic weight (>1: faster, less optimal) |
@@ -87,6 +89,8 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `--cancel-file PATH` | | stop like `--time-limit` as soon as this file exists (checked once per second); a cancel path that also works on Windows, where a GUI can only kill the process otherwise. The file should not exist at the start |
 | `--cancel-on-stdin-eof` | | stop like `--time-limit` when stdin is closed, e.g. because the calling plugin or KiCad ended |
 | `--stall-iters` | 3 | stop negotiating after this many iterations without fewer conflict cells, then rip up and reroute the conflicting nets |
+| `--stall-gain` | 0 | an iteration counts as progress only if it cuts the best conflict count by this fraction (0.1 = 10 %); stops plateaus early |
+| `--no-fallback` | off | skip the cleanup fallback ladder (two more full routes when the exact check drops nets); the dropped nets stay open and are reported |
 | `--par-nets` | 1 | 1 = nets whose windows cannot interact route in parallel (same result as serial); N > 1 = blocks of N nets against one snapshot (experimental) |
 | `--par-conn` | 1 | experimental: parallel connection searches inside a multi-pin net (0 = all threads); slower on the benchmark boards so far |
 | `--no-stubs` / `--no-clean` | | disable straight pad exits / the cleanup |
@@ -177,14 +181,18 @@ $B autoroute --pcb placed.kicad_pcb --planes In1.Cu=GND,In4.Cu=+3V3 --time 600 -
 Stages (each writes its board to `OUT_stages/`, the input is never modified):
 
 1. **planes**: `--planes LAYER=NET[+NET],...` creates the missing plane zones (`plane create`).
-   Plane nets = the nets of `--plane-nets A,B`, of `--planes` and every net with a copper zone;
-   they are not routed as signals.
+   Plane nets = the nets of `--plane-nets A,B`, of `--planes` and every net with a copper zone
+   on an inner layer; they are not routed as signals. Nets with outer pours only (two-layer
+   boards) are pour nets, see stage 3c.
 2. **fanout**: every open island of each plane net gets a track + via onto its plane
    (`fanout --native-fill`; the plane = its zones on inner layers).
 3. **route**: the negotiated router for all other nets with `--time-limit` = the time left minus
    a reserve, plus `--reroute-blockers` (off with `--no-reroute`).
    `--second-pass` retries the nets left open with `--job-margin 20 --max-expand 2e7` in the
    time left.
+3c. **pours**: the pour nets are routed after the signals: the zones are filled natively and
+   the router only joins what the fill leaves apart, starting on the fill (no signal is
+   ripped); new tracks can cut another pour, so fill and route repeat up to 3 times.
 4. **stitch**: stitching vias for outer pours of the plane nets onto their inner planes
    (`--stitch-grid G` adds a grid; off with `--no-stitch`).
 5. **gate**: opens of every net counted with native fills; with `--drc` KiCad DRC of the result
@@ -205,6 +213,72 @@ corridor (#87), the 40 plane opens are pads whose fanout found no via spot.
 
 Demo board, `--planes In1.Cu=GND`: 50 to 0 opens in 8 s (gate with KiCad DRC +16 s, 0 new
 errors; KiCad warns about dangling GND vias until the plane is refilled).
+
+## Routing intents per net (`--prio`)
+
+`route` and `autoroute` take a routing intent per net (`--prio NET=PROFILE,...`, wildcards, or
+`net_prio` in the config). It scales the router's costs for that net and its track width, and
+nets marked `first` are routed before the others:
+
+| profile | effect | use for |
+|---|---|---|
+| `low_r` | twice the class width (pads keep the neck-down), vias cost 2x, first | supply rails, high current |
+| `low_l` | vias cost 3x, bends and the wrong layer direction cheap (direct path), first | clocks, gate drives, decoupling loops |
+| `short` | bends and the wrong layer direction cheap | sense lines, short analog paths |
+| `few_vias` | vias cost 4x | signals that should stay on one layer |
+| `wide` | 1.5x the class width | moderate current |
+| `first` | routed before the other nets | the nets that matter most |
+| `via:X` `bend:X` `dir:X` `width:X` | the multipliers themselves | fine tuning |
+
+Profiles combine with `+` (`CLK=low_l+wide`). A key `class:PATTERN` applies to the nets of the
+matching net classes (`--prio 'class:Power=low_r'`). The intents can live in the KiCad project
+next to its net classes, as a `copperpath` block in the `.kicad_pro` (KiCad keeps unknown keys):
+
+```json
+"copperpath": { "net_prio": { "class:Power": "low_r", "CLK*": "low_l", "SW": { "via": 3, "width": 2 } } }
+```
+
+Order: `--prio` first, then `net_prio` of `--cfg`, then the project block; the first match wins. `netinfo` reports the result per net: length, vias,
+width and rough DC resistance (copper 35 µm, `--cu-um`) and partial inductance (Grover formula
+for the total length plus about 1.3 nH per 1.6 mm via). Demo board, `route` without and with
+`--prio '+5V=low_r,CLK=low_l,ADC1=few_vias'` (both DRC-clean):
+
+| net | without | with |
+|---|---|---|
+| +5V (`low_r`) | 0.4 mm, 51.2 mm, 64.5 mΩ | 0.8 mm, 50.4 mm, **32.6 mΩ** |
+| CLK (`low_l`) | 22.1 mm, 2 vias, 27.1 nH | 22.4 mm, **0 vias, 24.9 nH** |
+| ADC1 (`few_vias`) | 17.8 mm, 3 vias | 18.4 mm, **0 vias** |
+
+## Native DRC (`drc`)
+
+```bash
+$B drc --pcb routed.kicad_pcb --refill-zones --out report.json --json
+```
+
+The copper checks of `kicad-cli pcb drc`, on copperpath's model: `clearance`, `shorting_items`,
+`tracks_crossing`, `hole_clearance`, `hole_to_hole`, `copper_edge_clearance`, `track_width`,
+`via_diameter`, `annular_width`, `drill_out_of_range` and `unconnected_items`, with KiCad's semantics (net classes, DRU and pad clearances, the 0.0005 mm
+epsilon, one collision per net pair, collisions only between nets with pads). `--refill-zones`
+fills the zones natively first (like kicad-cli's flag, with thermal reliefs), otherwise the
+saved fills count. `--out` writes a report in kicad-cli's JSON layout.
+
+Checked against kicad-cli 10.0.7 on six routed PCBench boards (see the benchmark below) and on
+synthetic boards:
+
+- with the zone fills saved by KiCad: the same violations per type and the same unconnected
+  items per net, in 10-40 ms instead of 0.8-0.9 s per board;
+- with `--refill-zones` (native filler, 0.05 mm raster by default, `--fill-res`): the same
+  violations, unconnected items within 1 of kicad-cli's (the filler rasterises necks that are
+  exactly the minimum width), 0.1-1.2 s instead of 1-2 s.
+
+`route`, `nudge` and `autoroute` take `--drc native` for their DRC gate: the same comparison
+against the input as `--drc` (kicad-cli), with the input's rules for both boards, in
+milliseconds. Pads with the same number in one footprint count as one terminal (as in KiCad).
+Board setup minimums missing from the project take KiCad's defaults (0.5 mm via, 0.1 mm annular
+ring, 0.3 mm hole), for the router as well. Not covered: silk, courtyard, solder mask, footprint
+library and starved-thermal checks, and copper islands without pads (KiCad counts floating
+tracks as unconnected items). Use it as the fast check while iterating and kicad-cli for
+sign-off.
 
 ## Explaining failures (`explain`)
 
