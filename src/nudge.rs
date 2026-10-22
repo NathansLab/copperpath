@@ -229,10 +229,12 @@ pub struct Outcome {
 impl Outcome {
     /// the best candidate is an improvement over the board as it is
     pub fn improves(&self) -> bool {
-        self.best.as_ref().is_some_and(|b| match (b.true_opens, self.true_before) {
-            (Some(t), Some(t0)) => t < t0,
-            _ => b.opens < self.opens_before,
-        })
+        self.best
+            .as_ref()
+            .is_some_and(|b| match (b.true_opens, self.true_before) {
+                (Some(t), Some(t0)) => t < t0,
+                _ => b.opens < self.opens_before,
+            })
     }
 }
 
@@ -1077,10 +1079,15 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
         (0..w.zones.len())
             .filter(|&zi| {
                 let z = &w.zones[zi];
-                !z.keepout && z.net != 0 && z.outline.iter().fold(BBox::empty(), |mut bb, q| {
-                    bb.add(*q);
-                    bb
-                }).overlaps(&near)
+                !z.keepout
+                    && z.net != 0
+                    && z.outline
+                        .iter()
+                        .fold(BBox::empty(), |mut bb, q| {
+                            bb.add(*q);
+                            bb
+                        })
+                        .overlaps(&near)
             })
             .collect()
     };
@@ -1110,7 +1117,13 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
             }
         }
         let sel = zsel(&w2);
-        crate::plane::fill_board(&mut w2, r, cfg, &|zi| sel.contains(&zi), &crate::plane::FillParams::default());
+        crate::plane::fill_board(
+            &mut w2,
+            r,
+            cfg,
+            &|zi| sel.contains(&zi),
+            &crate::plane::FillParams::default(),
+        );
         let m = Model::new(&w2, r, cfg.clone(), CopperMode::All);
         let (pins, _) = pins_and_copper_of(&m, &|n| nets.contains(&n));
         pins.values()
@@ -1410,7 +1423,10 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
     // pour check: the best candidates again with the zones near the region refilled natively,
     // judged by the open connections of the routed nets on the whole board
     let mut true_before = None;
-    if o.verify_fill > 0 && best.is_some() && !droute::STOP.load(std::sync::atomic::Ordering::Relaxed) {
+    if o.verify_fill > 0
+        && best.is_some()
+        && !droute::STOP.load(std::sync::atomic::Ordering::Relaxed)
+    {
         let tv = Instant::now();
         // the board as it is: nothing ripped, nothing moved
         let orig = crop(b, &win, &nets, &HashSet::new());
@@ -1420,7 +1436,11 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
             .iter()
             .filter_map(|(c, e)| e.as_ref().map(|e| (c, e)))
             .collect();
-        ranked.sort_by(|a, b| (a.1.opens, a.1.cost, a.0).partial_cmp(&(b.1.opens, b.1.cost, b.0)).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.sort_by(|a, b| {
+            (a.1.opens, a.1.cost, a.0)
+                .partial_cmp(&(b.1.opens, b.1.cost, b.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         ranked.truncate(o.verify_fill);
         let checked: Vec<(Cand, Eval)> = ranked
             .par_iter()

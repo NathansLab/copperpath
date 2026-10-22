@@ -2013,9 +2013,12 @@ fn cmd_nudge(a: &Args) -> CmdResult {
     summary["board_opens_after"] = json!(wa.values().sum::<usize>());
     if !worse.is_empty() {
         eprintln!("[nudge] warning: nets with more opens on the whole board: {worse:?}");
-        summary["warnings"]
-            .as_array_mut()
-            .map(|w| w.push(json!(format!("nets with more opens on the whole board: {}", worse.len()))));
+        summary["warnings"].as_array_mut().map(|w| {
+            w.push(json!(format!(
+                "nets with more opens on the whole board: {}",
+                worse.len()
+            )))
+        });
     }
     summary["worse_nets"] = json!(worse);
     if a.get("drc").is_some() {

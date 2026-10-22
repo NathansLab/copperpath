@@ -1429,13 +1429,7 @@ impl<'a> Router<'a> {
                 },
             )
             .collect();
-        let conns = self
-            .jobs
-            .iter()
-            .map(|j| {
-                j.comps.len() - 1
-            })
-            .sum();
+        let conns = self.jobs.iter().map(|j| j.comps.len() - 1).sum();
         let mut stats = AesStats::default();
         for x in &nst {
             stats.pins += x.pins;

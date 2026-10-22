@@ -23,6 +23,11 @@ fn seg(a: (f64, f64), b: (f64, f64), net: &str, locked: bool, id: u32) -> String
 }
 
 fn board(dir: &std::path::Path) -> std::path::PathBuf {
+    board_pa(dir, 16.0)
+}
+
+/// `pa_x`: x of the far pad of net A (beyond the default region from 17.5 on)
+fn board_pa(dir: &std::path::Path, pa_x: f64) -> std::path::PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     let pcb = dir.join("nudge.kicad_pcb");
     // wall of net W around T1 with an opening at x = 13, y 9.375 .. 10.625
@@ -40,7 +45,7 @@ fn board(dir: &std::path::Path) -> std::path::PathBuf {
     }
     // the existing (unlocked) routes of R1's nets
     items += &seg((13.8, 10.0), (13.8, 12.5), "A", false, 101);
-    items += &seg((13.8, 12.5), (16.0, 12.5), "A", false, 102);
+    items += &seg((13.8, 12.5), (pa_x, 12.5), "A", false, 102);
     items += &seg((12.2, 10.0), (12.2, 12.0), "B", false, 103);
     items += &seg((12.2, 12.0), (11.0, 12.0), "B", false, 104);
     let text = format!(
@@ -57,7 +62,7 @@ fn board(dir: &std::path::Path) -> std::path::PathBuf {
          {}{}{}{} {items})",
         pad1("T1", 10.0, 10.0, "T"),
         pad1("T2", 16.0, 7.0, "T"),
-        pad1("PA", 16.0, 12.5, "A"),
+        pad1("PA", pa_x, 12.5, "A"),
         pad1("PB", 11.0, 12.0, "B"),
     );
     std::fs::write(&pcb, text).unwrap();
@@ -162,4 +167,39 @@ fn dry_run_and_auto_pick_the_resistor() {
         .unwrap()
         .iter()
         .any(|m| m["ref"] == "R1"));
+}
+
+#[test]
+fn ripped_stub_leaving_the_region_is_reconnected() {
+    // net A leaves the region: only its inner segment is ripped, the stub to PA stays and must
+    // be joined again (no net may end up with more opens on the whole board)
+    let pcb = board_pa(
+        &std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("nudge_stub"),
+        19.0,
+    );
+    let out = pcb.with_file_name("stub.kicad_pcb");
+    let v = run(&[
+        "nudge",
+        "--threads",
+        "2",
+        "--json",
+        "--pcb",
+        pcb.to_str().unwrap(),
+        "--parts",
+        "R1",
+        "--range",
+        "1",
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(v["improved"], true, "{v}");
+    assert!(v["region"][2].as_f64().unwrap() < 19.0, "{v}");
+    assert_eq!(v["worse_nets"], serde_json::json!([]), "{v}");
+    assert_eq!(v["board_opens_after"], 0, "{v}");
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("8000-000000000102"), "the stub to PA stays");
+    assert!(
+        !text.contains("8000-000000000101"),
+        "the inner segment is ripped"
+    );
 }
