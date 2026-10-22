@@ -58,6 +58,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `route [--region x0,y0,x1,y1] [--nets PATTERNS] --out OUT.kicad_pcb [--delta-json DELTA.json] [--drc]` | Detailed router (below). Routes every routable net whose pads lie in the region (default: whole board). Appends unlocked tracks/vias to a copy and writes `OUT_route.json`; `--delta-json` writes the added/removed items in nm for the KiCad IPC API ([schema](#change-set-for-the-kicad-ipc-api---delta-json)). `--drc` runs `kicad-cli` on input and output and reports the new violations. |
 | `check [--out DIR] [--res 0.25] [--tile 1.0] [--copper locked\|all] [--crop x0,y0,x1,y1 --crop-class C]` | Routability report: via-site maps per net class, region analysis per schematic sheet, what-if ablation (without rule areas, via keepouts, locked copper), global route with congestion per tile and layer, hotspot list. Writes `report.json`, `groute.json`, `congestion.json` and PNG maps. |
 | `place --zones zones.json [--init keep\|schematic\|both] [--moves N] [--starts K] [--out DIR]` | Parallel simulated-annealing placement of the movable parts inside zones (see `examples/zones.json`). Writes `place.json`; apply it to a copy with `scripts/apply_place.py`. |
+| `netinfo [--nets] [--cu-um 35]` | Length, vias, track width and estimated DC resistance (mΩ) and inductance (nH) per net, in milliseconds. See [Routing intents](#routing-intents-per-net---prio). |
 | `drc [--refill-zones] [--out report.json]` | Native copper DRC with KiCad's rule names in milliseconds. See [Native DRC](#native-drc-drc). |
 | `opens [--region] [--nets] [--max-islands 50]` | Unconnected connections per net, counted from all copper including saved zone fills (no 499-item cap as in kicad-cli). Nets named in `--nets` are counted even if they are plane nets. `--json` lists the islands of each open net (pads per copper component, largest first). |
 | `hints [--region] [--nets] [--tol 1.0]` | Pad pairs of a net that are *almost* in one row or column (offset 0.02..tol mm). Each forces a jog between two straight pad exits; align the pads before routing. |
@@ -210,6 +211,33 @@ corridor (#87), the 40 plane opens are pads whose fanout found no via spot.
 
 Demo board, `--planes In1.Cu=GND`: 50 to 0 opens in 8 s (gate with KiCad DRC +16 s, 0 new
 errors; KiCad warns about dangling GND vias until the plane is refilled).
+
+## Routing intents per net (`--prio`)
+
+`route` and `autoroute` take a routing intent per net (`--prio NET=PROFILE,...`, wildcards, or
+`net_prio` in the config). It scales the router's costs for that net and its track width, and
+nets marked `first` are routed before the others:
+
+| profile | effect | use for |
+|---|---|---|
+| `low_r` | twice the class width (pads keep the neck-down), vias cost 2x, first | supply rails, high current |
+| `low_l` | vias cost 3x, bends and the wrong layer direction cheap (direct path), first | clocks, gate drives, decoupling loops |
+| `short` | bends and the wrong layer direction cheap | sense lines, short analog paths |
+| `few_vias` | vias cost 4x | signals that should stay on one layer |
+| `wide` | 1.5x the class width | moderate current |
+| `first` | routed before the other nets | the nets that matter most |
+| `via:X` `bend:X` `dir:X` `width:X` | the multipliers themselves | fine tuning |
+
+Profiles combine with `+` (`CLK=low_l+wide`). `netinfo` reports the result per net: length, vias,
+width and rough DC resistance (copper 35 µm, `--cu-um`) and partial inductance (Grover formula
+for the total length plus about 1.3 nH per 1.6 mm via). Demo board, `route` without and with
+`--prio '+5V=low_r,CLK=low_l,ADC1=few_vias'` (both DRC-clean):
+
+| net | without | with |
+|---|---|---|
+| +5V (`low_r`) | 0.4 mm, 51.2 mm, 64.5 mΩ | 0.8 mm, 50.4 mm, **32.6 mΩ** |
+| CLK (`low_l`) | 22.1 mm, 2 vias, 27.1 nH | 22.4 mm, **0 vias, 24.9 nH** |
+| ADC1 (`few_vias`) | 17.8 mm, 3 vias | 18.4 mm, **0 vias** |
 
 ## Native DRC (`drc`)
 

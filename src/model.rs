@@ -117,6 +117,109 @@ pub struct BoardCfg {
     pub mh_pattern: String,
     /// locked pours (zone name wildcards) that yield like unlocked ones (KiCad refills them)
     pub yield_pours: Vec<String>,
+    /// routing intent per net (net wildcard, profile); the first match wins
+    pub net_prio: Vec<(String, NetPrio)>,
+}
+
+/// Routing intent of a net: multipliers on the router's costs and the track width, and whether
+/// the net is routed before the others. Profiles (combine with `+`):
+/// `low_r` (low resistance: twice the width, vias cost twice, first), `low_l` (low inductance:
+/// short and direct, vias cost three times, first), `short` (direct path: wrong layer direction
+/// and bends cheap), `few_vias` (vias cost four times), `wide` (1.5 times the width), `first`,
+/// and numbers `via:X`, `bend:X`, `dir:X`, `width:X`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NetPrio {
+    pub via: f32,
+    pub bend: f32,
+    /// wrong-direction cost multiplier on inner layers
+    pub dir: f32,
+    /// track width multiplier (the neck-down at pads keeps the class minimum)
+    pub width: f64,
+    pub first: bool,
+}
+
+impl Default for NetPrio {
+    fn default() -> Self {
+        NetPrio {
+            via: 1.0,
+            bend: 1.0,
+            dir: 1.0,
+            width: 1.0,
+            first: false,
+        }
+    }
+}
+
+impl NetPrio {
+    pub fn parse(spec: &str) -> Result<NetPrio, String> {
+        let mut p = NetPrio::default();
+        for t in spec.split('+').map(str::trim).filter(|t| !t.is_empty()) {
+            match t {
+                "low_r" => {
+                    p.width *= 2.0;
+                    p.via *= 2.0;
+                    p.first = true;
+                }
+                "low_l" => {
+                    p.via *= 3.0;
+                    p.bend *= 0.5;
+                    p.dir *= 0.25;
+                    p.first = true;
+                }
+                "short" => {
+                    p.bend *= 0.5;
+                    p.dir *= 0.25;
+                }
+                "few_vias" => p.via *= 4.0,
+                "wide" => p.width *= 1.5,
+                "first" => p.first = true,
+                _ => {
+                    let (k, v) = t
+                        .split_once(':')
+                        .ok_or(format!("net priority '{t}': unknown profile"))?;
+                    let x: f64 = v
+                        .parse()
+                        .map_err(|_| format!("net priority '{t}': expected a number"))?;
+                    if !(0.0..=100.0).contains(&x) {
+                        return Err(format!("net priority '{t}': out of range 0..100"));
+                    }
+                    match k {
+                        "via" => p.via = x as f32,
+                        "bend" => p.bend = x as f32,
+                        "dir" => p.dir = x as f32,
+                        "width" => p.width = x.max(0.1),
+                        _ => return Err(format!("net priority '{t}': unknown key '{k}'")),
+                    }
+                }
+            }
+        }
+        Ok(p)
+    }
+}
+
+impl BoardCfg {
+    /// routing intent of net `name` (the first matching wildcard; default: neutral)
+    pub fn prio(&self, name: &str) -> NetPrio {
+        self.net_prio
+            .iter()
+            .find(|(pat, _)| wild(name, pat))
+            .map(|(_, p)| *p)
+            .unwrap_or_default()
+    }
+
+    /// add `NET=PROFILE,...` (CLI `--prio`) in front of the configured ones
+    pub fn add_prio(&mut self, spec: &str) -> Result<(), String> {
+        let mut v = Vec::new();
+        for item in spec.split(',').filter(|s| !s.trim().is_empty()) {
+            let (n, pr) = item
+                .split_once('=')
+                .ok_or(format!("--prio {item}: expected NET=PROFILE"))?;
+            v.push((n.trim().to_string(), NetPrio::parse(pr)?));
+        }
+        v.append(&mut self.net_prio);
+        self.net_prio = v;
+        Ok(())
+    }
 }
 
 impl Default for BoardCfg {
@@ -130,6 +233,7 @@ impl Default for BoardCfg {
             layer_dir: [0, 1, 0, 1, 0, 1],
             mh_pattern: "MH*".into(),
             yield_pours: Vec::new(),
+            net_prio: Vec::new(),
         }
     }
 }
@@ -183,6 +287,26 @@ pub fn parse_cfg(j: &Value, board: Option<&str>) -> Result<BoardCfg, String> {
     c.skip_nets = strs(&b["skip_nets"]);
     c.yield_pours = strs(&b["yield_pours"]);
     c.via_keepout_refs = strs(&b["via_keepout_refs"]);
+    if let Some(np) = b["net_prio"].as_object() {
+        for (k, v) in np {
+            let p = match v {
+                Value::String(s) => NetPrio::parse(s)?,
+                Value::Object(o) => {
+                    let spec: Vec<String> = o
+                        .iter()
+                        .map(|(kk, vv)| match vv {
+                            Value::Bool(true) if kk == "first" => "first".to_string(),
+                            _ => format!("{kk}:{}", vv.as_f64().unwrap_or(1.0)),
+                        })
+                        .filter(|s| !s.starts_with("first:"))
+                        .collect();
+                    NetPrio::parse(&spec.join("+"))?
+                }
+                _ => return Err(format!("config: net_prio.{k}: expected a string or object")),
+            };
+            c.net_prio.push((k.clone(), p));
+        }
+    }
     if let Some(cl) = b["class_layers"].as_object() {
         for (k, v) in cl {
             c.class_layers.push((k.clone(), layer_mask(&strs(v))));

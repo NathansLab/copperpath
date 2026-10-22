@@ -1,8 +1,8 @@
 //! copperpath command line: check, place, route, opens, hints, pads, netclass (see README.md).
 
 use copperpath::{
-    board, check, delta, drc, droute, explain, fanout, geom, groute, model, nudge, place, plane,
-    render, reroute, rules, sch, sites, stitch,
+    board, check, delta, drc, droute, elec, explain, fanout, geom, groute, model, nudge, place,
+    plane, render, reroute, rules, sch, sites, stitch,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -23,6 +23,7 @@ commands:
   place     simulated-annealing placement inside zones (--zones zones.json)
   route     detailed router for a region (--region x0,y0,x1,y1 --out OUT.kicad_pcb
             and/or --delta-json DELTA.json: added/removed items in nm for the KiCad IPC API)
+  netinfo   length, vias, width, est. resistance (mOhm) and inductance (nH) per net
   drc       native copper DRC (KiCad rule names, ms instead of s): [-o report.json]
   opens     unconnected connections per net, counted from the copper
   hints     near-collinear pad pairs that force jogs between straight pad exits
@@ -216,6 +217,10 @@ pub fn load_ctx(a: &Args) -> Result<Ctx, String> {
         cfg.yield_pours
             .extend(y.split(',').filter(|s| !s.is_empty()).map(String::from));
     }
+    // routing intent per net: --prio 'VBUS=low_r,CLK*=low_l+first'
+    if let Some(p) = a.get("prio") {
+        cfg.add_prio(p)?;
+    }
     eprintln!(
         "[load] {} footprints, {} tracks, {} vias, {} zones, {} copper graphics, {} nets, {} DRU rules in {:.2} s",
         board.fps.len(),
@@ -264,6 +269,7 @@ fn main() {
         "route" => cmd_route(&a),
         "opens" => cmd_opens(&a),
         "drc" => cmd_drc(&a),
+        "netinfo" => cmd_netinfo(&a),
         "pads" => cmd_pads(&a),
         "hints" => cmd_hints(&a),
         "netclass" => cmd_netclass(&a),
@@ -1806,6 +1812,35 @@ fn cmd_opens(a: &Args) -> CmdResult {
         .iter()
         .map(|(n, k, isl)| json!({"net": n, "opens": k, "islands": isl.iter().take(cap).collect::<Vec<_>>()}))
         .collect::<Vec<_>>()}))
+}
+
+/// copper stack for the electrical estimates: --cu-um 35, --plating-um 25, --thickness 1.6 (mm)
+fn stack(a: &Args) -> elec::Stack {
+    let d = elec::Stack::default();
+    elec::Stack {
+        cu: a.f("cu-um", d.cu * 1000.0) / 1000.0,
+        plating: a.f("plating-um", d.plating * 1000.0) / 1000.0,
+        thickness: a.f("thickness", d.thickness),
+    }
+}
+
+/// per-net length, vias, widths and estimated resistance / inductance of the board's copper
+fn cmd_netinfo(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let filt = net_filter(a, &c.board.nets);
+    let v = elec::nets(&c.board, &stack(a), &|n| {
+        filt.as_ref().is_none_or(|f| f.contains(&n))
+    });
+    if !a.json() {
+        println!("net\tlength_mm\tvias\twidth_mm\tR_mOhm\tL_nH");
+        for e in &v {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                e.net, e.length_mm, e.vias, e.width_min_mm, e.r_mohm, e.l_nh
+            );
+        }
+    }
+    Ok(json!({"nets": v}))
 }
 
 /// native copper DRC with KiCad's rule names (see `drc.rs`); `-o` writes a KiCad-style JSON

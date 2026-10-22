@@ -213,6 +213,8 @@ pub struct NetJob {
     pub neck_fps: Vec<usize>,
     pub vr: f64,
     pub dr: f64,
+    /// routing intent (cost multipliers, routed first)
+    pub prio: crate::model::NetPrio,
     /// existing tracks, vias and zone fills of the pin components: a connection may start or
     /// end on them, not only at the pads
     pub copper: Vec<Seed>,
@@ -703,6 +705,9 @@ impl<'a> Router<'a> {
             if let Some(mn) = cw.iter().map(|(_, mn)| *mn).reduce(f64::max) {
                 hn = mn / 2.0;
             }
+            // routing intent: a wider track (capped at 5 mm), never narrower than the class
+            let prio = m.cfg.prio(&m.b.nets[net]);
+            let w = (w * prio.width).clamp(w.min(wmin), w.max(5.0));
             jobs.push(NetJob {
                 net,
                 pins: ps,
@@ -711,6 +716,7 @@ impl<'a> Router<'a> {
                 neck_fps,
                 vr: vd / 2.0,
                 dr: vdr / 2.0,
+                prio,
                 copper: cu,
             });
         }
@@ -1177,7 +1183,13 @@ impl<'a> Router<'a> {
             (b.x1 - b.x0) + (b.y1 - b.y0)
         };
         let mut order: Vec<usize> = (0..nj).collect();
-        order.sort_by(|a, b| hp(&self.jobs[*a]).partial_cmp(&hp(&self.jobs[*b])).unwrap());
+        // nets with the `first` intent lead, then the shortest nets
+        order.sort_by(|a, b| {
+            let (ja, jb) = (&self.jobs[*a], &self.jobs[*b]);
+            (!ja.prio.first, hp(ja))
+                .partial_cmp(&(!jb.prio.first, hp(jb)))
+                .unwrap()
+        });
         let mut need: Vec<usize> = order.clone();
         let mut pres = self.p.pres0;
         let mut routes = 0;
@@ -2181,11 +2193,18 @@ impl<'a> Router<'a> {
                 }
             }
         };
+        // routing intent of this net scales the bend, direction and via costs
+        let pr = self.jobs[k].prio;
+        let (bend_cost, wrong_dir, via_cost) = (
+            self.p.bend_cost * pr.bend,
+            self.p.wrong_dir * pr.dir,
+            self.p.via_cost * pr.via,
+        );
         let bend = |t: u8| -> f32 {
             match t {
                 0 => 0.0,
-                1 => self.p.bend_cost,
-                _ => self.p.bend_cost * self.p.bend90,
+                1 => bend_cost,
+                _ => bend_cost * self.p.bend90,
             }
         };
         let mut expanded = 0u64;
@@ -2244,9 +2263,9 @@ impl<'a> Router<'a> {
                 if !is_outer(l) {
                     let wrong = if dirpref[l] == 0 { *dx == 0 } else { *dy == 0 };
                     if wrong {
-                        c *= 1.0 + self.p.wrong_dir;
+                        c *= 1.0 + wrong_dir;
                     } else if *dx != 0 && *dy != 0 {
-                        c *= 1.0 + 0.5 * self.p.wrong_dir;
+                        c *= 1.0 + 0.5 * wrong_dir;
                     }
                 }
                 c += bend(t) + extra;
@@ -2293,7 +2312,7 @@ impl<'a> Router<'a> {
                             tc = c2;
                         }
                     }
-                    let ng = gc + self.p.via_cost + pen + extra + tc;
+                    let ng = gc + via_cost + pen + extra + tc;
                     if ng < g[nn] {
                         g[nn] = ng;
                         par[nn] = ln as u32;

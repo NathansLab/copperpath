@@ -10,6 +10,7 @@ pub mod clean;
 pub mod delta;
 pub mod drc;
 pub mod droute;
+pub mod elec;
 pub mod explain;
 pub mod fanout;
 pub mod font;

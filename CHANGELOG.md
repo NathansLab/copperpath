@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Routing intents per net (`--prio NET=PROFILE`, config `net_prio`): `low_r`, `low_l`, `short`,
+  `few_vias`, `wide`, `first` and raw multipliers scale the via, bend and layer-direction costs
+  and the track width per net and route marked nets first.
+- `netinfo`: length, vias, widths and estimated DC resistance and partial inductance per net.
 - `--drc native` for `route`, `nudge` and `autoroute`: the DRC gate with the native copper DRC
   (milliseconds, the input's rules for both boards) instead of two kicad-cli runs.
 - `drc`: native copper DRC with kicad-cli's rule names and JSON layout (clearance, shorts,
