@@ -105,6 +105,9 @@ All notable changes to this project are documented here. The format follows
   parallel, so the autoroute quality gate and repeated runs check an unchanged input once.
 
 ### Fixed
+- The board setup minimum clearance defaults to 0 like in KiCad (was 0.2 mm), so net classes
+  below 0.2 mm are honoured: the router was too strict and `drc` flagged legal pad pairs (28 on
+  PCBench rxadc_14, where kicad-cli reports none).
 - Board setup minimums missing from the project (via diameter, annular ring, hole) now take
   KiCad's defaults (0.5 / 0.1 / 0.3 mm) instead of 0; the router placed 0.46 mm vias that
   kicad-cli flagged (`via_diameter`, `drill_out_of_range`).

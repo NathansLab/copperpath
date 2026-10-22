@@ -121,3 +121,22 @@ fn routed_demo_is_clean() {
     assert_eq!(v["violations"], 0, "{v}");
     assert_eq!(v["unconnected"], 0, "{v}");
 }
+
+#[test]
+fn class_clearance_below_the_old_default_is_legal() {
+    // KiCad's default minimum clearance is 0: a 0.1 mm net class allows 0.15 mm gaps
+    let body = [
+        seg((20.0, 5.0), (25.0, 5.0), "A"),
+        seg((20.0, 5.4), (25.0, 5.4), "B"),
+    ]
+    .concat();
+    let pcb = write("fine_class", &body);
+    std::fs::write(
+        pcb.with_extension("kicad_pro"),
+        r#"{"net_settings": {"classes": [{"name": "Default", "clearance": 0.1, "track_width": 0.2,
+            "via_diameter": 0.6, "via_drill": 0.3}]}}"#,
+    )
+    .unwrap();
+    let v = run(&["drc"], &pcb);
+    assert_eq!(v["violations"], 0, "{v}");
+}
