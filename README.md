@@ -58,6 +58,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `route [--region x0,y0,x1,y1] [--nets PATTERNS] --out OUT.kicad_pcb [--delta-json DELTA.json] [--drc]` | Detailed router (below). Routes every routable net whose pads lie in the region (default: whole board). Appends unlocked tracks/vias to a copy and writes `OUT_route.json`; `--delta-json` writes the added/removed items in nm for the KiCad IPC API ([schema](#change-set-for-the-kicad-ipc-api---delta-json)). `--drc` runs `kicad-cli` on input and output and reports the new violations. |
 | `check [--out DIR] [--res 0.25] [--tile 1.0] [--copper locked\|all] [--crop x0,y0,x1,y1 --crop-class C]` | Routability report: via-site maps per net class, region analysis per schematic sheet, what-if ablation (without rule areas, via keepouts, locked copper), global route with congestion per tile and layer, hotspot list. Writes `report.json`, `groute.json`, `congestion.json` and PNG maps. |
 | `place --zones zones.json [--init keep\|schematic\|both] [--moves N] [--starts K] [--out DIR]` | Parallel simulated-annealing placement of the movable parts inside zones (see `examples/zones.json`). Writes `place.json`; apply it to a copy with `scripts/apply_place.py`. |
+| `drc [--refill-zones] [--out report.json]` | Native copper DRC with KiCad's rule names in milliseconds. See [Native DRC](#native-drc-drc). |
 | `opens [--region] [--nets] [--max-islands 50]` | Unconnected connections per net, counted from all copper including saved zone fills (no 499-item cap as in kicad-cli). Nets named in `--nets` are counted even if they are plane nets. `--json` lists the islands of each open net (pads per copper component, largest first). |
 | `hints [--region] [--nets] [--tol 1.0]` | Pad pairs of a net that are *almost* in one row or column (offset 0.02..tol mm). Each forces a jog between two straight pad exits; align the pads before routing. |
 | `stitch --net GND --zones REGEX --plane REGEX [--grid G] --out OUT.kicad_pcb` | Stitching vias for a plane net from the saved zone fills: one via in every fill island of the `--zones` zones (zone name, full match) that has no via or plated hole of the net, optionally a via grid of pitch G per island. A via must lie on a fill of a `--plane` zone of the same net (fully on its copper), keep the DRU/net-class clearance to every other net on every layer (outer layers incl. creepage, last matching rule wins) plus `--margin` (0.05), 0.2 mm to every pad, the hole and edge rules, and stay out of no-via rule areas. Unlocked zones of other nets are ignored (they refill around the via), locked ones are copper. Options: `--via D,DRILL` (default: the net class via), `--min-clr` (floor on the clearance to other nets), `--min-area` (0.3 mm²), `--base B.kicad_pcb` (write the vias into this board instead of the input, e.g. the unfilled original). `--json` lists the vias, the islands without a legal spot (with the nearest blockers of a via there) and the rejection causes. |
@@ -206,6 +207,25 @@ corridor (#87), the 40 plane opens are pads whose fanout found no via spot.
 
 Demo board, `--planes In1.Cu=GND`: 50 to 0 opens in 8 s (gate with KiCad DRC +16 s, 0 new
 errors; KiCad warns about dangling GND vias until the plane is refilled).
+
+## Native DRC (`drc`)
+
+```bash
+$B drc --pcb routed.kicad_pcb --refill-zones --out report.json --json
+```
+
+The copper checks of `kicad-cli pcb drc`, on copperpath's model: `clearance`, `shorting_items`,
+`tracks_crossing`, `hole_clearance`, `hole_to_hole`, `copper_edge_clearance`, `track_width` and
+`unconnected_items`, with KiCad's semantics (net classes, DRU and pad clearances, the 0.0005 mm
+epsilon, one collision per net pair, collisions only between nets with pads). `--refill-zones`
+fills the zones natively first (like kicad-cli's flag, with thermal reliefs), otherwise the
+saved fills count. `--out` writes a report in kicad-cli's JSON layout.
+
+Checked against kicad-cli 10.0.7 on the routed PCBench boards of the benchmark below and on
+synthetic boards: the same counts per type and the same unconnected items per net, in 1-4 ms
+instead of 1-2 s per board. Not covered: silk, courtyard, solder mask, footprint library and
+annular-ring checks, and copper islands without pads (KiCad counts floating tracks as
+unconnected items). Use it as the fast check while iterating and kicad-cli for sign-off.
 
 ## Explaining failures (`explain`)
 

@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `drc`: native copper DRC with kicad-cli's rule names and JSON layout (clearance, shorts,
+  crossings, hole and edge clearance, track width, unconnected items) in milliseconds; same
+  counts as kicad-cli 10 on the PCBench benchmark boards.
+- Native zone filler: thermal reliefs (spokes along the pad axes, 45 degrees for round pads; a
+  spoke that does not reach the fill or hits foreign copper is dropped, so a pad with no spoke
+  stays unconnected like in KiCad), the zone's own clearance and minimum width, pad and
+  footprint `zone_connect` overrides (#86).
 - `autoroute`: placed board to routed board in one command within a time budget (`--time`):
   plane zones (`--planes In1.Cu=GND`), plane fanout, negotiated signal routing with rip-up of
   blockers, stitching, quality gate (opens with native fills, optional KiCad DRC against the

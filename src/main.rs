@@ -1,8 +1,8 @@
 //! copperpath command line: check, place, route, opens, hints, pads, netclass (see README.md).
 
 use copperpath::{
-    board, check, delta, droute, explain, fanout, geom, groute, model, nudge, place, plane, render,
-    reroute, rules, sch, sites, stitch,
+    board, check, delta, drc, droute, explain, fanout, geom, groute, model, nudge, place, plane,
+    render, reroute, rules, sch, sites, stitch,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -23,6 +23,7 @@ commands:
   place     simulated-annealing placement inside zones (--zones zones.json)
   route     detailed router for a region (--region x0,y0,x1,y1 --out OUT.kicad_pcb
             and/or --delta-json DELTA.json: added/removed items in nm for the KiCad IPC API)
+  drc       native copper DRC (KiCad rule names, ms instead of s): [-o report.json]
   opens     unconnected connections per net, counted from the copper
   hints     near-collinear pad pairs that force jogs between straight pad exits
   pads      pad world positions, sizes and nets (tab separated)
@@ -262,6 +263,7 @@ fn main() {
         "place" => cmd_place(&a),
         "route" => cmd_route(&a),
         "opens" => cmd_opens(&a),
+        "drc" => cmd_drc(&a),
         "pads" => cmd_pads(&a),
         "hints" => cmd_hints(&a),
         "netclass" => cmd_netclass(&a),
@@ -1753,6 +1755,45 @@ fn cmd_opens(a: &Args) -> CmdResult {
         .collect::<Vec<_>>()}))
 }
 
+/// native copper DRC with KiCad's rule names (see `drc.rs`); `-o` writes a KiCad-style JSON
+/// report; unconnected items are the opens of every net with zones refilled natively
+fn cmd_drc(a: &Args) -> CmdResult {
+    let c = load_ctx_filled(a)?;
+    let t = Instant::now();
+    let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
+    let v = drc::check(&m);
+    let all: std::collections::HashSet<usize> = (1..c.board.nets.len()).collect();
+    let (opens, per) = count_opens(&c, None, Some(&all));
+    let dt = t.elapsed().as_secs_f64();
+    let mut unc = Vec::new();
+    for (n, k, isl) in &per {
+        for i in 0..*k {
+            unc.push((n.clone(), isl.get(i + 1).cloned().unwrap_or_default()));
+        }
+    }
+    let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
+    for x in &v {
+        *by.entry(x.typ).or_default() += 1;
+    }
+    if let Some(o) = a.get("o").or(a.get("out")) {
+        write_file(
+            o,
+            &serde_json::to_string_pretty(&drc::report(&v, &unc)).unwrap_or_default(),
+        )?;
+    }
+    if !a.json() {
+        for (k, n) in &by {
+            println!("{k}\t{n}");
+        }
+        println!("unconnected_items\t{opens}");
+    }
+    eprintln!(
+        "[drc] {} violations, {opens} unconnected in {dt:.3} s",
+        v.len()
+    );
+    Ok(json!({"violations": v.len(), "by_type": by, "unconnected": opens, "s": check::round2(dt)}))
+}
+
 /// unconnected connections (copper components - 1) per routable net (plus the nets named in
 /// the filter, e.g. plane nets), and the islands (pad names per component, largest first)
 type OpenNets = Vec<(String, usize, Vec<Vec<String>>)>;
@@ -2206,7 +2247,8 @@ fn write_bytes(path: &str, data: &[u8]) -> Result<(), String> {
 /// saved fills), so `stitch`, `fanout`, `opens` and `render` work without kicad-cli
 fn load_ctx_filled(a: &Args) -> Result<Ctx, String> {
     let mut c = load_ctx(a)?;
-    if a.get("native-fill").is_some() {
+    // --refill-zones: kicad-cli's name for the same thing
+    if a.get("native-fill").or(a.get("refill-zones")).is_some() {
         let t = Instant::now();
         let fp = fill_params(a);
         let k = plane::fill_board(&mut c.board, &c.rules, &c.cfg, &|_| true, &fp);
