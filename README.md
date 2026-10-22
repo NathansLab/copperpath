@@ -64,6 +64,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `fanout --net GND --plane REGEX [--reach 6] --out OUT.kicad_pcb` | Connects every open island of a plane net (a copper island with pads that touches no fill of a `--plane` zone) with one short track and a via onto the plane: grid search (0.05 mm, 8 directions) from an SMD pad of the island on its outer layer to the nearest legal via spot within `--reach` mm of track. Track legality as in the router (DRU/net-class clearance incl. outer-layer creepage, rule areas, mask apertures, edge); via legality as in `stitch`. Width: `--width` or the net class / DRU width, inside the pad's own courtyard the width of a DRU `track_width` rule with `A.intersectsCourtyard('REF')` (neck-down). Pads whose own cells are already too close to other copper (in-package creepage) are skipped. Options: `--via D,DRILL`, `--margin`, `--min-clr`, `--islands opens.json` (only islands listed by `opens --json`), `--base`. `--json` lists per island the pad used, track length and via, or why each pad failed and the nearest blockers (`net`, `kind`, `fp`, `layer`, `dist_mm`, `need_mm`, `locked`, `at`: the copper closest to violating its clearance, i.e. what to move). The search runs in 8 directions, so 45-degree tracks to a via spot are tried as well. |
 | `nudge (--parts R5,R7 \| --spec moves.json \| --auto) [--range 1] [--step 0.05] [--rots 0,90] --out OUT.kicad_pcb [--dry-run]` | Local placement optimisation by real routing: moves a few small parts (translation on a grid, rotation about the footprint origin, side kept) until their nets route, see [Nudge](#nudge-local-placement-by-real-routing). Writes the moved footprints and the new copper to a copy and `OUT_nudge.json`. |
 | `render [--roi x0,y0,x1,y1] --out roi.png` | PNG of a board region for AI agents and humans, native rasteriser (about 0.05 s per image). See [Rendering](#rendering-render). |
+| `explain [--net N] [--pad REF.PIN] [--explain-img DIR]` | Why connections are open: reason, widest corridor, blockers, ROI image. See [Explaining failures](#explaining-failures-explain). |
 | `plane list\|report\|fill\|create\|adjust` | Plane zones: detection, native zone filler, report (islands, unconnected pads, necks, stitching coverage), zone creation with HV cut-back, grow/merge. See [Planes](#planes-plane). |
 | `pads` | Pad world positions, sizes and nets (tab separated). |
 | `netclass` | net → net class table (tab separated). |
@@ -165,6 +166,35 @@ that both hold copper of the net meet (widest-path tree over the distance to the
 
 `--native-fill` on `fanout`, `stitch`, `opens` and `render` fills all copper zones natively first
 (instead of the saved fills), so the plane loop needs no kicad-cli refill.
+
+## Explaining failures (`explain`)
+
+Every failure comes with a one-line reason for humans and agents, and optionally a small image.
+`--explain` adds them to the JSON of `route`, `fanout`, `stitch` and `plane report`;
+`--explain-img DIR` also writes one ROI image per failure (the net highlighted, its ratsnest,
+labels, rule areas, HV halos, the bottleneck as a red marker and the blockers as yellow markers,
+scale bar). `copperpath explain` analyses the open connections of one net (or one pad) directly.
+
+```bash
+$B explain --pcb routed.kicad_pcb --net /Driver/PWM_A --pad U3.7 --explain-img why/ --json
+$B route --pcb board.kicad_pcb --out routed.kicad_pcb --explain-img why/ --json
+$B fanout --pcb board.kicad_pcb --net GND --plane "GND_In.*" --native-fill --explain --out f.kicad_pcb
+```
+
+For an open connection (the two closest pads of two copper islands of the net) the legal
+track-centre area is rasterised in a window around both pads (all allowed layers, vias where one
+fits; clearances from the DRU/net classes incl. creepage, rule areas, mask apertures, board edge):
+
+| `kind` | meaning |
+|---|---|
+| `congestion` | a corridor at the net's minimum width exists: the router ran out of iterations or budget (try `--reroute-blockers`, `--iters`, a region route) |
+| `routed-copper` | only unlocked tracks/vias of other nets block it; `rip_nets` lists the rip-up candidates |
+| `too-narrow` | fixed obstacles leave at most `corridor_mm` of track (< `need_mm`); `at`/`layer` is the bottleneck, `blockers` what to move |
+| `enclosed` | no legal path even for a zero-width track; `at` is the reachable point closest to the target |
+
+Example reason: `widest free corridor fits a 0.05 mm track < 0.20 mm needed at (19.62, 14.78)
+F.Cu: blocked by locked track SIG on F.Cu (0.20 mm away, needs 0.20)`. Options: `--explain-max`
+(20), `--explain-px` (900). About 0.05 s per connection including the image.
 
 ## How routing works
 

@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `explain` and `--explain` / `--explain-img DIR` (route, fanout, stitch, plane report): a
+  one-line reason per failure (`congestion`, `routed-copper` with rip-up candidates, `too-narrow`
+  with the widest corridor, bottleneck and blockers, `enclosed`) and a ROI image of it.
 - `nudge`: local placement optimisation by real routing. Movable parts (`--parts`, `--spec` JSON
   with per part offset ranges, grid step, rotations and keep-in, or `--auto` = unlocked 2-pad SMD
   parts near open connections) are searched on a discrete grid (coarse scan + pattern search,

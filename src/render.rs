@@ -969,7 +969,7 @@ pub fn render(m: &model::Model, o: &Opts) -> Result<Out, String> {
         }
     }
     let rats: Vec<Rat> = if o.opens {
-        let sel = |i: usize| i != 0;
+        let sel = |i: usize| i != 0 && o.hl_net.is_none_or(|h| h == i);
         ratsnest(m, &sel)
             .into_iter()
             .filter(|r| {

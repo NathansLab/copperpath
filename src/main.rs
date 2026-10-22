@@ -1,8 +1,8 @@
 //! copperpath command line: check, place, route, opens, hints, pads, netclass (see README.md).
 
 use copperpath::{
-    board, check, droute, fanout, geom, groute, model, nudge, place, plane, render, reroute, rules,
-    sch, sites, stitch,
+    board, check, droute, explain, fanout, geom, groute, model, nudge, place, plane, render,
+    reroute, rules, sch, sites, stitch,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -31,6 +31,7 @@ commands:
   nudge     move small parts locally until their nets route (--parts R5,R7 | --spec | --auto --out)
   render    PNG of a board region: layers, pads with labels, opens, DRC markers (--roi --out)
   plane     planes: list | report | fill | create | adjust (native zone filler, no kicad-cli)
+  explain   why a connection is open: blockers, corridor width, ROI image (--net [--pad])
 
 common options:
   --cfg config.json   board configuration (optional, see examples/config.json)
@@ -245,10 +246,12 @@ fn main() {
         "fanout" => cmd_fanout(&a),
         "nudge" => cmd_nudge(&a),
         "render" => cmd_render(&a),
+        "explain" => cmd_explain(&a),
         "plane" => cmd_plane(&a),
         "" => Err(format!("no command given\n{USAGE}")),
         c => Err(format!("unknown command '{c}'\n{USAGE}")),
     };
+    let res = res.and_then(|v| explain_post(&a, v));
     let secs = t0.elapsed().as_secs_f64();
     match res {
         Ok(mut v) => {
@@ -285,9 +288,9 @@ fn main() {
     }
 }
 
-const KNOWN: [&str; 12] = [
+const KNOWN: [&str; 13] = [
     "check", "place", "route", "opens", "pads", "hints", "netclass", "stitch", "fanout", "nudge",
-    "render", "plane",
+    "render", "plane", "explain",
 ];
 
 fn write_file(path: &str, data: &str) -> Result<(), String> {
@@ -874,7 +877,7 @@ fn cmd_hints(a: &Args) -> CmdResult {
 /// route, then (with --reroute-blockers) rip the unlocked copper of other nets that blocks each
 /// net left open and route it again together with the ripped nets; a try that leaves any of
 /// these nets worse than before is rolled back
-fn cmd_route(a: &Args) -> CmdResult {
+fn cmd_route_core(a: &Args) -> CmdResult {
     let mut summary = route_once(a)?;
     if a.get("reroute-blockers").is_none() || summary["opens"].as_u64().unwrap_or(0) == 0 {
         return Ok(summary);
@@ -2298,4 +2301,247 @@ fn plane_outline(a: &Args, sub: &str) -> CmdResult {
     let mut r = report;
     r["out"] = json!(out);
     Ok(r)
+}
+
+/// route with an explanation of every connection left open (`--explain`, `--explain-img DIR`)
+fn cmd_route(a: &Args) -> CmdResult {
+    cmd_route_core(a)
+}
+
+/// the same arguments with some keys replaced
+fn args_with(a: &Args, kv: &[(&str, &str)]) -> Args {
+    let mut n = Args {
+        cmd: a.cmd.clone(),
+        kv: a.kv.clone(),
+    };
+    for (k, v) in kv {
+        n.kv.insert(k.to_string(), v.to_string());
+    }
+    n
+}
+
+fn explain_wanted(a: &Args) -> bool {
+    a.get("explain").is_some() || a.get("explain-img").is_some()
+}
+
+/// explanations (and images with --explain-img DIR) of the open connections of a board
+fn explain_board(
+    a: &Args,
+    c: &Ctx,
+    sel: &(dyn Fn(usize) -> bool + Sync),
+    pad: Option<&str>,
+) -> Result<Value, String> {
+    let t = Instant::now();
+    let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
+    let mut ex = explain::explain_opens(&m, sel, pad, a.u("explain-max", 20));
+    if let Some(dir) = a.get("explain-img") {
+        for (k, e) in ex.iter_mut().enumerate() {
+            let path = explain::img_name(dir, k, e);
+            explain::image(&m, e, &path, a.u("explain-px", 900))?;
+            e.img = Some(path);
+        }
+    }
+    for e in &ex {
+        eprintln!("[explain] {} {} -> {}: {}", e.net, e.from, e.to, e.reason);
+    }
+    eprintln!(
+        "[explain] {} open connections explained in {:.2} s",
+        ex.len(),
+        t.elapsed().as_secs_f64()
+    );
+    Ok(json!(ex))
+}
+
+/// explain --pcb B [--net N] [--pad REF.PIN] [--explain-img DIR] [--explain-max 20]
+fn cmd_explain(a: &Args) -> CmdResult {
+    let c = load_ctx_filled(a)?;
+    let net = match a.get("net") {
+        Some(n) => Some(net_arg(&c, n)?),
+        None => None,
+    };
+    let pad = a.get("pad").map(String::from);
+    if let (Some(p), None) = (&pad, net) {
+        return Err(format!("--pad {p} needs --net"));
+    }
+    let ex = explain_board(
+        a,
+        &c,
+        &|n| n != 0 && net.is_none_or(|k| k == n),
+        pad.as_deref(),
+    )?;
+    Ok(json!({"open": ex.as_array().map(|v| v.len()), "explain": ex}))
+}
+
+/// `--explain` / `--explain-img DIR` for route, fanout, stitch and plane report: a reason per
+/// failure (and a ROI image)
+fn explain_post(a: &Args, mut v: Value) -> CmdResult {
+    if !explain_wanted(a) {
+        return Ok(v);
+    }
+    let sub = std::env::args().nth(2).unwrap_or_default();
+    match a.cmd.as_str() {
+        "route" => {
+            let Some(out) = v["out"].as_str().map(String::from) else {
+                return Ok(v);
+            };
+            if v["opens"].as_u64().unwrap_or(0) == 0 {
+                v["explain"] = json!([]);
+                return Ok(v);
+            }
+            let c0 = load_ctx(a)?;
+            let c = load_ctx(&args_with(
+                a,
+                &[
+                    ("pcb", &out),
+                    ("pro", &c0.pro),
+                    ("dru", &c0.dru),
+                    ("native-fill", "1"),
+                ],
+            ))?;
+            let open: std::collections::HashSet<String> = v["open_nets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|n| n["net"].as_str().map(String::from))
+                .collect();
+            let names = c.board.nets.clone();
+            v["explain"] = explain_board(a, &c, &|n| open.contains(&names[n]), None)?;
+        }
+        "plane" if sub == "report" => {
+            let mut c = load_ctx(a)?;
+            plane::fill_board(&mut c.board, &c.rules, &c.cfg, &|_| true, &fill_params(a));
+            let nets: std::collections::HashSet<usize> = v["nets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|r| r["components"].as_u64().unwrap_or(1) > 1)
+                .filter_map(|r| {
+                    r["net"]
+                        .as_str()
+                        .and_then(|n| c.board.net_id.get(n).copied())
+                })
+                .collect();
+            v["explain"] = explain_board(a, &c, &|n| nets.contains(&n), None)?;
+        }
+        "fanout" | "stitch" => {
+            let c = load_ctx_filled(a)?;
+            let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
+            let net = c.board.net_id.get(&a.s("net", "GND")).copied();
+            let key = if a.cmd == "fanout" {
+                "islands"
+            } else {
+                "failed"
+            };
+            let dir = a.get("explain-img").map(String::from);
+            let mut k = 0;
+            for it in v[key].as_array_mut().into_iter().flatten() {
+                if a.cmd == "fanout" && !it["pad"].is_null() {
+                    continue;
+                }
+                let bl: Vec<model::Blocker> = it["blockers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(blocker_from)
+                    .collect();
+                let what = if a.cmd == "fanout" {
+                    format!(
+                        "no track + via onto the plane within --reach from {}",
+                        it["pads"]
+                            .as_array()
+                            .map(|p| p
+                                .iter()
+                                .filter_map(|x| x.as_str())
+                                .take(4)
+                                .collect::<Vec<_>>()
+                                .join(", "))
+                            .unwrap_or_default()
+                    )
+                } else {
+                    "no legal stitching via spot in this pour island".to_string()
+                };
+                let reason = if bl.is_empty() {
+                    what
+                } else {
+                    format!(
+                        "{what}: nearest blockers {}",
+                        bl.iter()
+                            .take(3)
+                            .map(explain::describe)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )
+                };
+                it["reason"] = json!(reason);
+                eprintln!("[explain] {reason}");
+                if let Some(dir) = &dir {
+                    // ROI: the island's pads (fanout) or its point (stitch) and the blockers
+                    let mut bb = geom::BBox::empty();
+                    if let Some(at) = it["at"].as_array() {
+                        bb.add(geom::p(
+                            at[0].as_f64().unwrap_or(0.0),
+                            at[1].as_f64().unwrap_or(0.0),
+                        ));
+                    }
+                    for pn in it["pads"].as_array().into_iter().flatten() {
+                        if let Some((r, num)) = pn.as_str().and_then(|s| s.rsplit_once('.')) {
+                            if let Some(f) = c.board.fp(r) {
+                                if let Some(pd) = f.pads.iter().find(|p| p.num == num) {
+                                    bb.add(f.pad_world(pd).0);
+                                }
+                            }
+                        }
+                    }
+                    for b in bl.iter().take(3) {
+                        bb.add(geom::p(b.at[0], b.at[1]));
+                    }
+                    if !bb.valid() {
+                        continue;
+                    }
+                    let roi = bb.inflate(2.0);
+                    let path = format!(
+                        "{}/{}_{:02}.png",
+                        dir.trim_end_matches(['/', '\\']),
+                        a.cmd,
+                        k + 1
+                    );
+                    k += 1;
+                    explain::image_roi(
+                        &m,
+                        net,
+                        roi,
+                        explain::blocker_markers(&bl),
+                        &format!("{} failure {}", a.cmd, k),
+                        &path,
+                        a.u("explain-px", 900),
+                    )?;
+                    it["img"] = json!(path);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(v)
+}
+
+/// a blocker back from its JSON form
+fn blocker_from(v: &Value) -> Option<model::Blocker> {
+    let kind = match v["kind"].as_str()? {
+        "pad" => "pad",
+        "track" => "track",
+        "via" => "via",
+        "zone" => "zone",
+        "keepout" => "keepout",
+        _ => "graphic",
+    };
+    Some(model::Blocker {
+        net: v["net"].as_str().unwrap_or("").to_string(),
+        kind,
+        fp: v["fp"].as_str().map(String::from),
+        layer: v["layer"].as_str().unwrap_or("").to_string(),
+        dist_mm: v["dist_mm"].as_f64().unwrap_or(0.0),
+        need_mm: v["need_mm"].as_f64().unwrap_or(0.0),
+        locked: v["locked"].as_bool().unwrap_or(false),
+        at: [v["at"][0].as_f64()?, v["at"][1].as_f64()?],
+    })
 }
