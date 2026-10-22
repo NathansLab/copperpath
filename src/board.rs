@@ -85,6 +85,8 @@ pub struct Pad {
     pub zone_connect: Option<u8>,
     pub thermal_gap: Option<f64>,
     pub thermal_bridge: Option<f64>,
+    /// thermal spoke angle in degrees (KiCad: 45 for circle pads, 90 otherwise)
+    pub spoke_angle: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -373,6 +375,9 @@ fn parse_pad(l: &List, b: &mut Board, fp_rot: f64, fp_margin: Option<f64>) -> Pa
         zone_connect: l.valf("zone_connect").map(|v| v as u8),
         thermal_gap: l.valf("thermal_gap"),
         thermal_bridge: l.valf("thermal_bridge_width").or(l.valf("thermal_width")),
+        spoke_angle: l
+            .valf("thermal_bridge_angle")
+            .unwrap_or(if shape == "circle" { 45.0 } else { 90.0 }),
     }
 }
 

@@ -8,7 +8,9 @@
 //! - `hole_clearance`: a drilled hole closer to copper of another net than `min_hole_clearance`;
 //! - `hole_to_hole`: two drilled holes closer than `min_hole_to_hole` (edge to edge);
 //! - `copper_edge_clearance`: copper closer to Edge.Cuts than the edge clearance;
-//! - `track_width`: a track narrower than the rule minimum.
+//! - `track_width`: a track narrower than the rule minimum;
+//! - `via_diameter`, `annular_width` (vias), `drill_out_of_range` (holes) against the board
+//!   setup minimums.
 //!
 //! Like KiCad, a violation needs `actual < required - epsilon` (epsilon 0.0005 mm), items of one
 //! net never collide, net-less pads collide with every net, and each item pair is reported once
@@ -261,6 +263,28 @@ pub fn check(m: &Model) -> Vec<Violation> {
                     items: vec![describe(m, o)],
                 });
             }
+        }
+        // via size and holes against the board setup minimums
+        let (md, ma, mh) = r.min_via;
+        let hole_d = 2.0 * o.hole_r;
+        let size = |v: &mut Vec<Violation>, typ: &'static str, need: f64, actual: f64| {
+            if actual < need - EPS {
+                v.push(Violation {
+                    typ,
+                    need,
+                    actual,
+                    layer: (o.layers & m.b.cu_mask).trailing_zeros() as usize,
+                    at: at(&o.bbox, &o.bbox),
+                    items: vec![describe(m, o)],
+                });
+            }
+        };
+        if let (Kind::Via, Shape::Capsule { r: vr, .. }) = (&o.kind, &o.shape) {
+            size(&mut out, "via_diameter", md, 2.0 * vr);
+            size(&mut out, "annular_width", ma, vr - o.hole_r);
+        }
+        if hole_d > 0.0 {
+            size(&mut out, "drill_out_of_range", mh, hole_d);
         }
         if let (Kind::Track, Shape::Capsule { r: hw, .. }) = (&o.kind, &o.shape) {
             let (min, _) = r.track_width(o.net);

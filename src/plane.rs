@@ -443,8 +443,9 @@ fn r3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
 
-/// an own pad with a thermal relief: centre, angle (deg), half size, gap, spoke width, round
-type Thermal = (P, f64, (f64, f64), f64, f64, bool);
+/// an own pad with a thermal relief: centre, angle (deg), half size, gap, spoke width, spoke
+/// angle (deg)
+type Thermal = (P, f64, (f64, f64), f64, f64, f64);
 
 /// native fill of zone `zi` on copper layer `l`
 pub fn fill_zone(m: &Model, zi: usize, l: usize, fp: &FillParams) -> ZoneFill {
@@ -548,15 +549,13 @@ pub fn fill_zone(m: &Model, zi: usize, l: usize, fp: &FillParams) -> ZoneFill {
                             let w = pd.thermal_bridge.unwrap_or(z.thermal_bridge);
                             block(&o.shape, gap + rt, &mut ok);
                             let (c, a) = f.pad_world(pd);
-                            let round = (pd.size.0 - pd.size.1).abs() < 1e-6
-                                && matches!(o.shape, Shape::Capsule { .. });
                             thermals.push((
                                 c,
                                 a,
                                 (pd.size.0 / 2.0, pd.size.1 / 2.0),
                                 gap,
                                 w.max(2.0 * rt),
-                                round,
+                                pd.spoke_angle,
                             ));
                         }
                     }
@@ -611,17 +610,26 @@ pub fn fill_zone(m: &Model, zi: usize, l: usize, fp: &FillParams) -> ZoneFill {
     // thermal spokes (KiCad: four, along the pad axes, 45 degrees for round pads): a spoke is
     // kept when it is clear of foreign copper and its end reaches the fill
     let mut spokes: Vec<Shape> = Vec::new();
-    for &(c, a, (hx, hy), gap, w, round) in &thermals {
+    for &(c, a, (hx, hy), gap, w, sa) in &thermals {
+        // spokes leave along the pad axes rotated by the spoke angle (90 = along the axes)
+        let diag = (sa - 90.0).abs() > 1e-6;
         for k in 0..4 {
             let ang = a.to_radians()
-                + if round { 45f64.to_radians() } else { 0.0 }
+                + if diag { sa.to_radians() } else { 0.0 }
                 + k as f64 * std::f64::consts::FRAC_PI_2;
             let (dx, dy) = (ang.cos(), ang.sin());
-            // pad half extent along the spoke (pad frame axes)
-            let ext = if round || k % 2 == 0 { hx } else { hy };
+            // pad half extent along the spoke (pad frame axes; the larger one on a diagonal)
+            let ext = if diag {
+                hx.max(hy)
+            } else if k % 2 == 0 {
+                hx
+            } else {
+                hy
+            };
+            // KiCad's spoke ends where the relief gap ends; one cell more joins it to the fill
             let e = P {
-                x: c.x + dx * (ext + gap + rt + res),
-                y: c.y + dy * (ext + gap + rt + res),
+                x: c.x + dx * (ext + gap + res),
+                y: c.y + dy * (ext + gap + res),
             };
             let sp = Shape::Capsule {
                 a: c,

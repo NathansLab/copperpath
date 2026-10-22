@@ -449,10 +449,12 @@ impl Rules {
             class_idx,
             min_clearance: rs["min_clearance"].as_f64().unwrap_or(0.2),
             min_track: rs["min_track_width"].as_f64().unwrap_or(0.2),
+            // KiCad's board setup defaults when the project has no value (kicad-cli 10 reports
+            // 0.5 mm via diameter, 0.1 mm annular width, 0.3 mm hole)
             min_via: (
-                rs["min_via_diameter"].as_f64().unwrap_or(0.0),
-                rs["min_via_annular_width"].as_f64().unwrap_or(0.0),
-                rs["min_through_hole_diameter"].as_f64().unwrap_or(0.0),
+                rs["min_via_diameter"].as_f64().unwrap_or(0.5),
+                rs["min_via_annular_width"].as_f64().unwrap_or(0.1),
+                rs["min_through_hole_diameter"].as_f64().unwrap_or(0.3),
             ),
             min_edge: rs["min_copper_edge_clearance"].as_f64().unwrap_or(0.5),
             min_hole_to_hole: rs["min_hole_to_hole"].as_f64().unwrap_or(0.25),

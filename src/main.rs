@@ -1402,6 +1402,9 @@ fn which(cli: &str) -> Option<String> {
 /// The input's report is cached (in this process and in the temp dir, keyed by `drc_key`), so
 /// the autoroute gate and repeated runs on one input check it once; both boards run in parallel.
 fn drc_delta(a: &Args, before: &str, after: &str) -> Result<Value, String> {
+    if a.get("drc") == Some("native") {
+        return drc_delta_native(a, before, after);
+    }
     let cli = a
         .get("kicad-cli")
         .map(String::from)
@@ -1470,6 +1473,11 @@ fn drc_delta(a: &Args, before: &str, after: &str) -> Result<Value, String> {
             let _ = std::fs::write(d, b.to_string());
         }
     }
+    drc_compare(&b, &n, base, new)
+}
+
+/// violations only the routed report has (by severity, type and items), unconnected counts
+fn drc_compare(b: &Value, n: &Value, base: String, new: String) -> Result<Value, String> {
     let keys = |d: &Value| -> HashMap<String, usize> {
         let mut m = HashMap::new();
         for v in d["violations"].as_array().into_iter().flatten() {
@@ -1490,7 +1498,7 @@ fn drc_delta(a: &Args, before: &str, after: &str) -> Result<Value, String> {
         }
         m
     };
-    let (kb, kn) = (keys(&b), keys(&n));
+    let (kb, kn) = (keys(b), keys(n));
     let mut added: Vec<String> = Vec::new();
     for (k, cnt) in &kn {
         for _ in kb.get(k).copied().unwrap_or(0)..*cnt {
@@ -1508,8 +1516,53 @@ fn drc_delta(a: &Args, before: &str, after: &str) -> Result<Value, String> {
         "violations_before": kb.values().sum::<usize>(), "violations_after": kn.values().sum::<usize>(),
         "new_violations": added.len(), "new_errors": added.iter().filter(|k| k.starts_with("error ")).count(),
         "new": added.iter().take(50).collect::<Vec<_>>(),
-        "unconnected_before": unc(&b), "unconnected_after": unc(&n), "reports": [base, new],
+        "unconnected_before": unc(b), "unconnected_after": unc(n), "reports": [base, new],
     }))
+}
+
+/// `--drc native`: the native copper DRC (`drc.rs`, saved or native fills) on both boards with
+/// the input's rules; milliseconds instead of two kicad-cli runs
+fn drc_delta_native(a: &Args, before: &str, after: &str) -> Result<Value, String> {
+    let mut kv = a.kv.clone();
+    kv.insert("pcb".into(), before.into());
+    let c0 = load_ctx(&Args {
+        cmd: "drc".into(),
+        kv: kv.clone(),
+    })?;
+    let report = |pcb: &str| -> Result<Value, String> {
+        let mut kv = kv.clone();
+        kv.insert("pcb".into(), pcb.into());
+        kv.insert("pro".into(), c0.pro.clone());
+        kv.insert("dru".into(), c0.dru.clone());
+        let c = load_ctx_filled(&Args {
+            cmd: "drc".into(),
+            kv,
+        })?;
+        Ok(native_report(&c).0)
+    };
+    let base = after.replace(".kicad_pcb", "_drc_before.json");
+    let new = after.replace(".kicad_pcb", "_drc_after.json");
+    let (b, n) = (report(before)?, report(after)?);
+    write_file(&base, &serde_json::to_string_pretty(&b).unwrap_or_default())?;
+    write_file(&new, &serde_json::to_string_pretty(&n).unwrap_or_default())?;
+    let mut d = drc_compare(&b, &n, base, new)?;
+    d["engine"] = json!("native");
+    Ok(d)
+}
+
+/// native DRC report of a loaded board: (kicad-style report, violations, unconnected count)
+fn native_report(c: &Ctx) -> (Value, Vec<drc::Violation>, usize) {
+    let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
+    let v = drc::check(&m);
+    let all: std::collections::HashSet<usize> = (1..c.board.nets.len()).collect();
+    let (opens, per) = count_opens(c, None, Some(&all));
+    let mut unc = Vec::new();
+    for (n, k, isl) in &per {
+        for i in 0..*k {
+            unc.push((n.clone(), isl.get(i + 1).cloned().unwrap_or_default()));
+        }
+    }
+    (drc::report(&v, &unc), v, opens)
 }
 
 /// output path for a command that writes a board copy: must end in .kicad_pcb and differ from
@@ -1758,28 +1811,24 @@ fn cmd_opens(a: &Args) -> CmdResult {
 /// native copper DRC with KiCad's rule names (see `drc.rs`); `-o` writes a KiCad-style JSON
 /// report; unconnected items are the opens of every net with zones refilled natively
 fn cmd_drc(a: &Args) -> CmdResult {
-    let c = load_ctx_filled(a)?;
-    let t = Instant::now();
-    let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
-    let v = drc::check(&m);
-    let all: std::collections::HashSet<usize> = (1..c.board.nets.len()).collect();
-    let (opens, per) = count_opens(&c, None, Some(&all));
-    let dt = t.elapsed().as_secs_f64();
-    let mut unc = Vec::new();
-    for (n, k, isl) in &per {
-        for i in 0..*k {
-            unc.push((n.clone(), isl.get(i + 1).cloned().unwrap_or_default()));
-        }
+    let mut kv = a.kv.clone();
+    // the native fill needs a finer raster than routing to match KiCad's polygon fill
+    if a.get("refill-zones").is_some() && a.get("fill-res").is_none() {
+        kv.insert("fill-res".into(), "0.05".into());
     }
+    let c = load_ctx_filled(&Args {
+        cmd: a.cmd.clone(),
+        kv,
+    })?;
+    let t = Instant::now();
+    let (rep, v, opens) = native_report(&c);
+    let dt = t.elapsed().as_secs_f64();
     let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
     for x in &v {
         *by.entry(x.typ).or_default() += 1;
     }
-    if let Some(o) = a.get("o").or(a.get("out")) {
-        write_file(
-            o,
-            &serde_json::to_string_pretty(&drc::report(&v, &unc)).unwrap_or_default(),
-        )?;
+    if let Some(o) = a.get("out") {
+        write_file(o, &serde_json::to_string_pretty(&rep).unwrap_or_default())?;
     }
     if !a.json() {
         for (k, n) in &by {
@@ -1814,13 +1863,31 @@ fn count_opens(
         if filt.is_some_and(|f| !f.contains(&n)) {
             continue;
         }
+        // pads with the same number in one footprint are one terminal (KiCad: no missing
+        // connection between them), so their components are merged
+        let mut comp: HashMap<usize, usize> = HashMap::new();
+        let mut first: HashMap<(usize, &str), usize> = HashMap::new();
+        fn root(m: &mut HashMap<usize, usize>, mut c: usize) -> usize {
+            while let Some(&p) = m.get(&c).filter(|&&p| p != c) {
+                c = p;
+            }
+            c
+        }
+        for p in &pins[&n] {
+            let key = (p.fp, c.board.fps[p.fp].pads[p.pad].num.as_str());
+            let f = *first.entry(key).or_insert(p.comp);
+            let (a, b) = (root(&mut comp, f), root(&mut comp, p.comp));
+            if a != b {
+                comp.insert(b, a);
+            }
+        }
         let mut isl: std::collections::BTreeMap<usize, Vec<String>> = Default::default();
         for p in pins[&n]
             .iter()
             .filter(|p| region.map(|r| r.contains(p.at)).unwrap_or(true))
         {
             let f = &c.board.fps[p.fp];
-            isl.entry(p.comp)
+            isl.entry(root(&mut comp, p.comp))
                 .or_default()
                 .push(format!("{}.{}", f.refd, f.pads[p.pad].num));
         }

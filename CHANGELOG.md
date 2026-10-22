@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `--drc native` for `route`, `nudge` and `autoroute`: the DRC gate with the native copper DRC
+  (milliseconds, the input's rules for both boards) instead of two kicad-cli runs.
 - `drc`: native copper DRC with kicad-cli's rule names and JSON layout (clearance, shorts,
   crossings, hole and edge clearance, track width, unconnected items) in milliseconds; same
   counts as kicad-cli 10 on the PCBench benchmark boards.
@@ -93,6 +95,11 @@ All notable changes to this project are documented here. The format follows
   parallel, so the autoroute quality gate and repeated runs check an unchanged input once.
 
 ### Fixed
+- Board setup minimums missing from the project (via diameter, annular ring, hole) now take
+  KiCad's defaults (0.5 / 0.1 / 0.3 mm) instead of 0; the router placed 0.46 mm vias that
+  kicad-cli flagged (`via_diameter`, `drill_out_of_range`).
+- `opens`: pads with the same number in one footprint (split exposed pads) are one terminal, as
+  in KiCad, instead of separate islands.
 - `autoroute`: a net with outer pours only is no longer a plane net. It had no inner plane to fan
   out to and stayed open (two-layer boards: all GND/supply pads unconnected); it is now routed.
 - `route`: the cleanup fallback ladder (two more full routes) only runs when a failed net may have
