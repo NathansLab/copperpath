@@ -194,7 +194,8 @@ pub struct Problem<'a> {
     pub eval: Option<(GridSpec, usize, f64, f64)>, // grid, rep net, via r, drill r
     pub base_count: Vec<u16>,
     pub maxclr: f64,
-    pub outline: Option<Vec<P>>,
+    /// the board has a closed Edge.Cuts outline (courtyards must lie inside it)
+    pub has_outline: bool,
     pub fp_keepouts: Vec<(Vec<P>, u8)>, // rule areas forbidding footprints
 }
 
@@ -321,7 +322,7 @@ pub fn place_part(f: &Footprint, pose: &Pose) -> Placed {
     }
 }
 
-fn poly_overlap(a: &[P], b: &[P]) -> bool {
+pub fn poly_overlap(a: &[P], b: &[P]) -> bool {
     if a.len() < 3 || b.len() < 3 {
         return false;
     }
@@ -481,16 +482,15 @@ impl<'a> Problem<'a> {
             .iter()
             .enumerate()
             .filter(|(fi, _)| !idx_of_fp.contains_key(fi))
-            .filter_map(|(_, f)| {
-                let c = f.crtyd_world();
-                if c.len() < 3 {
-                    return None;
-                }
-                let mut bb = BBox::empty();
-                for q in &c {
-                    bb.add(*q);
-                }
-                Some((c, bb, f.back))
+            .flat_map(|(_, f)| {
+                // each courtyard polygon of a footprint on its own (no hull over a header pair)
+                f.crtyd_parts_world().into_iter().map(move |c| {
+                    let mut bb = BBox::empty();
+                    for q in &c {
+                        bb.add(*q);
+                    }
+                    (c, bb, f.back)
+                })
             })
             .collect();
         // nets
@@ -596,7 +596,7 @@ impl<'a> Problem<'a> {
             eval,
             base_count: vec![],
             maxclr,
-            outline: b.edge.first().cloned(),
+            has_outline: !b.edge.is_empty(),
             fp_keepouts,
         };
         pb.base_count = pb.fixed_via_count();
@@ -744,10 +744,8 @@ impl<'a> Problem<'a> {
             }
         }
         // board outline
-        if let Some(o) = &self.outline {
-            if !poly_inside(&pl.crtyd, o) {
-                v += 1;
-            }
+        if self.has_outline && !pl.crtyd.iter().all(|q| self.m.b.inside(*q)) {
+            v += 1;
         }
         // near
         for (tp, mx) in &spec.near {

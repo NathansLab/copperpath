@@ -11,11 +11,23 @@
 
 use crate::board::*;
 use crate::clean::{self, Checker, End, FItem, Run};
-use crate::geom::*;
+use crate::geom::{self, *};
 use crate::model::*;
-use crate::sites::{track_map, via_map, R_FREE};
+use crate::sites::{track_map, track_stamp, via_map, via_stamp, R_FREE};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+
+/// silences the router's progress lines (grid, iterations, hotspots) while set, e.g. while
+/// `nudge` routes thousands of small candidate windows
+pub static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+macro_rules! dlog {
+    ($($t:tt)*) => {
+        if !QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!($($t)*)
+        }
+    };
+}
 
 #[derive(Clone, Debug)]
 pub struct DParams {
@@ -41,6 +53,8 @@ pub struct DParams {
     pub deadline: Option<std::time::Instant>,
     /// iterations without a new minimum of conflict cells before the negotiation stops
     pub stall_iters: usize,
+    /// a new minimum counts only if it is this fraction below the earlier one (0 = any gain)
+    pub stall_gain: f32,
     /// experimental: parallel connection searches inside a multi-pin net (0 = number of threads,
     /// 1 = serial; parallel was slower and not shorter on the public benchmark boards)
     pub par_conn: usize,
@@ -67,6 +81,9 @@ pub struct DParams {
     pub clean: bool,
     /// cleanup may slide stub ends / switch stub axes / slide junctions (off in the fallback pass)
     pub slide: bool,
+    /// also connect copper components (tracks, vias) that reach into the region while their
+    /// pins lie outside it, e.g. stubs left by ripping copper inside the region (`nudge`)
+    pub copper_comps: bool,
 }
 
 impl Default for DParams {
@@ -88,6 +105,7 @@ impl Default for DParams {
             par_nets: 1,
             deadline: None,
             stall_iters: 3,
+            stall_gain: 0.0,
             par_conn: 1,
             job_margin: 6.0,
             hweight: 1.02,
@@ -101,6 +119,7 @@ impl Default for DParams {
             slide: true,
             bend90: 1.4,
             clean: true,
+            copper_comps: false,
         }
     }
 }
@@ -191,13 +210,81 @@ pub struct RNet {
 type Found = (Vec<(usize, usize)>, usize);
 type NetRouteResult = (RNet, usize, Vec<(usize, usize, bool)>, Vec<usize>);
 
+/// per-thread A* buffers, kept between searches; only the nodes a search wrote are reset
+#[derive(Default)]
+struct Scratch {
+    g: Vec<f32>,
+    par: Vec<u32>,
+    indir: Vec<u8>,
+    fkey: Vec<u32>,
+    hc: Vec<f32>,
+    touched: Vec<u32>,
+    htouched: Vec<u32>,
+}
+
+impl Scratch {
+    /// at least `total` nodes and `wn` heuristic cells, all at their initial values
+    fn reset(&mut self, total: usize, wn: usize) {
+        for &i in &self.touched {
+            let i = i as usize;
+            self.g[i] = f32::INFINITY;
+            self.par[i] = u32::MAX;
+            self.indir[i] = 8;
+            self.fkey[i] = u32::MAX;
+        }
+        self.touched.clear();
+        for &i in &self.htouched {
+            self.hc[i as usize] = f32::NAN;
+        }
+        self.htouched.clear();
+        if self.g.len() < total {
+            self.g.resize(total, f32::INFINITY);
+            self.par.resize(total, u32::MAX);
+            self.indir.resize(total, 8);
+            self.fkey.resize(total, u32::MAX);
+        }
+        if self.hc.len() < wn {
+            self.hc.resize(wn, f32::NAN);
+        }
+    }
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
 pub struct NetJob {
     pub net: usize,
     pub pins: Vec<Pin>, // pins inside the region
     pub hw: f64,        // opt half width
     pub hn: f64,        // min half width (neck-down)
+    /// footprints whose courtyard allows a narrower neck-down width (DRU `track_width` rule with
+    /// `intersectsCourtyard`): the neck-down then applies inside these courtyards only
+    pub neck_fps: Vec<usize>,
     pub vr: f64,
     pub dr: f64,
+    /// routing intent (cost multipliers, routed first)
+    pub prio: crate::model::NetPrio,
+    /// existing tracks, vias and zone fills of the pin components: a connection may start or
+    /// end on them, not only at the pads
+    pub copper: Vec<Seed>,
+    /// the components to connect (sorted): those of the pins, plus copper-only ones with
+    /// [`DParams::copper_comps`]
+    pub comps: Vec<usize>,
+}
+
+/// existing copper of a pin component that can start or end a connection
+#[derive(Debug, Clone)]
+pub struct Seed {
+    pub shape: Shape,
+    pub layers: u8,
+    /// component id ([`Pin::comp`])
+    pub comp: usize,
+    /// via centre (a via end is pulled to it)
+    pub via_at: Option<P>,
+    /// saved zone fill: seeds only inside the job window (it does not widen the window), the
+    /// interior sampled every 4th cell plus the rim
+    pub fill: bool,
 }
 
 struct NetMaps {
@@ -342,6 +429,8 @@ pub struct AesStats {
     pub jogs: usize,
     pub kept90: [usize; 5],
     pub exact_fail: usize,
+    /// nets whose copper failed the exact check and was not written
+    pub exact_dropped: usize,
 }
 
 /// min-heap of u64 with four children per node: same pop order as a binary heap, fewer levels
@@ -512,6 +601,32 @@ fn tdir(a: u8, b: u8) -> u8 {
     d.min(8 - d)
 }
 
+/// blocker maps of the objects that stay while a few footprints move (`nudge`): one window per
+/// net (the region plus the job margin) on one grid, so a candidate placement only stamps the
+/// pads and mask apertures of the moving footprints into copies of these maps
+pub struct FixedMaps {
+    pub gs: GridSpec,
+    /// footprints (indices into the model's board) whose objects are stamped per candidate
+    pub moving: HashSet<usize>,
+    nets: HashMap<usize, FixedNet>,
+}
+
+struct FixedNet {
+    ox: usize,
+    oy: usize,
+    g: GridSpec,
+    t: Vec<Vec<u8>>,
+    tn: Vec<Vec<u8>>,
+    v: Vec<u8>,
+}
+
+fn is_moving(o: &Obj, mv: &HashSet<usize>) -> bool {
+    match o.kind {
+        Kind::Pad { fp, .. } | Kind::Mask { fp, .. } => mv.contains(&fp),
+        _ => false,
+    }
+}
+
 impl<'a> Router<'a> {
     pub fn new(
         m: &'a Model<'a>,
@@ -519,8 +634,66 @@ impl<'a> Router<'a> {
         p: DParams,
         only_nets: Option<&HashSet<usize>>,
     ) -> Router<'a> {
+        Self::build(m, region, p, only_nets, None, None)
+    }
+
+    /// a router that reuses `fixed` (built by [`Router::fixed_maps`] on the same board with the
+    /// moving footprints elsewhere): only the moving footprints' objects are stamped anew
+    pub fn new_with(
+        m: &'a Model<'a>,
+        region: BBox,
+        p: DParams,
+        only_nets: Option<&HashSet<usize>>,
+        fixed: &FixedMaps,
+    ) -> Router<'a> {
+        Self::build(m, region, p, only_nets, Some(fixed), None)
+    }
+
+    /// the maps of everything but the `moving` footprints' pads and mask apertures, per net of
+    /// the region (see [`FixedMaps`])
+    pub fn fixed_maps(
+        m: &Model,
+        region: BBox,
+        p: DParams,
+        only_nets: Option<&HashSet<usize>>,
+        moving: HashSet<usize>,
+    ) -> FixedMaps {
+        let r = Router::build(m, region, p, only_nets, None, Some(&moving));
+        let nets = r
+            .jobs
+            .iter()
+            .zip(r.maps)
+            .map(|(j, mp)| {
+                (
+                    j.net,
+                    FixedNet {
+                        ox: mp.ox,
+                        oy: mp.oy,
+                        g: mp.g,
+                        t: mp.t,
+                        tn: mp.tn,
+                        v: mp.v,
+                    },
+                )
+            })
+            .collect();
+        FixedMaps {
+            gs: r.gs,
+            moving,
+            nets,
+        }
+    }
+
+    fn build(
+        m: &'a Model<'a>,
+        region: BBox,
+        p: DParams,
+        only_nets: Option<&HashSet<usize>>,
+        fixed: Option<&FixedMaps>,
+        exclude: Option<&HashSet<usize>>,
+    ) -> Router<'a> {
         // connections: pins inside the region, nets with >= 2 copper components there
-        let pins = pins_by_net(m);
+        let (pins, copper) = pins_and_copper(m);
         let mut jobs = Vec::new();
         let mut keys: Vec<&usize> = pins.keys().collect();
         keys.sort();
@@ -536,6 +709,14 @@ impl<'a> Router<'a> {
                 .cloned()
                 .collect();
             let mut comps: Vec<usize> = ps.iter().map(|pn| pn.comp).collect();
+            if p.copper_comps {
+                for &(oi, c) in copper.get(&net).into_iter().flatten() {
+                    let o = m.cu(oi);
+                    if matches!(o.kind, Kind::Track | Kind::Via) && o.bbox.overlaps(&region) {
+                        comps.push(c);
+                    }
+                }
+            }
             comps.sort();
             comps.dedup();
             if comps.len() < 2 {
@@ -543,16 +724,68 @@ impl<'a> Router<'a> {
             }
             let (wmin, w) = m.r.track_width(net);
             let (vd, vdr) = m.r.via(net);
+            let cu = copper
+                .get(&net)
+                .map(|v| {
+                    v.iter()
+                        .filter(|(oi, c)| {
+                            comps.binary_search(c).is_ok() && m.cu(*oi).bbox.overlaps(&region)
+                        })
+                        .map(|&(oi, c)| {
+                            let o = m.cu(oi);
+                            let via_at = match (o.kind, &o.shape) {
+                                (Kind::Via, Shape::Capsule { a, .. }) => Some(*a),
+                                _ => None,
+                            };
+                            Seed {
+                                shape: o.shape.clone(),
+                                layers: o.layers,
+                                comp: c,
+                                via_at,
+                                fill: matches!(o.kind, Kind::Zone),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // courtyard neck-down rules of the pins' footprints (issue #2)
+            let mut hn = wmin.min(w) / 2.0;
+            let mut fps: Vec<usize> = ps.iter().map(|pn| pn.fp).collect();
+            fps.sort_unstable();
+            fps.dedup();
+            let cw: Vec<(usize, f64)> = fps
+                .into_iter()
+                .filter(|&fi| m.b.fps[fi].crtyd.len() >= 3)
+                .map(|fi| {
+                    let refs = [m.b.fps[fi].refd.clone()];
+                    (fi, m.r.track_width_at(net, Some(&refs)).0)
+                })
+                .filter(|(_, mn)| *mn < hn * 2.0 - 1e-9)
+                .collect();
+            let neck_fps: Vec<usize> = cw.iter().map(|(fi, _)| *fi).collect();
+            if let Some(mn) = cw.iter().map(|(_, mn)| *mn).reduce(f64::max) {
+                hn = mn / 2.0;
+            }
+            // routing intent: a wider track (capped at 5 mm), never narrower than the class
+            let prio = m.cfg.prio(&m.b.nets[net], &m.r.class_of(net).name);
+            let w = (w * prio.width).clamp(w.min(wmin), w.max(5.0));
             jobs.push(NetJob {
                 net,
                 pins: ps,
                 hw: w / 2.0,
-                hn: wmin.min(w) / 2.0,
+                hn,
+                neck_fps,
                 vr: vd / 2.0,
                 dr: vdr / 2.0,
+                prio,
+                copper: cu,
+                comps: comps.clone(),
             });
         }
-        let gs = phased_grid(m, region, p.res, &jobs);
+        let gs = match fixed {
+            Some(f) => f.gs,
+            None => phased_grid(m, region, p.res, &jobs),
+        };
         let gb = gs.bbox();
         let mut maxd: f64 = 0.0;
         for v in &m.r.mat[0] {
@@ -570,22 +803,41 @@ impl<'a> Router<'a> {
         let ms: Vec<(NetMaps, Vec<Stub>)> = jobs
             .par_iter()
             .map(|j| {
+                let base = fixed.and_then(|f| f.nets.get(&j.net));
                 let mut bb = BBox::empty();
                 for pn in &j.pins {
                     bb.add(pn.at);
+                }
+                if exclude.is_some() {
+                    // fixed maps: one window for every placement of the moving parts
+                    bb = region;
+                }
+                // existing copper of the components (clipped to the region) can be a start too
+                for sd in j.copper.iter().filter(|s| !s.fill) {
+                    let cb = sd.shape.bbox();
+                    for q in [P { x: cb.x0, y: cb.y0 }, P { x: cb.x1, y: cb.y1 }] {
+                        bb.add(geom::p(
+                            q.x.clamp(region.x0, region.x1),
+                            q.y.clamp(region.y0, region.y1),
+                        ));
+                    }
                 }
                 let bb = bb.inflate(jm);
                 let ox = (((bb.x0 - gs.x0) / gs.res).floor().max(0.0) as usize).min(gs.nx - 1);
                 let oy = (((bb.y0 - gs.y0) / gs.res).floor().max(0.0) as usize).min(gs.ny - 1);
                 let ex = (((bb.x1 - gs.x0) / gs.res).ceil().max(0.0) as usize).clamp(ox + 1, gs.nx);
                 let ey = (((bb.y1 - gs.y0) / gs.res).ceil().max(0.0) as usize).clamp(oy + 1, gs.ny);
-                let g = GridSpec {
+                let mut g = GridSpec {
                     x0: gs.x0 + ox as f64 * gs.res,
                     y0: gs.y0 + oy as f64 * gs.res,
                     res: gs.res,
                     nx: ex - ox,
                     ny: ey - oy,
                 };
+                let (mut ox, mut oy) = (ox, oy);
+                if let Some(nb) = base {
+                    (ox, oy, g) = (nb.ox, nb.oy, nb.g);
+                }
                 let wb = g.bbox().inflate(maxd + 2.0);
                 // locked pours of the net's own class (e.g. a guard pour of the same class) refill
                 // around this net's copper with their own clearance -> not an obstacle
@@ -594,6 +846,7 @@ impl<'a> Router<'a> {
                     .iter()
                     .filter(|o| {
                         o.bbox.overlaps(&wb)
+                            && !exclude.is_some_and(|mv| is_moving(o, mv))
                             && !(p.yield_same_class
                                 && matches!(o.kind, Kind::Zone)
                                 && o.net != 0 // net-less copper never refills
@@ -602,15 +855,39 @@ impl<'a> Router<'a> {
                     .cloned()
                     .collect();
                 let objs = &objs;
-                let t: Vec<Vec<u8>> = (0..NL)
-                    .map(|l| track_map(m, &g, j.net, j.hw + p.margin, l, objs))
-                    .collect();
-                let tn: Vec<Vec<u8>> = (0..NL)
-                    .map(|l| track_map(m, &g, j.net, j.hn + p.margin, l, objs))
-                    .collect();
-                let v = via_map(m, &g, j.net, j.vr + p.margin, j.dr, objs);
+                let (t, tn, v) = match (base, fixed) {
+                    (Some(nb), Some(f)) => {
+                        // stamp only the moving footprints into copies of the fixed maps
+                        let dynv: Vec<Obj> = objs
+                            .iter()
+                            .filter(|o| is_moving(o, &f.moving))
+                            .cloned()
+                            .collect();
+                        let (mut t, mut tn, mut v) = (nb.t.clone(), nb.tn.clone(), nb.v.clone());
+                        for l in 0..NL {
+                            track_stamp(m, &g, j.net, j.hw + p.margin, l, &dynv, &mut t[l]);
+                            track_stamp(m, &g, j.net, j.hn + p.margin, l, &dynv, &mut tn[l]);
+                        }
+                        via_stamp(m, &g, j.net, j.vr + p.margin, j.dr, &dynv, &mut v);
+                        (t, tn, v)
+                    }
+                    _ => (
+                        (0..NL)
+                            .map(|l| track_map(m, &g, j.net, j.hw + p.margin, l, objs))
+                            .collect(),
+                        (0..NL)
+                            .map(|l| track_map(m, &g, j.net, j.hn + p.margin, l, objs))
+                            .collect(),
+                        via_map(m, &g, j.net, j.vr + p.margin, j.dr, objs),
+                    ),
+                };
                 let mut neck = vec![false; g.n()];
-                for pn in &j.pins {
+                // courtyard neck-down rule: narrow width inside those courtyards only
+                for &fi in &j.neck_fps {
+                    let c = m.b.fps[fi].crtyd_world();
+                    g.fill_poly(&c, &mut |x, y| neck[g.idx(x, y)] = true);
+                }
+                for pn in j.pins.iter().filter(|_| j.neck_fps.is_empty()) {
                     let f = &m.b.fps[pn.fp];
                     for s in f.pad_shapes(&f.pads[pn.pad]) {
                         g.stamp(&s, p.neck, |x, y| neck[g.idx(x, y)] = true);
@@ -647,7 +924,7 @@ impl<'a> Router<'a> {
             })
             .collect();
         let (maps, stubs): (Vec<NetMaps>, Vec<Vec<Stub>>) = ms.into_iter().unzip();
-        eprintln!(
+        dlog!(
             "[droute] grid {}x{} @ {} mm, {} objects, {} nets to route, window cells {:.1} M, fixed maps in {:.2} s",
             gs.nx,
             gs.ny,
@@ -968,7 +1245,13 @@ impl<'a> Router<'a> {
             (b.x1 - b.x0) + (b.y1 - b.y0)
         };
         let mut order: Vec<usize> = (0..nj).collect();
-        order.sort_by(|a, b| hp(&self.jobs[*a]).partial_cmp(&hp(&self.jobs[*b])).unwrap());
+        // nets with the `first` intent lead, then the shortest nets
+        order.sort_by(|a, b| {
+            let (ja, jb) = (&self.jobs[*a], &self.jobs[*b]);
+            (!ja.prio.first, hp(ja))
+                .partial_cmp(&(!jb.prio.first, hp(jb)))
+                .unwrap()
+        });
         let mut need: Vec<usize> = order.clone();
         let mut pres = self.p.pres0;
         let mut routes = 0;
@@ -1014,7 +1297,7 @@ impl<'a> Router<'a> {
                 for (k, r, st, dt) in rs {
                     if dt > 2.0 {
                         let mp = &self.maps[k];
-                        eprintln!(
+                        dlog!(
                             "[droute]   slow net {}: {:.1} s, {} pins, window {}x{}, wave of {}, left {}",
                             self.m.b.nets[self.jobs[k].net],
                             dt,
@@ -1044,7 +1327,7 @@ impl<'a> Router<'a> {
             // conflicts of every net against all others
             let conf = self.conflicts(&routed, &cells, &vias);
             let total: usize = conf.iter().map(|c| c.len()).sum();
-            eprintln!(
+            dlog!(
                 "[droute] iter {it}: {} nets in {:.1} s, conflict cells {total}, nets in conflict {}, unrouted comps {}",
                 need.len(),
                 t_it.elapsed().as_secs_f64(),
@@ -1075,7 +1358,7 @@ impl<'a> Router<'a> {
                 if let Some(b) = best.take() {
                     if b.0 < total {
                         (routed, cells, vias, left) = (b.1, b.2, b.3, b.4);
-                        eprintln!(
+                        dlog!(
                             "[droute] stopped: back to the best iteration ({} conflict cells)",
                             b.0
                         );
@@ -1091,14 +1374,19 @@ impl<'a> Router<'a> {
             // no new best for `stall_iters` iterations: stop negotiating, rip and reroute hard
             let sw = self.p.stall_iters.max(1);
             let stalled = best_hist.len() > sw
-                && best_hist[best_hist.len() - sw..].iter().min().unwrap()
-                    >= best_hist[..best_hist.len() - sw].iter().min().unwrap();
+                && (*best_hist[best_hist.len() - sw..].iter().min().unwrap() as f32)
+                    >= (1.0 - self.p.stall_gain)
+                        * *best_hist[..best_hist.len() - sw].iter().min().unwrap() as f32;
             if total == 0 || it + 1 >= self.p.nego_iters || stalled || out_of_time {
                 hotspots = self.hotspots(&conf);
                 for h in hotspots.iter().take(10) {
-                    eprintln!(
+                    dlog!(
                         "[droute] hotspot {}: {} conflict cells around ({:.2}, {:.2}) {}",
-                        self.m.b.nets[h.net], h.cells, h.x, h.y, h.layer
+                        self.m.b.nets[h.net],
+                        h.cells,
+                        h.x,
+                        h.y,
+                        h.layer
                     );
                 }
                 if total > 0 && dbg {
@@ -1189,7 +1477,7 @@ impl<'a> Router<'a> {
             .filter(|k| left[*k] > 0)
             .map(|k| (self.jobs[k].net, left[k]))
             .collect();
-        let why = (0..nj)
+        let why: Vec<&'static str> = (0..nj)
             .filter(|k| left[*k] > 0)
             .map(
                 |k| match self.why[k].load(std::sync::atomic::Ordering::Relaxed) {
@@ -1200,16 +1488,7 @@ impl<'a> Router<'a> {
                 },
             )
             .collect();
-        let conns = self
-            .jobs
-            .iter()
-            .map(|j| {
-                let mut c: Vec<usize> = j.pins.iter().map(|p| p.comp).collect();
-                c.sort();
-                c.dedup();
-                c.len() - 1
-            })
-            .sum();
+        let conns = self.jobs.iter().map(|j| j.comps.len() - 1).sum();
         let mut stats = AesStats::default();
         for x in &nst {
             stats.pins += x.pins;
@@ -1295,7 +1574,7 @@ impl<'a> Router<'a> {
             }
         }
         // exact verification of all routed copper (fixed objects + other nets)
-        let fails: Vec<String> = (0..nj)
+        let fails: Vec<(usize, String)> = (0..nj)
             .into_par_iter()
             .flat_map(|k| {
                 let fr = self.foreign(k, &routed);
@@ -1306,9 +1585,18 @@ impl<'a> Router<'a> {
                     if !ck.seg_ok_fixed(job.net, sg.a, sg.b, hw, sg.l)
                         || !ck.seg_ok_foreign(job.net, sg.a, sg.b, hw, sg.l, &fr)
                     {
-                        out.push(format!(
-                            "{} {} ({:.3},{:.3})-({:.3},{:.3}) w {}",
-                            self.m.b.nets[job.net], CU[sg.l], sg.a.x, sg.a.y, sg.b.x, sg.b.y, sg.w
+                        out.push((
+                            k,
+                            format!(
+                                "{} {} ({:.3},{:.3})-({:.3},{:.3}) w {}",
+                                self.m.b.nets[job.net],
+                                CU[sg.l],
+                                sg.a.x,
+                                sg.a.y,
+                                sg.b.x,
+                                sg.b.y,
+                                sg.w
+                            ),
                         ));
                     }
                 }
@@ -1317,10 +1605,28 @@ impl<'a> Router<'a> {
             .collect();
         stats.exact_fail = fails.len();
         if dbg {
-            for f in &fails {
+            for (_, f) in &fails {
                 eprintln!("[dbg] exact check fails: {f}");
             }
         }
+        // never write copper that fails the exact check: such a net is dropped (left open)
+        let mut failed = failed;
+        let mut why = why;
+        let mut bad: Vec<usize> = fails.iter().map(|(k, _)| *k).collect();
+        bad.sort();
+        bad.dedup();
+        for &k in &bad {
+            eprintln!(
+                "[route] {}: routed copper fails the exact clearance check, net dropped (left open)",
+                self.m.b.nets[self.jobs[k].net]
+            );
+            routed[k] = RNet::default();
+            if !failed.iter().any(|(n, _)| *n == self.jobs[k].net) {
+                failed.push((self.jobs[k].net, 1));
+                why.push("exact-check");
+            }
+        }
+        stats.exact_dropped = bad.len();
         DResult {
             stats,
             routed: (0..nj)
@@ -1396,9 +1702,7 @@ impl<'a> Router<'a> {
         let mp = &self.maps[k];
         let n = mp.g.n();
         let soft = nego.is_some();
-        let mut comp_ids: Vec<usize> = job.pins.iter().map(|p| p.comp).collect();
-        comp_ids.sort();
-        comp_ids.dedup();
+        let comp_ids: Vec<usize> = job.comps.clone();
         let nc = comp_ids.len();
         let stubs = &self.stubs[k];
         // usable stubs and their start cost
@@ -1464,6 +1768,53 @@ impl<'a> Router<'a> {
                     }
                 }
             }
+        }
+        // existing tracks and vias of each component: start/target cells too (a pad boxed in by
+        // other copper still joins through its own via or a dangling track end)
+        for sd in &job.copper {
+            let Ok(ci) = comp_ids.binary_search(&sd.comp) else {
+                continue;
+            };
+            for l in 0..NL {
+                if sd.layers & (1 << l) == 0 {
+                    continue;
+                }
+                let mut add = |i: usize| {
+                    if self.wi(k, i).is_some() && ok(l, i) && !node_stub.contains_key(&(l, i)) {
+                        comp_cells[ci].push((l, i));
+                        // a via end is pulled to the via centre (like a pad end)
+                        if let Some(c) = sd.via_at {
+                            pad_of.entry((l, i)).or_insert(c);
+                        }
+                    }
+                };
+                match (&sd.shape, sd.fill) {
+                    (Shape::Poly { pts, .. }, true) => {
+                        // fill: window cells only; rim + every 4th interior cell
+                        let g = mp.g;
+                        let gi = |x: usize, y: usize| (mp.oy + y) * self.gs.nx + mp.ox + x;
+                        g.fill_poly(pts, &mut |x, y| {
+                            if x % 4 == 0 && y % 4 == 0 {
+                                add(gi(x, y));
+                            }
+                        });
+                        let n = pts.len();
+                        for e in 0..n {
+                            let rim = Shape::Capsule {
+                                a: pts[e],
+                                b: pts[(e + 1) % n],
+                                r: 0.0,
+                            };
+                            g.stamp(&rim, g.res * 0.75, |x, y| add(gi(x, y)));
+                        }
+                    }
+                    _ => self.gs.stamp(&sd.shape, 0.0, |x, y| add(self.gs.idx(x, y))),
+                }
+            }
+        }
+        for cc in comp_cells.iter_mut() {
+            cc.sort_unstable();
+            cc.dedup();
         }
         let info = |c: &(usize, usize), used: &[Option<P>]| -> (f32, u8) {
             match node_stub.get(c) {
@@ -1757,6 +2108,8 @@ impl<'a> Router<'a> {
         )
     }
 
+    /// [`Self::astar_win_in`] with this thread's search buffers (reused across searches, so a
+    /// search costs the nodes it touches, not the size of its window)
     #[allow(clippy::too_many_arguments)]
     fn astar_win(
         &self,
@@ -1770,6 +2123,29 @@ impl<'a> Router<'a> {
         o: &Owners,
         nego: Nego,
         win: (i32, i32, i32, i32),
+    ) -> Option<(Vec<(usize, usize)>, usize)> {
+        let mut sc = SCRATCH.with(|c| c.take());
+        let r = self.astar_win_in(
+            k, src, src_info, tmark, tinfo, tree_mark, bbs, o, nego, win, &mut sc,
+        );
+        SCRATCH.with(|c| c.replace(sc));
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn astar_win_in(
+        &self,
+        k: usize,
+        src: &[(usize, usize)],
+        src_info: &HashMap<(usize, usize), (f32, u8)>,
+        tmark: &[u16],
+        tinfo: &HashMap<usize, (f32, u8)>,
+        tree_mark: &[bool],
+        bbs: &[(i32, i32, i32, i32)],
+        o: &Owners,
+        nego: Nego,
+        win: (i32, i32, i32, i32),
+        sc: &mut Scratch,
     ) -> Option<(Vec<(usize, usize)>, usize)> {
         let mp = &self.maps[k];
         let nxg = self.gs.nx as i32;
@@ -1794,19 +2170,29 @@ impl<'a> Router<'a> {
             (l, (y * nxg + x) as usize)
         };
         let total = wn * NL;
-        let mut g = vec![f32::INFINITY; total];
-        let mut par = vec![u32::MAX; total];
-        let mut indir = vec![8u8; total];
-        // key of the newest heap entry per node: older entries are stale and skipped (lazy deletion)
-        let mut fkey = vec![u32::MAX; total];
+        sc.reset(total, wn);
+        let Scratch {
+            g,
+            par,
+            indir,
+            fkey,
+            hc,
+            touched,
+            htouched,
+        } = sc;
+        // g, par, indir: cost, parent and incoming direction per node; fkey: key of the newest
+        // heap entry per node (older entries are stale and skipped: lazy deletion); `touched`
+        // lists the nodes written, which the next search resets
         // heuristic per (x, y), shared by all layers, computed on first use
-        let hc = std::cell::RefCell::new(vec![f32::NAN; wn]);
+        let hc = std::cell::RefCell::new((hc, htouched));
         let h = |x: i32, y: i32| -> f32 {
             let ci = ((y - y0) as usize) * wx + (x - x0) as usize;
-            let mut hc = hc.borrow_mut();
+            let mut b = hc.borrow_mut();
+            let (hc, ht) = &mut *b;
             if !hc[ci].is_nan() {
                 return hc[ci];
             }
+            ht.push(ci as u32);
             let mut best = i32::MAX as f32;
             for b in bbs {
                 let dx = (b.0 - x).max(0).max(x - b.2) as f32;
@@ -1831,6 +2217,9 @@ impl<'a> Router<'a> {
             let (c0, d0) = src_info.get(&(l, i)).cloned().unwrap_or((0.0, 8));
             let ln = loc(l, i);
             if c0 < g[ln] {
+                if g[ln] == f32::INFINITY {
+                    touched.push(ln as u32);
+                }
                 g[ln] = c0;
                 indir[ln] = d0;
                 fkey[ln] = key(c0 + self.p.hweight * h((i as i32) % nxg, (i as i32) / nxg));
@@ -1894,11 +2283,18 @@ impl<'a> Router<'a> {
                 }
             }
         };
+        // routing intent of this net scales the bend, direction and via costs
+        let pr = self.jobs[k].prio;
+        let (bend_cost, wrong_dir, via_cost) = (
+            self.p.bend_cost * pr.bend,
+            self.p.wrong_dir * pr.dir,
+            self.p.via_cost * pr.via,
+        );
         let bend = |t: u8| -> f32 {
             match t {
                 0 => 0.0,
-                1 => self.p.bend_cost,
-                _ => self.p.bend_cost * self.p.bend90,
+                1 => bend_cost,
+                _ => bend_cost * self.p.bend90,
             }
         };
         let mut expanded = 0u64;
@@ -1957,9 +2353,9 @@ impl<'a> Router<'a> {
                 if !is_outer(l) {
                     let wrong = if dirpref[l] == 0 { *dx == 0 } else { *dy == 0 };
                     if wrong {
-                        c *= 1.0 + self.p.wrong_dir;
+                        c *= 1.0 + wrong_dir;
                     } else if *dx != 0 && *dy != 0 {
-                        c *= 1.0 + 0.5 * self.p.wrong_dir;
+                        c *= 1.0 + 0.5 * wrong_dir;
                     }
                 }
                 c += bend(t) + extra;
@@ -1976,6 +2372,9 @@ impl<'a> Router<'a> {
                 let nn = l * wn + ((yy - y0) as usize) * wx + (xx - x0) as usize;
                 let ng = gc + c;
                 if ng < g[nn] {
+                    if g[nn] == f32::INFINITY {
+                        touched.push(nn as u32);
+                    }
                     g[nn] = ng;
                     par[nn] = ln as u32;
                     indir[nn] = d as u8;
@@ -2006,8 +2405,11 @@ impl<'a> Router<'a> {
                             tc = c2;
                         }
                     }
-                    let ng = gc + self.p.via_cost + pen + extra + tc;
+                    let ng = gc + via_cost + pen + extra + tc;
                     if ng < g[nn] {
+                        if g[nn] == f32::INFINITY {
+                            touched.push(nn as u32);
+                        }
                         g[nn] = ng;
                         par[nn] = ln as u32;
                         indir[nn] = 8;
@@ -2683,21 +3085,37 @@ fn uuid(seed: &mut u64) -> String {
 
 /// append routed copper to the board text (unlocked, so it can be ripped by later runs)
 pub fn write_pcb(text: &str, nets: &[String], res: &DResult, out: &str) -> std::io::Result<()> {
-    std::fs::write(out, pcb_text(text, nets, res))
+    write_copper(text, nets, &res.routed, out)
+}
+
+/// append new copper per net (unlocked) to the board text and write it to `out`
+pub fn write_copper(
+    text: &str,
+    nets: &[String],
+    routed: &HashMap<usize, RNet>,
+    out: &str,
+) -> std::io::Result<()> {
+    std::fs::write(out, copper_text(text, nets, routed))
 }
 
 /// the board text with the routed copper appended (what `write_pcb` writes)
 pub fn pcb_text(text: &str, nets: &[String], res: &DResult) -> String {
-    // seeded from the input (FNV-1a): reproducible, but a run on an already routed board does
-    // not hand out the UUIDs of the earlier run's copper again
-    let mut seed = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
-        (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
-    }) | 1;
+    copper_text(text, nets, &res.routed)
+}
+
+/// the board text with new copper per net (unlocked) appended
+fn copper_text(text: &str, nets: &[String], routed: &HashMap<usize, RNet>) -> String {
+    // seed from the board text: copper added to an output of an earlier run gets new uuids
+    let mut seed = 0x1234_5678_9abc_def1u64;
+    for b in text.bytes().step_by(97).chain(text.len().to_le_bytes()) {
+        seed = (seed ^ b as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    seed |= 1;
     let mut add = String::new();
-    let mut keys: Vec<&usize> = res.routed.keys().collect();
+    let mut keys: Vec<&usize> = routed.keys().collect();
     keys.sort();
     for &net in keys {
-        let rn = &res.routed[&net];
+        let rn = &routed[&net];
         let name = crate::sexpr::q(&nets[net]);
         for s in &rn.segs {
             add += &format!(

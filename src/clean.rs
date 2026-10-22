@@ -28,6 +28,8 @@ pub struct Checker<'a> {
     pub m: &'a Model<'a>,
     /// locked pours of the routed net's own class yield (as in the router's maps)
     pub yield_same_class: bool,
+    /// floor (mm) on the via clearance to copper of other nets (0 = rules only)
+    pub min_clr: f64,
     objs: &'a [Obj],
     bs: f64,
     x0: f64,
@@ -75,6 +77,7 @@ impl<'a> Checker<'a> {
         Checker {
             m,
             yield_same_class: true,
+            min_clr: 0.0,
             objs,
             bs,
             x0,
@@ -115,6 +118,12 @@ impl<'a> Checker<'a> {
         if m.net_layers[net] & (1 << l) == 0 {
             return false;
         }
+        // copper that lies inside an own pad adds nothing: only the part outside is checked (a
+        // stub from the centre of a pad that already sits closer to another net than the rule,
+        // e.g. LV pins of an isolator next to its HV pins, #53)
+        let Some((a, b)) = self.clip_own_pads(net, a, b, hw, l) else {
+            return true;
+        };
         let cl = Shape::Capsule { a, b, r: 0.0 };
         let mut bb = cl.bbox().inflate(self.reach + hw);
         bb.x0 -= 0.0;
@@ -179,17 +188,72 @@ impl<'a> Checker<'a> {
                 return false;
             }
         }
-        if let Some(outl) = m.b.edge.first() {
-            if !point_in_poly(a, outl) || !point_in_poly(b, outl) {
-                return false;
-            }
+        if !m.b.inside(a) || !m.b.inside(b) {
+            return false;
         }
         true
+    }
+
+    /// the part of a-b that is checked against other copper when an end lies inside a pad of
+    /// `net` on layer l (the track's disk there inside the pad): the track from that end until
+    /// its centre leaves the pad, plus its half width, is the pad's own copper. None when the
+    /// whole track lies inside own pads
+    fn clip_own_pads(&self, net: usize, a: P, b: P, hw: f64, l: usize) -> Option<(P, P)> {
+        let len = (b - a).len();
+        if net == 0 || len < 1e-12 {
+            return Some((a, b));
+        }
+        let mut cand = Vec::new();
+        // largest t in [0, 1] up to which the centre stays in an own pad (pads are convex: one
+        // interval from the end), plus the half width
+        let covered = |from: P, to: P, cand: &mut Vec<u32>| -> f64 {
+            self.near(&BBox::empty_at(from), cand);
+            let mut best: f64 = 0.0;
+            for &k in cand.iter() {
+                let o = &self.objs[k as usize];
+                if o.net != net || o.layers & (1 << l) == 0 || !matches!(o.kind, Kind::Pad { .. }) {
+                    continue;
+                }
+                if depth(&o.shape, from) < hw {
+                    continue;
+                }
+                let at = |t: f64| from + (to - from) * t;
+                if depth(&o.shape, to) >= hw {
+                    return 1.0;
+                }
+                let (mut lo, mut hi) = (0.0, 1.0);
+                for _ in 0..30 {
+                    let mid = 0.5 * (lo + hi);
+                    if depth(&o.shape, at(mid)) >= 0.0 {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                best = best.max(lo + hw / len);
+            }
+            best.min(1.0)
+        };
+        let ta = covered(a, b, &mut cand);
+        if ta >= 1.0 {
+            return None;
+        }
+        let tb = covered(b, a, &mut cand);
+        if ta + tb >= 1.0 {
+            return None;
+        }
+        Some((a + (b - a) * ta, b + (a - b) * tb))
     }
 
     /// through via (radius vr incl. margin, drill radius dr) legal for `net` against fixed objects
     /// (same semantics as sites::via_map)
     pub fn via_ok_fixed(&self, net: usize, at: P, vr: f64, dr: f64) -> bool {
+        self.via_block_fixed(net, at, vr, dr).is_none()
+    }
+
+    /// what blocks a through via at `at` (None = legal; see [`Checker::via_ok_fixed`]):
+    /// "keepout", "pad", "copper", "mask", "hole", "edge"
+    pub fn via_block_fixed(&self, net: usize, at: P, vr: f64, dr: f64) -> Option<&'static str> {
         let m = self.m;
         let via_pad_gap = 0.2;
         let pt = Shape::circle(at, 0.0);
@@ -219,6 +283,9 @@ impl<'a> Checker<'a> {
                             continue;
                         }
                         let mut c = m.clr(net, o, l);
+                        if c >= 0.0 && o.net != net {
+                            c = c.max(self.min_clr);
+                        }
                         if matches!(o.kind, Kind::Pad { .. }) {
                             c = c.max(via_pad_gap);
                         }
@@ -235,7 +302,12 @@ impl<'a> Checker<'a> {
                 }
             }
             if d >= 0.0 && o.shape.dist(at) <= d {
-                return false;
+                return Some(match o.kind {
+                    Kind::Keepout { .. } | Kind::ViaKeepout => "keepout",
+                    Kind::Pad { .. } => "pad",
+                    Kind::Mask { .. } => "mask",
+                    _ => "copper",
+                });
             }
             if o.hole_r > 0.0 {
                 let ctr = match &o.shape {
@@ -245,22 +317,20 @@ impl<'a> Checker<'a> {
                     }
                 };
                 if (ctr - at).len() <= m.r.min_hole_to_hole + o.hole_r + dr {
-                    return false;
+                    return Some("hole");
                 }
             }
         }
         let e = m.r.edge_clearance(net) + vr;
         for (p0, p1) in &m.b.edge_segs {
             if dist_seg(at, *p0, *p1) <= e {
-                return false;
+                return Some("edge");
             }
         }
-        if let Some(outl) = m.b.edge.first() {
-            if !point_in_poly(at, outl) {
-                return false;
-            }
+        if !m.b.inside(at) {
+            return Some("edge");
         }
-        true
+        None
     }
 
     pub fn via_ok_foreign(&self, net: usize, at: P, vr: f64, dr: f64, foreign: &[FItem]) -> bool {

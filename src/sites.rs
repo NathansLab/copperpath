@@ -80,6 +80,21 @@ fn obj_code(o: &Obj, m: &Model) -> u8 {
 /// via blocker map for net `net` with via radius vr and drill radius dr
 pub fn via_map(m: &Model, gs: &GridSpec, net: usize, vr: f64, dr: f64, objs: &[Obj]) -> Vec<u8> {
     let mut map = vec![R_FREE; gs.n()];
+    via_stamp(m, gs, net, vr, dr, objs, &mut map);
+    edge_block(m, gs, net, vr, &mut map);
+    map
+}
+
+/// stamps the via blockers of `objs` into the free cells of `map` (no board edge)
+pub fn via_stamp(
+    m: &Model,
+    gs: &GridSpec,
+    net: usize,
+    vr: f64,
+    dr: f64,
+    objs: &[Obj],
+    map: &mut [u8],
+) {
     let via_pad_gap = 0.2; // via-to-pad gap: no via in or touching a pad (any net)
     for o in objs {
         let code = obj_code(o, m);
@@ -146,13 +161,34 @@ pub fn via_map(m: &Model, gs: &GridSpec, net: usize, vr: f64, dr: f64, objs: &[O
             });
         }
     }
-    edge_block(m, gs, net, vr, &mut map);
-    map
 }
 
 /// track blocker map on layer l for net `net` with half width hw
 pub fn track_map(m: &Model, gs: &GridSpec, net: usize, hw: f64, l: usize, objs: &[Obj]) -> Vec<u8> {
     let mut map = vec![R_FREE; gs.n()];
+    track_stamp(m, gs, net, hw, l, objs, &mut map);
+    if m.net_layers[net] & (1 << l) == 0 {
+        for v in map.iter_mut() {
+            if *v == R_FREE {
+                *v = K_KEEPOUT | ((l as u8) << 4);
+            }
+        }
+    }
+    edge_block(m, gs, net, hw, &mut map);
+    map
+}
+
+/// stamps the track blockers of `objs` on layer l into the free cells of `map` (no board edge,
+/// no layer restriction of the net)
+pub fn track_stamp(
+    m: &Model,
+    gs: &GridSpec,
+    net: usize,
+    hw: f64,
+    l: usize,
+    objs: &[Obj],
+    map: &mut [u8],
+) {
     for o in objs {
         if o.layers & (1 << l) == 0 {
             continue;
@@ -211,15 +247,6 @@ pub fn track_map(m: &Model, gs: &GridSpec, net: usize, hw: f64, l: usize, objs: 
             );
         }
     }
-    if m.net_layers[net] & (1 << l) == 0 {
-        for v in map.iter_mut() {
-            if *v == R_FREE {
-                *v = K_KEEPOUT | ((l as u8) << 4);
-            }
-        }
-    }
-    edge_block(m, gs, net, hw, &mut map);
-    map
 }
 
 fn edge_block(m: &Model, gs: &GridSpec, net: usize, r: f64, map: &mut [u8]) {
@@ -241,11 +268,11 @@ fn edge_block(m: &Model, gs: &GridSpec, net: usize, r: f64, map: &mut [u8]) {
         );
     }
     // outside the outline
-    if let Some(outl) = m.b.edge.first() {
+    if !m.b.edge.is_empty() {
         for iy in 0..gs.ny {
             for ix in 0..gs.nx {
                 let i = gs.idx(ix, iy);
-                if map[i] == R_FREE && !point_in_poly(gs.center(ix, iy), outl) {
+                if map[i] == R_FREE && !m.b.inside(gs.center(ix, iy)) {
                     map[i] = K_EDGE;
                 }
             }
