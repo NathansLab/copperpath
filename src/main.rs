@@ -31,6 +31,7 @@ commands:
   nudge     move small parts locally until their nets route (--parts R5,R7 | --spec | --auto --out)
   render    PNG of a board region: layers, pads with labels, opens, DRC markers (--roi --out)
   plane     planes: list | report | fill | create | adjust (native zone filler, no kicad-cli)
+  autoroute one command: plane fanout, routing, reroute, stitching, quality gate (--out --time)
   explain   why a connection is open: blockers, corridor width, ROI image (--net [--pad])
 
 common options:
@@ -188,6 +189,11 @@ pub fn load_ctx(a: &Args) -> Result<Ctx, String> {
         Some(path) => model::load_cfg(path, a.get("board"))?,
         None => model::BoardCfg::default(),
     };
+    // plane nets given on the command line (autoroute): not routed as signals
+    if let Some(pn) = a.get("plane-nets") {
+        cfg.plane_nets
+            .extend(pn.split(',').filter(|s| !s.is_empty()).map(String::from));
+    }
     if let Some(y) = a.get("yield-pours") {
         cfg.yield_pours
             .extend(y.split(',').filter(|s| !s.is_empty()).map(String::from));
@@ -248,6 +254,7 @@ fn main() {
         "render" => cmd_render(&a),
         "explain" => cmd_explain(&a),
         "plane" => cmd_plane(&a),
+        "autoroute" => cmd_autoroute(&a),
         "" => Err(format!("no command given\n{USAGE}")),
         c => Err(format!("unknown command '{c}'\n{USAGE}")),
     };
@@ -288,9 +295,21 @@ fn main() {
     }
 }
 
-const KNOWN: [&str; 13] = [
-    "check", "place", "route", "opens", "pads", "hints", "netclass", "stitch", "fanout", "nudge",
-    "render", "plane", "explain",
+const KNOWN: [&str; 14] = [
+    "check",
+    "place",
+    "route",
+    "opens",
+    "pads",
+    "hints",
+    "netclass",
+    "stitch",
+    "fanout",
+    "nudge",
+    "render",
+    "plane",
+    "explain",
+    "autoroute",
 ];
 
 fn write_file(path: &str, data: &str) -> Result<(), String> {
@@ -1125,7 +1144,19 @@ fn route_once(a: &Args) -> CmdResult {
     } else {
         None
     };
-    if !res.failed.is_empty() && p.clean && !halted() {
+    // only failures the cleanup can have caused rerun the route (#54): nets whose search failed
+    // (no path, node cap, window exhausted) fail at every cleanup level
+    let search_fail = |w: &str| {
+        w.starts_with("no path") || w.starts_with("node cap") || w.starts_with("job window")
+    };
+    let cleanup_suspect = res.why.iter().any(|w| !search_fail(w));
+    if !cleanup_suspect && !res.failed.is_empty() {
+        eprintln!(
+            "[route] {} failed nets, all search failures: no cleanup fallback",
+            res.failed.len()
+        );
+    }
+    if !res.failed.is_empty() && cleanup_suspect && p.clean && !halted() {
         // both fallback levels run at the same time (a route mostly uses one core); the choice
         // is the same as trying them one after the other
         let run_level = |slide: bool, clean: bool| {
@@ -1250,7 +1281,7 @@ fn route_once(a: &Args) -> CmdResult {
         "out": out, "nets": r.jobs.len(), "connections": res.conns, "segments": nseg, "vias": nvia, "length_mm": check::round2(len),
         "routes": res.routes, "rips": res.rips, "opens": opens,
         "open_nets": open_nets.iter().map(|(n, k, _)| json!({"net": n, "opens": k})).collect::<Vec<_>>(),
-        "aes": {"cleanup_level": level, "pins": s.pins, "pins_no_stub": s.pins_no_stub, "stub_ends": s.stubs_used, "short_stubs": s.short_stubs, "fallback_ends": s.fallback_ends, "aligned": s.aligned, "align_failed": s.align_failed, "pulls": s.pulls, "mitered": s.mitered, "miter_kept_90": s.miter_failed, "stub_end_shifts": s.shifted, "axis_jogs": s.jogs, "kept90_by_cause": {"clearance": s.kept90[0], "L_between_stubs": s.kept90[1], "shift_blocked": s.kept90[2], "Z_U_too_short": s.kept90[3], "short_legs": s.kept90[4]}, "exact_fail": s.exact_fail},
+        "aes": {"cleanup_level": level, "pins": s.pins, "pins_no_stub": s.pins_no_stub, "stub_ends": s.stubs_used, "short_stubs": s.short_stubs, "fallback_ends": s.fallback_ends, "aligned": s.aligned, "align_failed": s.align_failed, "pulls": s.pulls, "mitered": s.mitered, "miter_kept_90": s.miter_failed, "stub_end_shifts": s.shifted, "axis_jogs": s.jogs, "kept90_by_cause": {"clearance": s.kept90[0], "L_between_stubs": s.kept90[1], "shift_blocked": s.kept90[2], "Z_U_too_short": s.kept90[3], "short_legs": s.kept90[4]}, "exact_fail": s.exact_fail, "exact_dropped": s.exact_dropped},
         "drc": drc, "search_s": check::round2(dt),
         "failed": res.failed.iter().map(|(n, l)| json!([c.board.nets[*n], l])).collect::<Vec<_>>(),
         "warnings": warnings,
@@ -1974,7 +2005,10 @@ fn nets_regex(c: &Ctx, pat: &str) -> Result<Vec<usize>, String> {
 
 /// plane list | report | fill | create | adjust
 fn cmd_plane(a: &Args) -> CmdResult {
-    let sub = std::env::args().nth(2).unwrap_or_default();
+    let sub = a
+        .get("_sub")
+        .map(String::from)
+        .unwrap_or_else(|| std::env::args().nth(2).unwrap_or_default());
     match sub.as_str() {
         "list" => {
             let c = load_ctx(a)?;
@@ -2380,7 +2414,7 @@ fn explain_post(a: &Args, mut v: Value) -> CmdResult {
     }
     let sub = std::env::args().nth(2).unwrap_or_default();
     match a.cmd.as_str() {
-        "route" => {
+        "route" | "autoroute" => {
             let Some(out) = v["out"].as_str().map(String::from) else {
                 return Ok(v);
             };
@@ -2544,4 +2578,428 @@ fn blocker_from(v: &Value) -> Option<model::Blocker> {
         locked: v["locked"].as_bool().unwrap_or(false),
         at: [v["at"][0].as_f64()?, v["at"][1].as_f64()?],
     })
+}
+
+/// a stage of `autoroute`
+struct Stage {
+    name: &'static str,
+    out: String,
+    secs: f64,
+    opens: Option<usize>,
+    ok: bool,
+    note: String,
+    detail: Value,
+}
+
+/// opens of every net (plane nets included, zones filled natively)
+fn opens_all(a: &Args, pcb: &str, base: &Ctx) -> Result<(usize, Vec<Value>), String> {
+    let mut kv = vec![("pcb", pcb), ("native-fill", "1")];
+    if !base.pro.is_empty() {
+        kv.push(("pro", &base.pro));
+    }
+    if std::path::Path::new(&base.dru).is_file() {
+        kv.push(("dru", &base.dru));
+    }
+    let c = load_ctx_filled(&args_with(a, &kv))?;
+    let all: std::collections::HashSet<usize> = (1..c.board.nets.len()).collect();
+    let (total, per) = count_opens(&c, None, Some(&all));
+    Ok((
+        total,
+        per.iter()
+            .map(|(n, k, _)| json!({"net": n, "opens": k}))
+            .collect(),
+    ))
+}
+
+/// autoroute --pcb B --out OUT.kicad_pcb [--time 600] [--planes auto|In1.Cu=GND,In2.Cu=+3V3]
+/// [--plane-nets A,B] [--no-fanout] [--no-stitch] [--stitch-grid G] [--drc] [--allow-drc]
+/// [--explain] [--explain-img DIR]
+fn cmd_autoroute(a: &Args) -> CmdResult {
+    let t0 = Instant::now();
+    let budget = a.f("time", 600.0);
+    let c = load_ctx(a)?;
+    let out = out_path(a, &c, "autorouted.kicad_pcb")?;
+    let stem = out.trim_end_matches(".kicad_pcb").to_string();
+    let work = format!("{stem}_stages");
+    std::fs::create_dir_all(&work).map_err(|e| format!("{work}: {e}"))?;
+    let mut base_kv: Vec<(String, String)> = Vec::new();
+    if !c.pro.is_empty() {
+        base_kv.push(("pro".into(), c.pro.clone()));
+    }
+    if std::path::Path::new(&c.dru).is_file() {
+        base_kv.push(("dru".into(), c.dru.clone()));
+    }
+    let sub_args = |cmd: &str, kv: &[(&str, &str)]| -> Args {
+        let mut n = Args {
+            cmd: cmd.to_string(),
+            kv: a.kv.clone(),
+        };
+        for k in [
+            "out",
+            "time",
+            "json",
+            "explain",
+            "explain-img",
+            "planes",
+            "drc",
+            "net",
+        ] {
+            n.kv.remove(k);
+        }
+        for (k, v) in &base_kv {
+            n.kv.insert(k.clone(), v.clone());
+        }
+        for (k, v) in kv {
+            n.kv.insert(k.to_string(), v.to_string());
+        }
+        n
+    };
+    let left = || budget - t0.elapsed().as_secs_f64();
+    let mut stages: Vec<Stage> = Vec::new();
+    let mut cur = c.pcb.clone();
+    let (opens_in, _) = opens_all(a, &cur, &c)?;
+    eprintln!("[autoroute] input: {opens_in} opens, budget {budget:.0} s");
+
+    // 1. planes: zones from --planes L=NET (unless the net already has a zone on L)
+    let mut plane_nets: Vec<String> = a
+        .get("plane-nets")
+        .map(|s| {
+            s.split(',')
+                .filter(|x| !x.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(spec) = a.get("planes").filter(|s| *s != "auto") {
+        let t = Instant::now();
+        let mut made = Vec::new();
+        for item in spec.split(',').filter(|s| !s.is_empty()) {
+            let (layer, nets) = item
+                .split_once('=')
+                .ok_or(format!("--planes {item}: expected LAYER=NET"))?;
+            for net in nets.split('+') {
+                let have = c.board.zones.iter().any(|z| {
+                    !z.keepout
+                        && c.board.nets[z.net] == net
+                        && render::parse_layers(layer).is_ok_and(|m| z.layers & m != 0)
+                });
+                if have {
+                    continue;
+                }
+                let o = format!("{work}/1_plane_{}.kicad_pcb", made.len() + 1);
+                let r = plane_outline(
+                    &sub_args(
+                        "plane",
+                        &[
+                            ("pcb", &cur),
+                            ("net", net),
+                            ("layer", layer),
+                            ("out", &o),
+                            ("_sub", "create"),
+                        ],
+                    ),
+                    "create",
+                )?;
+                made.push(r);
+                cur = o;
+            }
+        }
+        stages.push(Stage {
+            name: "planes",
+            out: cur.clone(),
+            secs: t.elapsed().as_secs_f64(),
+            opens: None,
+            ok: true,
+            note: format!("{} zone(s) created", made.len()),
+            detail: json!(made),
+        });
+    }
+    // plane nets: given, plus every net with a copper zone
+    {
+        let b = board::load(&cur)?;
+        for z in b.zones.iter().filter(|z| !z.keepout && z.net != 0) {
+            let n = &b.nets[z.net];
+            if !plane_nets.contains(n) {
+                plane_nets.push(n.clone());
+            }
+        }
+    }
+    let pn = plane_nets.join(",");
+    eprintln!("[autoroute] plane nets: {pn}");
+    // zone name patterns per plane net: inner zones are the plane, outer ones the pours
+    let zone_pats = |pcb: &str, net: &str| -> Result<(String, String), String> {
+        let b = board::load(pcb)?;
+        let esc = |z: &board::Zone| regex::escape(&z.name);
+        let zs: Vec<&board::Zone> = b
+            .zones
+            .iter()
+            .filter(|z| !z.keepout && b.nets[z.net] == net && !z.name.is_empty())
+            .collect();
+        let inner: Vec<String> = zs
+            .iter()
+            .filter(|z| z.layers & 0x1e != 0)
+            .map(|z| esc(z))
+            .collect();
+        let outer: Vec<String> = zs
+            .iter()
+            .filter(|z| z.layers & 0x1e == 0)
+            .map(|z| esc(z))
+            .collect();
+        let plane = if inner.is_empty() {
+            outer.clone()
+        } else {
+            inner
+        };
+        Ok((plane.join("|"), outer.join("|")))
+    };
+    // 2. fanout of the plane nets
+    if a.get("no-fanout").is_none() && !plane_nets.is_empty() {
+        let t = Instant::now();
+        let mut det = Vec::new();
+        for net in &plane_nets {
+            if left() < budget * 0.5 {
+                break;
+            }
+            let (plane, _) = zone_pats(&cur, net)?;
+            if plane.is_empty() {
+                continue;
+            }
+            let o = format!("{work}/2_fanout_{}.kicad_pcb", det.len() + 1);
+            match cmd_fanout(&sub_args(
+                "fanout",
+                &[
+                    ("pcb", &cur),
+                    ("net", net),
+                    ("plane", &plane),
+                    ("out", &o),
+                    ("native-fill", "1"),
+                ],
+            )) {
+                Ok(v) => {
+                    det.push(json!({"net": net, "open_islands": v["open_islands"], "connected": v["connected"]}));
+                    cur = o;
+                }
+                Err(e) => det.push(json!({"net": net, "error": e})),
+            }
+        }
+        stages.push(Stage {
+            name: "fanout",
+            out: cur.clone(),
+            secs: t.elapsed().as_secs_f64(),
+            opens: None,
+            ok: true,
+            note: format!("{} plane net(s)", det.len()),
+            detail: json!(det),
+        });
+    }
+    // 3. signal routing (negotiated) + reroute of blockers, within the time left
+    {
+        let t = Instant::now();
+        let reserve = (budget * 0.15).clamp(5.0, 90.0);
+        let tl = (left() - reserve).max(10.0);
+        let o = format!("{work}/3_route.kicad_pcb");
+        let tls = format!("{tl:.0}");
+        let mut kv: Vec<(&str, &str)> = vec![("pcb", &cur), ("out", &o), ("time-limit", &tls)];
+        if !pn.is_empty() {
+            kv.push(("plane-nets", &pn));
+        }
+        if a.get("no-reroute").is_none() {
+            kv.push(("reroute-blockers", "1"));
+        }
+        match cmd_route_core(&sub_args("route", &kv)) {
+            Ok(v) => {
+                stages.push(Stage {
+                    name: "route",
+                    out: o.clone(),
+                    secs: t.elapsed().as_secs_f64(),
+                    opens: v["opens"].as_u64().map(|x| x as usize),
+                    ok: true,
+                    note: format!(
+                        "{} segments, {} vias, stopped: {}",
+                        v["segments"], v["vias"], v["stopped"]
+                    ),
+                    detail: json!({"open_nets": v["open_nets"], "aes_cleanup": v["aes"]["cleanup_level"], "exact_fail": v["aes"]["exact_fail"]}),
+                });
+                cur = o;
+            }
+            Err(e) => stages.push(Stage {
+                name: "route",
+                out: cur.clone(),
+                secs: t.elapsed().as_secs_f64(),
+                opens: None,
+                ok: false,
+                note: e,
+                detail: json!(null),
+            }),
+        }
+    }
+    // 3b. optional second pass (--second-pass) for the nets left open: wider search windows and a
+    // larger node budget, in the time left (no gain on the stress board so far, see README)
+    let open_sig: Vec<String> = stages
+        .last()
+        .filter(|s| s.name == "route")
+        .and_then(|s| s.detail["open_nets"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|n| n["net"].as_str().map(String::from))
+        .filter(|n| !n.contains([',', '*', '?']))
+        .collect();
+    if !open_sig.is_empty() && left() > budget * 0.25 && a.get("second-pass").is_some() {
+        let t = Instant::now();
+        let reserve = (budget * 0.1).clamp(5.0, 60.0);
+        let tls = format!("{:.0}", (left() - reserve).max(10.0));
+        let o = format!("{work}/3b_route.kicad_pcb");
+        let nets = open_sig.join(",");
+        let mut kv: Vec<(&str, &str)> = vec![
+            ("pcb", &cur),
+            ("out", &o),
+            ("time-limit", &tls),
+            ("nets", &nets),
+            ("job-margin", "20"),
+            ("max-expand", "20000000"),
+            ("reroute-blockers", "1"),
+        ];
+        if !pn.is_empty() {
+            kv.push(("plane-nets", &pn));
+        }
+        match cmd_route_core(&sub_args("route", &kv)) {
+            Ok(v) => {
+                let before = open_sig.len();
+                stages.push(Stage {
+                    name: "route2",
+                    out: o.clone(),
+                    secs: t.elapsed().as_secs_f64(),
+                    opens: v["opens"].as_u64().map(|x| x as usize),
+                    ok: true,
+                    note: format!("{before} open nets retried, {} vias added", v["vias"]),
+                    detail: json!({"open_nets": v["open_nets"]}),
+                });
+                cur = o;
+            }
+            Err(e) => stages.push(Stage {
+                name: "route2",
+                out: cur.clone(),
+                secs: t.elapsed().as_secs_f64(),
+                opens: None,
+                ok: false,
+                note: e,
+                detail: json!(null),
+            }),
+        }
+    }
+    // 4. stitching vias for outer pours of the plane nets
+    if a.get("no-stitch").is_none() && left() > 5.0 {
+        let t = Instant::now();
+        let mut det = Vec::new();
+        for net in &plane_nets {
+            let (plane, outer) = zone_pats(&cur, net)?;
+            if plane.is_empty() || outer.is_empty() || plane == outer {
+                continue;
+            }
+            let o = format!("{work}/4_stitch_{}.kicad_pcb", det.len() + 1);
+            let grid = a.s("stitch-grid", "0");
+            match cmd_stitch(&sub_args(
+                "stitch",
+                &[
+                    ("pcb", &cur),
+                    ("net", net),
+                    ("zones", &outer),
+                    ("plane", &plane),
+                    ("grid", &grid),
+                    ("out", &o),
+                    ("native-fill", "1"),
+                ],
+            )) {
+                Ok(v) => {
+                    det.push(json!({"net": net, "vias": v["vias"].as_array().map(|x| x.len()), "failed": v["failed"].as_array().map(|x| x.len())}));
+                    cur = o;
+                }
+                Err(e) => det.push(json!({"net": net, "error": e})),
+            }
+        }
+        if !det.is_empty() {
+            stages.push(Stage {
+                name: "stitch",
+                out: cur.clone(),
+                secs: t.elapsed().as_secs_f64(),
+                opens: None,
+                ok: true,
+                note: format!("{} net(s)", det.len()),
+                detail: json!(det),
+            });
+        }
+    }
+    // 5. quality gate: opens with native fills, KiCad DRC against the input (optional); the best
+    // stage without new DRC errors is written
+    let t = Instant::now();
+    let (opens_out, open_nets) = opens_all(a, &cur, &c)?;
+    let mut chosen = cur.clone();
+    let mut gate = json!({"drc": "skipped (use --drc with kicad-cli)"});
+    if a.get("drc").is_some() {
+        let mut cands: Vec<String> = stages.iter().rev().map(|s| s.out.clone()).collect();
+        cands.dedup();
+        let mut tried = Vec::new();
+        let mut found = None;
+        for cand in cands {
+            if cand == c.pcb {
+                continue;
+            }
+            let d = drc_delta(a, &c.pcb, &cand)?;
+            let ne = d["new_errors"].as_u64().unwrap_or(0);
+            tried.push(json!({"board": cand, "new_errors": ne, "new": d["new"]}));
+            if ne == 0 || a.get("allow-drc").is_some() {
+                found = Some(cand);
+                break;
+            }
+        }
+        match found {
+            Some(f) => chosen = f,
+            None => {
+                return Err(format!(
+                    "quality gate: every stage adds KiCad DRC errors (see {work}): {}; nothing written (--allow-drc writes anyway)",
+                    serde_json::to_string(&tried).unwrap_or_default()
+                ));
+            }
+        }
+        gate = json!({"drc": tried});
+    }
+    let (opens_final, open_final) = if chosen == cur {
+        (opens_out, open_nets)
+    } else {
+        opens_all(a, &chosen, &c)?
+    };
+    std::fs::copy(&chosen, &out).map_err(|e| format!("{out}: {e}"))?;
+    stages.push(Stage {
+        name: "gate",
+        out: chosen.clone(),
+        secs: t.elapsed().as_secs_f64(),
+        opens: Some(opens_final),
+        ok: true,
+        note: format!("written from {chosen}"),
+        detail: gate,
+    });
+    let total = t0.elapsed().as_secs_f64();
+    for s in &stages {
+        eprintln!(
+            "[autoroute] {:<7} {:>7.1} s  {}{}",
+            s.name,
+            s.secs,
+            s.opens.map(|o| format!("{o} opens  ")).unwrap_or_default(),
+            s.note
+        );
+    }
+    eprintln!(
+        "[autoroute] {opens_in} -> {opens_final} opens in {total:.1} s (budget {budget:.0} s) -> {out}"
+    );
+    Ok(json!({
+        "out": out,
+        "opens_before": opens_in,
+        "opens": opens_final,
+        "open_nets": open_final,
+        "plane_nets": plane_nets,
+        "budget_s": budget,
+        "within_budget": total <= budget,
+        "stages": stages.iter().map(|s| json!({"stage": s.name, "s": check::round2(s.secs), "ok": s.ok,
+            "opens": s.opens, "note": s.note, "out": s.out, "detail": s.detail})).collect::<Vec<_>>(),
+    }))
 }

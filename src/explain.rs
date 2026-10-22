@@ -293,10 +293,44 @@ pub fn explain(m: &Model, net: usize, a: &Pin, b: &Pin, margin: f64) -> Explain 
     };
     let r4 = |v: f64| (v * 1e4).round() / 1e4;
     let (fr, via) = w.free(hw, via_r, true);
-    if w.connect(&fr, &via, &sa, &sb).is_ok() {
+    if let Ok(path) = w.connect(&fr, &via, &sa, &sb) {
         ex.corridor_mm = Some(need);
+        // the router uses the minimum width only near the net's own pads (neck-down)
+        let opt = m.r.track_width(net).1;
+        if opt > need + 1e-6 {
+            let (fo, vo) = w.free(opt / 2.0, via_r, true);
+            if w.connect(&fo, &vo, &sa, &sb).is_err() {
+                ex.kind = "neck-down";
+                let pads: Vec<P> = [a, b].iter().map(|q| q.at).collect();
+                for &(k, i) in &path {
+                    let q = w.gs.center(i % w.gs.nx, i / w.gs.nx);
+                    if !fo[k][i] && pads.iter().all(|c| (q - *c).len() > 1.5) {
+                        ex.at = Some([r4(q.x), r4(q.y)]);
+                        ex.layer = Some(CU[w.layers[k]].to_string());
+                        ex.blockers = model::nearest_blockers(
+                            m,
+                            net,
+                            &Shape::circle(q, opt / 2.0),
+                            1 << w.layers[k],
+                            1.0,
+                            3,
+                        );
+                        break;
+                    }
+                }
+                let at = ex
+                    .at
+                    .map(|q| format!(" at ({:.2}, {:.2})", q[0], q[1]))
+                    .unwrap_or_default();
+                ex.reason = format!(
+                    "only the minimum width {need:.2} mm gets through{at}, the router allows it within 1.5 mm of the own pads only (net width {opt:.2} mm): {}",
+                    ex.blockers.iter().map(describe).collect::<Vec<_>>().join("; ")
+                );
+                return ex;
+            }
+        }
         ex.reason = format!(
-            "a legal corridor for {need:.2} mm exists: congestion or search budget (try --iters, --max-expand, --reroute-blockers, or a region route)"
+            "a legal corridor for {need:.2} mm exists (raster check incl. vias), the router did not find it: congestion, search budget or stub/via rules (try --reroute-blockers, --iters, --max-expand, --job-margin, a region route)"
         );
         return ex;
     }

@@ -719,7 +719,8 @@ pub fn fill_zones(m: &Model, sel: &dyn Fn(usize) -> bool, fp: &FillParams) -> Ve
 
 /// replace the saved fills (`Zone::fills`) of the selected zones by native fills; returns the
 /// number of fill polygons. Commands that read fills (`stitch`, `fanout`, `opens`, `route`)
-/// then work without kicad-cli.
+/// then work without kicad-cli. Islands without copper of the net are kept (a new plane has no
+/// via yet: `fanout` lands its vias on it; they hold no pads, so connectivity is unchanged).
 pub fn fill_board(
     b: &mut Board,
     r: &Rules,
@@ -731,7 +732,7 @@ pub fn fill_board(
         let m = Model::new(b, r, cfg.clone(), model::CopperMode::All);
         fill_zones(&m, sel, fp)
             .par_iter()
-            .map(|f| (f.zone, f.layer, f.polygons(false)))
+            .map(|f| (f.zone, f.layer, f.polygons(true)))
             .collect()
     };
     let mut cleared = std::collections::HashSet::new();

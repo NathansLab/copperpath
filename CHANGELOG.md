@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `autoroute`: placed board to routed board in one command within a time budget (`--time`):
+  plane zones (`--planes In1.Cu=GND`), plane fanout, negotiated signal routing with rip-up of
+  blockers, stitching, quality gate (opens with native fills, optional KiCad DRC against the
+  input; the latest stage without new errors is written). Per stage timing and opens in `--json`.
+- `scripts/make_stress.py`: synthetic 6-layer stress board generator for benchmarks.
 - `explain` and `--explain` / `--explain-img DIR` (route, fanout, stitch, plane report): a
   one-line reason per failure (`congestion`, `routed-copper` with rip-up candidates, `too-narrow`
   with the widest corridor, bottleneck and blockers, `enclosed`) and a ROI image of it.
@@ -69,6 +74,15 @@ All notable changes to this project are documented here. The format follows
   (all nets of a 6-layer board with 217 fills in about 1 s; per-net opens equal KiCad's DRC).
 
 ### Fixed
+- `route`: the cleanup fallback ladder (two more full routes) only runs when a failed net may have
+  been broken by the cleanup; pure search failures (no path, node cap, window) skip it (#54).
+  Route stage of the 800-part stress board: 217 s to 70 s, same opens.
+- Native fill keeps islands without copper of the net when it replaces saved fills
+  (`--native-fill`): a new plane without vias was dropped completely, so `fanout` found nothing
+  to land on.
+- Router: routed copper that fails the final exact clearance check is no longer written; the net
+  is dropped and reported open (before, two shorts could reach the file with `aes.exact_fail`
+  as the only hint; seen on the demo board with GND as a plane net).
 - `fanout --plane REGEX`: when the pattern also matches outer-layer pours of the net (F/B
   pours named like the plane), only the inner-layer fills count as the plane. A pad in an
   isolated outer pour fragment without a via is now an open island (before, every pad touching
