@@ -100,3 +100,53 @@ fn autoroute_two_layer_pour_net() {
         .collect();
     assert!(stages.contains(&"pours"), "{v}");
 }
+
+/// unnamed inner zone (boards from KiCad 5 have no zone names): the plane is still found by its
+/// key NET@LAYER and the GND pads are fanned out to it
+#[test]
+fn autoroute_unnamed_inner_plane() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("autoroute_unnamed");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pad = |r: &str, x: f64, y: f64, net: &str| {
+        format!(
+            "(footprint \"P\" (layer \"F.Cu\") (at {x} {y}) (property \"Reference\" \"{r}\") \
+             (pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\") (net \"{net}\")))"
+        )
+    };
+    let pcb = dir.join("unnamed.kicad_pcb");
+    std::fs::write(
+        &pcb,
+        format!(
+            "(kicad_pcb (version 20260206) (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" signal) \
+             (6 \"In2.Cu\" signal) (2 \"B.Cu\" signal) (25 \"Edge.Cuts\" user)) \
+             (gr_rect (start 0 0) (end 40 20) (stroke (width 0.1)) (layer \"Edge.Cuts\")) {}{}{}{} \
+             (zone (net \"GND\") (layers \"In1.Cu\") (connect_pads (clearance 0.3)) \
+               (min_thickness 0.25) (fill (thermal_gap 0.5) (thermal_bridge_width 0.5)) \
+               (polygon (pts (xy 1 1) (xy 39 1) (xy 39 19) (xy 1 19)))))",
+            pad("G1", 5.0, 5.0, "GND"),
+            pad("G2", 35.0, 15.0, "GND"),
+            pad("A1", 10.0, 10.0, "A"),
+            pad("A2", 30.0, 10.0, "A"),
+        ),
+    )
+    .unwrap();
+    let out = dir.join("unnamed_routed.kicad_pcb");
+    let o = Command::new(env!("CARGO_BIN_EXE_copperpath"))
+        .args([
+            "autoroute",
+            "--time",
+            "60",
+            "--threads",
+            "2",
+            "--json",
+            "--pcb",
+        ])
+        .arg(&pcb)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["opens"], 0, "{v}");
+}

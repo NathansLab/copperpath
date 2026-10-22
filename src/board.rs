@@ -234,6 +234,25 @@ pub struct Zone {
     pub fills: Vec<(usize, Vec<P>)>,
 }
 
+impl Zone {
+    /// name for zone selection (`--zones` / `--plane` regexes): the zone name, or for an unnamed
+    /// zone `NET@LAYER[+LAYER...]` (e.g. `GND@In1.Cu`; boards from KiCad 5 have no zone names)
+    pub fn key(&self, nets: &[String]) -> String {
+        if !self.name.is_empty() {
+            return self.name.clone();
+        }
+        let ls: Vec<&str> = (0..CU.len())
+            .filter(|l| self.layers & (1 << l) != 0)
+            .map(|l| CU[l])
+            .collect();
+        format!(
+            "{}@{}",
+            nets.get(self.net).map_or("", |s| s.as_str()),
+            ls.join("+")
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Board {
     pub text: String,
