@@ -2980,6 +2980,16 @@ pub fn write_copper(
     routed: &HashMap<usize, RNet>,
     out: &str,
 ) -> std::io::Result<()> {
+    std::fs::write(out, copper_text(text, nets, routed))
+}
+
+/// the board text with the routed copper appended (what `write_pcb` writes)
+pub fn pcb_text(text: &str, nets: &[String], res: &DResult) -> String {
+    copper_text(text, nets, &res.routed)
+}
+
+/// the board text with new copper per net (unlocked) appended
+fn copper_text(text: &str, nets: &[String], routed: &HashMap<usize, RNet>) -> String {
     // seed from the board text: copper added to an output of an earlier run gets new uuids
     let mut seed = 0x1234_5678_9abc_def1u64;
     for b in text.bytes().step_by(97).chain(text.len().to_le_bytes()) {
@@ -3010,7 +3020,7 @@ pub fn write_copper(
     o.push_str(&text[..end]);
     o.push_str(&add);
     o.push_str(&text[end..]);
-    std::fs::write(out, o)
+    o
 }
 
 #[cfg(test)]
