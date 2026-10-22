@@ -81,6 +81,8 @@ pub struct DParams {
     pub clean: bool,
     /// cleanup may slide stub ends / switch stub axes / slide junctions (off in the fallback pass)
     pub slide: bool,
+    /// --progress-json: `iter` and phase events of this run (off for the fallback runs)
+    pub progress: bool,
     /// also connect copper components (tracks, vias) that reach into the region while their
     /// pins lie outside it, e.g. stubs left by ripping copper inside the region (`nudge`)
     pub copper_comps: bool,
@@ -117,6 +119,7 @@ impl Default for DParams {
             short_stub_cost: 30.0,
             stub_ext_long: 0.6,
             slide: true,
+            progress: false,
             bend90: 1.4,
             clean: true,
             copper_comps: false,
@@ -1269,6 +1272,7 @@ impl<'a> Router<'a> {
             Vec<usize>,
         );
         let mut best: Option<Snap> = None;
+        let t_run = std::time::Instant::now();
         let hotspots: Vec<Hotspot>;
         loop {
             let t_it = std::time::Instant::now();
@@ -1334,6 +1338,21 @@ impl<'a> Router<'a> {
                 conf.iter().filter(|c| !c.is_empty()).count(),
                 left.iter().sum::<usize>()
             );
+            if self.p.progress {
+                let now = std::time::Instant::now();
+                let mean = (now - t_run).as_secs_f64() / (it + 1) as f64;
+                let iters_left = self.p.nego_iters.saturating_sub(it + 1);
+                crate::progress::emit(serde_json::json!({
+                    "ev": "iter",
+                    "iter": it,
+                    "conflict_cells": total,
+                    "nets_conflicted": conf.iter().filter(|c| !c.is_empty()).count(),
+                    "nets_left": (0..nj).filter(|k| !conf[*k].is_empty() || left[*k] > 0).count(),
+                    "nets_total": nj,
+                    "iters_max": self.p.nego_iters,
+                    "eta_s": if total == 0 { Some(0.0) } else { crate::progress::eta(mean, iters_left, self.p.deadline, now) },
+                }));
+            }
             if dbg {
                 eprintln!("[dbg] nego iter {it}: pres {pres:.2}, {} nets rerouted, conflict cells {total}, nets in conflict {}", need.len(), conf.iter().filter(|c| !c.is_empty()).count());
             }
@@ -1417,6 +1436,9 @@ impl<'a> Router<'a> {
                     }
                 }
                 if total > 0 {
+                    if self.p.progress {
+                        crate::progress::phase("resolve");
+                    }
                     // resolve: rip the most conflicted nets until clean, reroute them hard
                     let mut ripped: Vec<usize> = Vec::new();
                     let mut conf = conf;
@@ -1506,6 +1528,9 @@ impl<'a> Router<'a> {
             for q in 0..5 {
                 stats.kept90[q] += x.kept90[q];
             }
+        }
+        if self.p.progress {
+            crate::progress::phase("clean");
         }
         // final octilinear polish against the final copper of all other nets (the cleanup ran
         // against the copper of the negotiation round): a segment only slightly off an octilinear

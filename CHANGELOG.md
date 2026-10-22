@@ -211,6 +211,14 @@ All notable changes to this project are documented here. The format follows
   copper or touch nets outside the selection are refused; `--ignore-unlocked` is refused in the
   plugin settings. README documents that `route` never changes existing copper ("route the
   rest") and what `--ignore-unlocked` does (#22).
+- `route --progress-json`: NDJSON progress events on stderr (`phase`, one `iter` per negotiation
+  iteration with conflict cells, nets left and an ETA, a final versioned `done`); without the
+  flag the output is unchanged (#18).
+- KiCad plugin: progress dialog (phase, iteration, conflict cells, nets left, progress bar, ETA)
+  while copperpath runs; the editor stays usable. **Stop and apply best result** cancels the
+  router and applies its best result as one commit, **Cancel and discard** throws it away. If the
+  board changed during the run, the plugin asks before applying. The board goes to copperpath
+  as a temporary file so stdin stays open: the router stops when the plugin ends (#23).
 
 ## [0.1.0] - 2026-10-21
 

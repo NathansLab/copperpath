@@ -62,10 +62,19 @@ def command_args(settings, nets=None, region=None):
 
 
 def route(board, binary, args, api, nets=None):
-    """Route with `args` and apply the delta as one commit; (removed, added)."""
+    """Route with `args` (progress dialog, cancel) and apply the delta as one commit;
+    (removed, added). Raises `runner.Discarded` if the user throws the result away."""
     pro, dru = project_files(board)
-    delta = runner.route(binary, board_text(board), pro, dru, args)
+    text = board_text(board)
+    delta = runner.route(binary, text, pro, dru, args, watch=ui.progress_dialog)
     deltamod.check_scope(delta, nets)
+    # the editor stays usable during the route: new copper drawn meanwhile is not in the result
+    if board_text(board) != text and not ui.ask(
+        "copperpath",
+        "The board changed while copperpath was running. The new route does not know these "
+        "changes and can overlap them.\n\nApply the route anyway? (One Ctrl+Z undoes it.)",
+    ):
+        raise runner.Discarded()
     return deltamod.apply(board, delta, api)
 
 
@@ -111,6 +120,9 @@ def run(kicad=None, api=None, command="all"):
             if command == "ripup":
                 return 0
         removed, added = route(board, binary, args, api, nets)
+    except runner.Discarded:
+        print("copperpath: route discarded, the board is unchanged by it")
+        return 0
     except runner.RouteError as e:
         ui.error(str(e), e.log)
         return 1

@@ -4,17 +4,41 @@ A KiCad 9/10 plugin on the official IPC API ([kicad-python](https://pypi.org/pro
 `kipy`). It adds a toolbar button **Route with copperpath** to the PCB editor:
 
 1. reads the open board from the editor (`Board.get_as_string()`, unsaved edits included),
-2. runs `copperpath route --pcb - --delta-json …` with the board text on stdin and the
-   `.kicad_pro` / `.kicad_dru` next to the board,
+2. runs `copperpath route --pcb <temp file> --delta-json … --progress-json --cancel-file …
+   --cancel-on-stdin-eof` with the `.kicad_pro` / `.kicad_dru` next to the board, and shows a
+   progress dialog while it runs,
 3. applies the [delta](../README.md#change-set-for-the-kicad-ipc-api---delta-json) as **one**
    commit (`begin_commit`, `remove_items` / `create_items`, `push_commit("copperpath route")`).
 
-No file is written or reloaded, so there is no "board changed on disk" dialog, and one Ctrl+Z
-restores the board as it was. Errors (binary missing, exit code ≠ 0, a delta that does not fit
-the board) are shown in a dialog with the last log lines; nothing is changed then.
+The board's own file is never written or reloaded, so there is no "board changed on disk"
+dialog, and one Ctrl+Z restores the board as it was. Errors (binary missing, exit code ≠ 0, a
+delta that does not fit the board) are shown in a dialog with the last log lines; nothing is
+changed then.
 
-Part of [#9](https://github.com/NathansLab/copperpath/issues/9); progress/cancel and a PCM
-package with a bundled binary follow.
+Part of [#9](https://github.com/NathansLab/copperpath/issues/9); a PCM package with a bundled
+binary follows.
+
+## Progress and cancel
+
+While copperpath runs, a small window (tkinter, always on top) shows the phase, the negotiation
+iteration, the conflict cells, the nets left, a progress bar, the elapsed time and an ETA. The
+data are the [`--progress-json`](../README.md#progress-events---progress-json) events, read line
+by line in a thread. The plugin is its own process, so **the editor stays usable** meanwhile.
+
+| button | what happens |
+|---|---|
+| **Stop and apply best result** | creates the cancel file and closes copperpath's stdin; copperpath ends the current step, writes the best result so far, and the plugin applies it as one commit (one Ctrl+Z) |
+| **Cancel and discard** (or closing the window) | ends copperpath at once; the board is not changed by the route |
+
+- If the board changed while copperpath was running (any difference in the board text), the
+  plugin asks before applying: the route does not know the changes and can overlap them.
+- The board goes to copperpath as a temporary file, not on stdin, so stdin stays open: if the
+  plugin or KiCad ends, copperpath sees stdin close and stops instead of running on.
+- The ETA covers the negotiation (the longest part) and is capped by a `--time-limit` from the
+  settings; the negotiation often ends earlier on a plateau.
+- Without tkinter there is no window: the plugin waits, prints the progress to its log, and a
+  changed board is not applied.
+- *Rip up and reroute*: discarding the route keeps the rip-up commit (Ctrl+Z restores it).
 
 ## Actions
 
@@ -38,7 +62,8 @@ package with a bundled binary follow.
 
 ## Install
 
-Needs KiCad 9.0.1 or newer with the IPC API, and copperpath with `--delta-json` / `--pcb -`.
+Needs KiCad 9.0.1 or newer with the IPC API, and copperpath with `--delta-json` and
+`--progress-json`.
 
 1. In KiCad: *Preferences → Plugins → Enable KiCad API*. KiCad creates a Python environment for
    the plugin and installs `requirements.txt` on first use.
@@ -72,8 +97,9 @@ routing.
 
 ## Tests
 
-The delta → kipy conversion, the commit flow, the binary lookup and the subprocess handling are
-tested against a mocked kipy API; neither KiCad nor kipy is needed:
+The delta → kipy conversion, the commit flow, the binary lookup, the subprocess handling
+(progress events, cancel, discard) and the progress display are tested against a mocked kipy
+API and a fake process; neither KiCad, kipy nor copperpath is needed:
 
 ```sh
 python -m pytest kicad-plugin/tests
@@ -82,4 +108,6 @@ python -m pytest kicad-plugin/tests
 Manual check in KiCad 10 on the demo board (`examples/demo/demo.kicad_pcb`): open the board, press the
 button, the board is routed; one Ctrl+Z removes all new tracks and vias. Then select a pad each of
 two nets and press **Route selected nets**: only those two nets get copper. Draw a track by hand
-and press **Route with copperpath** again: the track stays as drawn.
+and press **Route with copperpath** again: the track stays as drawn. On a bigger board, press
+**Stop and apply best result** during the negotiation: the partial result arrives as one commit;
+press the button again and **Cancel and discard**: nothing changes.

@@ -2,7 +2,7 @@
 
 use copperpath::{
     board, check, delta, drc, droute, elec, explain, fanout, geom, groute, model, nudge, place,
-    plane, render, reroute, rules, sch, sites, stitch,
+    plane, progress, render, reroute, rules, sch, sites, stitch,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -292,6 +292,18 @@ fn main() {
     };
     let res = res.and_then(|v| explain_post(&a, v));
     let secs = t0.elapsed().as_secs_f64();
+    // --progress-json: the last event of the stream
+    if progress::enabled() {
+        progress::emit(match &res {
+            Ok(v) => {
+                let failed = v["failed"].as_array().map_or(0, |f| f.len());
+                json!({"ev": "done", "v": progress::VERSION, "ok": true,
+                    "routed": v["nets"].as_u64().unwrap_or(0) as usize - failed, "failed": failed,
+                    "opens": v["opens"], "stopped": v["stopped"], "out": v["out"], "delta_json": v["delta_json"]})
+            }
+            Err(e) => json!({"ev": "done", "v": progress::VERSION, "ok": false, "error": e}),
+        });
+    }
     match res {
         Ok(mut v) => {
             eprintln!("[done] {} in {:.2} s ({} threads)", a.cmd, secs, threads);
@@ -1172,8 +1184,10 @@ fn route_once(a: &Args) -> CmdResult {
     p.stub_side_cost = a.f("stub-side-cost", p.stub_side_cost as f64) as f32;
     p.stubs = a.get("no-stubs").is_none();
     p.clean = a.get("no-clean").is_none();
+    p.progress = progress::enabled();
     let filt = net_filter(a, &c.board.nets);
     let t = Instant::now();
+    progress::phase("droute");
     let mut r = droute::Router::new(&m, region, p.clone(), filt.as_ref());
     let mut res = r.run();
     // fallback ladder when the cleanup's geometry costs completeness: no sliding, then no cleanup
@@ -1210,10 +1224,13 @@ fn route_once(a: &Args) -> CmdResult {
     if !res.failed.is_empty() && cleanup_suspect && p.clean && fallback && !halted() {
         // both fallback levels run at the same time (a route mostly uses one core); the choice
         // is the same as trying them one after the other
+        progress::phase("fallback");
         let run_level = |slide: bool, clean: bool| {
             let mut p2 = p.clone();
             p2.slide = slide;
             p2.clean = clean;
+            // two runs at once: their iterations would interleave in one progress stream
+            p2.progress = false;
             let r2 = droute::Router::new(&m, region, p2, filt.as_ref());
             let res2 = r2.run();
             (r2, res2)
@@ -1291,6 +1308,7 @@ fn route_once(a: &Args) -> CmdResult {
             r.debug_images(*n, &res, if d.is_empty() { "." } else { &d });
         }
     }
+    progress::phase("write");
     let text = droute::pcb_text(&c.board.text, &c.board.nets, &res);
     if write_board {
         write_file(&out, &text)?;
@@ -1316,6 +1334,7 @@ fn route_once(a: &Args) -> CmdResult {
         );
     }
     // opens counted on the routed board (all copper, routed region and nets only)
+    progress::phase("check");
     let board2 = board::parse_board(text)?;
     let rules2 = rules::Rules::load(
         &c.pro,
@@ -2817,6 +2836,10 @@ fn plane_outline(a: &Args, sub: &str) -> CmdResult {
 
 /// route with an explanation of every connection left open (`--explain`, `--explain-img DIR`)
 fn cmd_route(a: &Args) -> CmdResult {
+    if a.get("progress-json").is_some() {
+        progress::enable(Instant::now());
+    }
+    progress::phase("load");
     cmd_route_core(a)
 }
 

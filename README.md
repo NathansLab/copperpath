@@ -88,6 +88,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `--time-limit S` | | stop negotiating in time and write the best iteration so far (conflicting nets ripped and rerouted, or left as failed); SIGTERM / Ctrl+C (Ctrl+Break on Windows) do the same at once. `--json` reports `stopped` (`time-limit`, `signal`, `cancel`) and `hotspots` (net, conflict cells, location, layer) |
 | `--cancel-file PATH` | | stop like `--time-limit` as soon as this file exists (checked once per second); a cancel path that also works on Windows, where a GUI can only kill the process otherwise. The file should not exist at the start |
 | `--cancel-on-stdin-eof` | | stop like `--time-limit` when stdin is closed, e.g. because the calling plugin or KiCad ended |
+| `--progress-json` | | machine-readable progress on stderr, one JSON object per line ([events](#progress-events---progress-json)) |
 | `--stall-iters` | 3 | stop negotiating after this many iterations without fewer conflict cells, then rip up and reroute the conflicting nets |
 | `--stall-gain` | 0 | an iteration counts as progress only if it cuts the best conflict count by this fraction (0.1 = 10 %); stops plateaus early |
 | `--no-fallback` | off | skip the cleanup fallback ladder (two more full routes when the exact check drops nets); the dropped nets stay open and are reported |
@@ -521,6 +522,32 @@ explicitly then (stdin is read to the end, so cancel with `--cancel-file`, not
 - Applying the delta to the input board (`copperpath::delta::apply`) gives the same copper as
   `--out` (tested on the demo: same tracks and vias within 1 nm, same opens).
 
+### Progress events (`--progress-json`)
+
+`route --progress-json` writes one JSON object per line (NDJSON) to **stderr**, between the
+normal log lines, for a progress bar in a GUI. Each line is written and flushed at once, so a
+reader never sees a fragment; lines starting with `{` are events, all others are log. stdout and
+the output files are unchanged, and without the flag no event is written.
+
+```json
+{"ev":"phase","phase":"droute","t":0.41}
+{"ev":"iter","iter":0,"conflict_cells":412,"nets_conflicted":9,"nets_left":14,"nets_total":120,"iters_max":25,"eta_s":90.0,"t":12.3}
+{"ev":"done","v":1,"ok":true,"routed":118,"failed":2,"opens":2,"stopped":null,"out":null,"delta_json":"delta.json","t":180.3}
+```
+
+- `t`: seconds since the start (every event).
+- `phase`: `load`, `droute` (maps and negotiation), `resolve` (rip-up and hard reroute of the
+  remaining conflicts), `clean` (final polish and exact check), `fallback` (the cleanup fallback
+  runs, if needed), `write`, `check` (opens, `--drc`). `resolve` and `fallback` are skipped when
+  not needed.
+- `iter`: one per negotiation iteration (counted from 0, at most `iters_max`). `nets_left`: nets
+  with conflicts or unrouted connections; `eta_s`: rough time to the end of the negotiation (mean
+  iteration time × iterations left, capped by `--time-limit`; 0 once there are no conflicts;
+  `null` if unknown). The negotiation often stops early on a plateau (`--stall-iters`), so treat
+  the ETA as an upper bound.
+- `done`: always the last event, also on errors (`"ok":false,"error":"…"`). `v` is the schema
+  version; `stopped` is `null`, `time-limit`, `signal` or `cancel` as in `--json`.
+
 ## Comparison with Freerouting
 
 Freerouting is the established open-source autorouter for KiCad (via Specctra DSN). An informal
@@ -581,7 +608,9 @@ Run the `pcbnew` scripts with KiCad's bundled Python (e.g. on macOS
 9/10 PCB editor (IPC API). It routes the open board and pushes the result as one commit, so one
 Ctrl+Z undoes it and no file is reloaded. Further actions work on the selection: **Route selected
 nets**, **Route region** (a rectangle on a User layer), **Rip up selected nets** and **Rip up and
-reroute selected nets**.
+reroute selected nets**. While copperpath runs, a progress dialog shows the phase, iteration,
+conflicts, nets left and an ETA; the editor stays usable, and the route can be stopped (the best
+result so far is applied) or cancelled and discarded.
 
 ## Contributing and issues
 
