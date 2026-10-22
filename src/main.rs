@@ -1356,8 +1356,49 @@ fn route_once(a: &Args) -> CmdResult {
     Ok(summary)
 }
 
+/// cache key of a kicad-cli DRC report: board, project and rules text plus the kicad-cli binary
+/// (path, size, mtime), so an edited board or rule file or another KiCad version runs again
+fn drc_key(cli: &str, pcb: &str) -> Option<u64> {
+    let base = pcb.trim_end_matches(".kicad_pcb");
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut eat = |b: &[u8]| {
+        for &x in b.iter().chain(&b.len().to_le_bytes()) {
+            h = (h ^ x as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    };
+    eat(&std::fs::read(pcb).ok()?);
+    for ext in ["kicad_pro", "kicad_dru"] {
+        eat(&std::fs::read(format!("{base}.{ext}")).unwrap_or_default());
+    }
+    let bin = which(cli).unwrap_or_else(|| cli.into());
+    eat(bin.as_bytes());
+    if let Ok(m) = std::fs::metadata(&bin) {
+        eat(&m.len().to_le_bytes());
+        let t = m
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        eat(&t.as_nanos().to_le_bytes());
+    }
+    Some(h)
+}
+
+/// `cli` resolved on the PATH (a path with a separator is taken as is)
+fn which(cli: &str) -> Option<String> {
+    if cli.contains(std::path::MAIN_SEPARATOR) || cli.contains('/') {
+        return Some(cli.into());
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .flat_map(|d| [d.join(cli), d.join(format!("{cli}.exe"))])
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// kicad-cli DRC on the input and the routed board; violations only the routed board has.
 /// kicad-cli: --kicad-cli PATH, else $KICAD_CLI, else `kicad-cli` on the PATH.
+/// The input's report is cached (in this process and in the temp dir, keyed by `drc_key`), so
+/// the autoroute gate and repeated runs on one input check it once; both boards run in parallel.
 fn drc_delta(a: &Args, before: &str, after: &str) -> Result<Value, String> {
     let cli = a
         .get("kicad-cli")
@@ -1390,7 +1431,43 @@ fn drc_delta(a: &Args, before: &str, after: &str) -> Result<Value, String> {
     };
     let base = after.replace(".kicad_pcb", "_drc_before.json");
     let new = after.replace(".kicad_pcb", "_drc_after.json");
-    let (b, n) = (run(before, &base)?, run(after, &new)?);
+    static MEM: std::sync::Mutex<Option<HashMap<u64, Value>>> = std::sync::Mutex::new(None);
+    let key = drc_key(&cli, before);
+    let disk = key.map(|k| {
+        std::env::temp_dir()
+            .join("copperpath-drc")
+            .join(format!("{k:016x}.json"))
+    });
+    let cached = key
+        .and_then(|k| MEM.lock().ok()?.as_ref()?.get(&k).cloned())
+        .or_else(|| {
+            let t = std::fs::read_to_string(disk.as_ref()?).ok()?;
+            serde_json::from_str::<Value>(&t).ok()
+        });
+    let (b, n) = std::thread::scope(|sc| {
+        let hb = cached.is_none().then(|| sc.spawn(|| run(before, &base)));
+        let n = run(after, &new);
+        let b = match hb {
+            Some(h) => h
+                .join()
+                .unwrap_or_else(|_| Err("--drc: thread panicked".into())),
+            None => Ok(cached.clone().unwrap_or_default()),
+        };
+        (b, n)
+    });
+    let (b, n) = (b?, n?);
+    if cached.is_some() {
+        write_file(&base, &serde_json::to_string_pretty(&b).unwrap_or_default())?;
+    }
+    if let Some(k) = key {
+        if let Ok(mut m) = MEM.lock() {
+            m.get_or_insert_with(HashMap::new).insert(k, b.clone());
+        }
+        if let Some(d) = disk.as_ref().filter(|_| cached.is_none()) {
+            let _ = std::fs::create_dir_all(d.parent().unwrap_or(std::path::Path::new(".")));
+            let _ = std::fs::write(d, b.to_string());
+        }
+    }
     let keys = |d: &Value| -> HashMap<String, usize> {
         let mut m = HashMap::new();
         for v in d["violations"].as_array().into_iter().flatten() {

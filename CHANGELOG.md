@@ -80,6 +80,11 @@ All notable changes to this project are documented here. The format follows
   net's search window. Connectivity uses a bounding-box sweep and an edge index per fill
   (all nets of a 6-layer board with 217 fills in about 1 s; per-net opens equal KiCad's DRC).
 
+### Changed
+- `--drc`: the kicad-cli report of the input board is cached (per process and in the temp dir,
+  keyed by board, project, rules and the kicad-cli binary) and the routed board is checked in
+  parallel, so the autoroute quality gate and repeated runs check an unchanged input once.
+
 ### Fixed
 - `route`: the cleanup fallback ladder (two more full routes) only runs when a failed net may have
   been broken by the cleanup; pure search failures (no path, node cap, window) skip it (#54).
