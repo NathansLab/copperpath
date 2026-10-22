@@ -94,6 +94,10 @@ All notable changes to this project are documented here. The format follows
   (all nets of a 6-layer board with 217 fills in about 1 s; per-net opens equal KiCad's DRC).
 
 ### Changed
+- Router: the A* buffers are kept per thread and only the nodes a search touched are reset, so
+  a search costs the nodes it expands instead of its whole window. Same result; the first
+  negotiation iteration on the PCBench sizif128 board (2801 x 1701 cells, a 56-pin GND) takes
+  26 s instead of 52 s, the demo 4.4 s instead of 5.5 s.
 - `--drc`: the kicad-cli report of the input board is cached (per process and in the temp dir,
   keyed by board, project, rules and the kicad-cli binary) and the routed board is checked in
   parallel, so the autoroute quality gate and repeated runs check an unchanged input once.

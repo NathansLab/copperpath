@@ -203,6 +203,49 @@ pub struct RNet {
 type Found = (Vec<(usize, usize)>, usize);
 type NetRouteResult = (RNet, usize, Vec<(usize, usize, bool)>, Vec<usize>);
 
+/// per-thread A* buffers, kept between searches; only the nodes a search wrote are reset
+#[derive(Default)]
+struct Scratch {
+    g: Vec<f32>,
+    par: Vec<u32>,
+    indir: Vec<u8>,
+    fkey: Vec<u32>,
+    hc: Vec<f32>,
+    touched: Vec<u32>,
+    htouched: Vec<u32>,
+}
+
+impl Scratch {
+    /// at least `total` nodes and `wn` heuristic cells, all at their initial values
+    fn reset(&mut self, total: usize, wn: usize) {
+        for &i in &self.touched {
+            let i = i as usize;
+            self.g[i] = f32::INFINITY;
+            self.par[i] = u32::MAX;
+            self.indir[i] = 8;
+            self.fkey[i] = u32::MAX;
+        }
+        self.touched.clear();
+        for &i in &self.htouched {
+            self.hc[i as usize] = f32::NAN;
+        }
+        self.htouched.clear();
+        if self.g.len() < total {
+            self.g.resize(total, f32::INFINITY);
+            self.par.resize(total, u32::MAX);
+            self.indir.resize(total, 8);
+            self.fkey.resize(total, u32::MAX);
+        }
+        if self.hc.len() < wn {
+            self.hc.resize(wn, f32::NAN);
+        }
+    }
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
 pub struct NetJob {
     pub net: usize,
     pub pins: Vec<Pin>, // pins inside the region
@@ -2056,6 +2099,8 @@ impl<'a> Router<'a> {
         )
     }
 
+    /// [`Self::astar_win_in`] with this thread's search buffers (reused across searches, so a
+    /// search costs the nodes it touches, not the size of its window)
     #[allow(clippy::too_many_arguments)]
     fn astar_win(
         &self,
@@ -2069,6 +2114,29 @@ impl<'a> Router<'a> {
         o: &Owners,
         nego: Nego,
         win: (i32, i32, i32, i32),
+    ) -> Option<(Vec<(usize, usize)>, usize)> {
+        let mut sc = SCRATCH.with(|c| c.take());
+        let r = self.astar_win_in(
+            k, src, src_info, tmark, tinfo, tree_mark, bbs, o, nego, win, &mut sc,
+        );
+        SCRATCH.with(|c| c.replace(sc));
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn astar_win_in(
+        &self,
+        k: usize,
+        src: &[(usize, usize)],
+        src_info: &HashMap<(usize, usize), (f32, u8)>,
+        tmark: &[u16],
+        tinfo: &HashMap<usize, (f32, u8)>,
+        tree_mark: &[bool],
+        bbs: &[(i32, i32, i32, i32)],
+        o: &Owners,
+        nego: Nego,
+        win: (i32, i32, i32, i32),
+        sc: &mut Scratch,
     ) -> Option<(Vec<(usize, usize)>, usize)> {
         let mp = &self.maps[k];
         let nxg = self.gs.nx as i32;
@@ -2093,19 +2161,29 @@ impl<'a> Router<'a> {
             (l, (y * nxg + x) as usize)
         };
         let total = wn * NL;
-        let mut g = vec![f32::INFINITY; total];
-        let mut par = vec![u32::MAX; total];
-        let mut indir = vec![8u8; total];
-        // key of the newest heap entry per node: older entries are stale and skipped (lazy deletion)
-        let mut fkey = vec![u32::MAX; total];
+        sc.reset(total, wn);
+        let Scratch {
+            g,
+            par,
+            indir,
+            fkey,
+            hc,
+            touched,
+            htouched,
+        } = sc;
+        // g, par, indir: cost, parent and incoming direction per node; fkey: key of the newest
+        // heap entry per node (older entries are stale and skipped: lazy deletion); `touched`
+        // lists the nodes written, which the next search resets
         // heuristic per (x, y), shared by all layers, computed on first use
-        let hc = std::cell::RefCell::new(vec![f32::NAN; wn]);
+        let hc = std::cell::RefCell::new((hc, htouched));
         let h = |x: i32, y: i32| -> f32 {
             let ci = ((y - y0) as usize) * wx + (x - x0) as usize;
-            let mut hc = hc.borrow_mut();
+            let mut b = hc.borrow_mut();
+            let (hc, ht) = &mut *b;
             if !hc[ci].is_nan() {
                 return hc[ci];
             }
+            ht.push(ci as u32);
             let mut best = i32::MAX as f32;
             for b in bbs {
                 let dx = (b.0 - x).max(0).max(x - b.2) as f32;
@@ -2130,6 +2208,9 @@ impl<'a> Router<'a> {
             let (c0, d0) = src_info.get(&(l, i)).cloned().unwrap_or((0.0, 8));
             let ln = loc(l, i);
             if c0 < g[ln] {
+                if g[ln] == f32::INFINITY {
+                    touched.push(ln as u32);
+                }
                 g[ln] = c0;
                 indir[ln] = d0;
                 fkey[ln] = key(c0 + self.p.hweight * h((i as i32) % nxg, (i as i32) / nxg));
@@ -2282,6 +2363,9 @@ impl<'a> Router<'a> {
                 let nn = l * wn + ((yy - y0) as usize) * wx + (xx - x0) as usize;
                 let ng = gc + c;
                 if ng < g[nn] {
+                    if g[nn] == f32::INFINITY {
+                        touched.push(nn as u32);
+                    }
                     g[nn] = ng;
                     par[nn] = ln as u32;
                     indir[nn] = d as u8;
@@ -2314,6 +2398,9 @@ impl<'a> Router<'a> {
                     }
                     let ng = gc + via_cost + pen + extra + tc;
                     if ng < g[nn] {
+                        if g[nn] == f32::INFINITY {
+                            touched.push(nn as u32);
+                        }
                         g[nn] = ng;
                         par[nn] = ln as u32;
                         indir[nn] = 8;
