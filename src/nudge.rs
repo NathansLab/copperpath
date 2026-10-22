@@ -81,6 +81,8 @@ pub struct Spec {
     pub push: f64,
     /// how far a pushed part may move (mm, each axis)
     pub push_range: f64,
+    /// locked tracks and vias of the routed nets inside the region may be ripped too
+    pub rip_locked: bool,
 }
 
 impl Default for Spec {
@@ -103,6 +105,7 @@ impl Default for Spec {
             exclude_nets: Vec::new(),
             push: 0.0,
             push_range: 1.0,
+            rip_locked: false,
         }
     }
 }
@@ -119,6 +122,11 @@ pub struct Opts {
     pub coarse: usize,
     /// route every candidate with the exact cleanup (slower; default: only the winner)
     pub clean_search: bool,
+    /// the best K candidates are checked again with the copper zones refilled natively (pour
+    /// connectivity after the new copper); 0 = off
+    pub verify_fill: usize,
+    /// refill and count the pour connectivity for every candidate (slower, exact for pours)
+    pub fill_search: bool,
 }
 
 impl Default for Opts {
@@ -129,6 +137,8 @@ impl Default for Opts {
             max_cands: 20000,
             coarse: 9,
             clean_search: false,
+            verify_fill: 8,
+            fill_search: false,
         }
     }
 }
@@ -168,6 +178,9 @@ pub struct Eval {
     pub failed: Vec<(usize, usize)>,
     /// per failed net: why the router gave up and the pins of its unconnected components
     pub fails: Vec<Fail>,
+    /// open connections of the routed nets on the whole (cropped) board after a native refill
+    /// of the zones near the region (`Opts::verify_fill`)
+    pub true_opens: Option<usize>,
 }
 
 /// a net the router could not complete in a candidate
@@ -182,7 +195,7 @@ pub struct Fail {
 
 impl Eval {
     fn better(&self, o: &Eval) -> bool {
-        (self.opens, self.cost) < (o.opens, o.cost)
+        (self.true_opens, self.opens, self.cost) < (o.true_opens, o.opens, o.cost)
     }
 }
 
@@ -208,14 +221,18 @@ pub struct Outcome {
     pub reasons: Vec<(String, usize, P)>,
     /// joint moves: candidates repaired by pushing neighbours
     pub pushed: usize,
+    /// open connections of the routed nets on the whole board before, with the zones near the
+    /// region refilled natively (`Opts::verify_fill`)
+    pub true_before: Option<usize>,
 }
 
 impl Outcome {
     /// the best candidate is an improvement over the board as it is
     pub fn improves(&self) -> bool {
-        self.best
-            .as_ref()
-            .is_some_and(|b| b.opens < self.opens_before)
+        self.best.as_ref().is_some_and(|b| match (b.true_opens, self.true_before) {
+            (Some(t), Some(t0)) => t < t0,
+            _ => b.opens < self.opens_before,
+        })
     }
 }
 
@@ -330,6 +347,7 @@ fn rip_set(
     region: &BBox,
     nets: &HashSet<usize>,
     attached: Option<&[usize]>,
+    locked_too: bool,
 ) -> Vec<String> {
     let inside = |q: P| region.contains(q);
     // items whose every piece lies inside (arcs are two tracks with one uuid)
@@ -342,7 +360,7 @@ fn rip_set(
     let cand_t: Vec<usize> = (0..b.tracks.len())
         .filter(|&i| {
             let t = &b.tracks[i];
-            !t.locked
+            (!t.locked || locked_too)
                 && !t.uuid.is_empty()
                 && nets.contains(&t.net)
                 && !out_uuid.contains(t.uuid.as_str())
@@ -351,7 +369,7 @@ fn rip_set(
     let cand_v: Vec<usize> = (0..b.vias.len())
         .filter(|&i| {
             let v = &b.vias[i];
-            !v.locked && !v.uuid.is_empty() && nets.contains(&v.net) && inside(v.at)
+            (!v.locked || locked_too) && !v.uuid.is_empty() && nets.contains(&v.net) && inside(v.at)
         })
         .collect();
     let Some(fps) = attached else {
@@ -416,7 +434,7 @@ fn rip_set(
 
 /// open connections (components - 1) per net among the pins inside `region`
 fn opens_in(m: &Model, region: &BBox, nets: &HashSet<usize>) -> HashMap<usize, usize> {
-    let (pins, _) = pins_and_copper_of(m, &|n| nets.contains(&n));
+    let (pins, copper) = pins_and_copper_of(m, &|n| nets.contains(&n));
     let mut out = HashMap::new();
     for (n, ps) in pins {
         let mut c: Vec<usize> = ps
@@ -424,6 +442,14 @@ fn opens_in(m: &Model, region: &BBox, nets: &HashSet<usize>) -> HashMap<usize, u
             .filter(|p| region.contains(p.at))
             .map(|p| p.comp)
             .collect();
+        // tracks and vias reaching into the region whose pins lie outside (as the router sees
+        // them with `copper_comps`)
+        for &(oi, k) in copper.get(&n).into_iter().flatten() {
+            let o = m.cu(oi);
+            if matches!(o.kind, Kind::Track | Kind::Via) && o.bbox.overlaps(region) {
+                c.push(k);
+            }
+        }
         c.sort_unstable();
         c.dedup();
         if c.len() > 1 {
@@ -578,12 +604,12 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
     if !spec.rip_classes.is_empty() {
         // blocking nets: unlocked copper of these classes inside the region
         for t in &b.tracks {
-            if !t.locked && region.contains(t.a) && region.contains(t.b) {
+            if (!t.locked || spec.rip_locked) && region.contains(t.a) && region.contains(t.b) {
                 extra.insert(t.net);
             }
         }
         for v in &b.vias {
-            if !v.locked && region.contains(v.at) {
+            if (!v.locked || spec.rip_locked) && region.contains(v.at) {
                 extra.insert(v.net);
             }
         }
@@ -645,6 +671,7 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
             stopped: None,
             reasons: Vec::new(),
             pushed: 0,
+            true_before: None,
             log: vec![
                 json!({"phase": "start", "note": "no open connection of the routed nets in the region", "reach": reach_nets}),
             ],
@@ -653,8 +680,8 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
     // ---- copper that may be ripped
     let ripped = match spec.rip.as_str() {
         "none" => Vec::new(),
-        "region" => rip_set(b, &region, &nets, None),
-        "attached" => rip_set(b, &region, &nets, Some(&fis)),
+        "region" => rip_set(b, &region, &nets, None, spec.rip_locked),
+        "attached" => rip_set(b, &region, &nets, Some(&fis), spec.rip_locked),
         x => return Err(format!("rip: unknown mode '{x}' (region, attached, none)")),
     };
     let ripped_set: HashSet<String> = ripped.iter().cloned().collect();
@@ -936,14 +963,17 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
                 if other == Some(k) {
                     continue;
                 }
-                let cr = match other {
-                    Some(j) => placed_of(j, c[j]).crtyd,
-                    None => f.crtyd_world(),
+                let crs = match other {
+                    Some(j) => vec![placed_of(j, c[j]).crtyd],
+                    None => f.crtyd_parts_world(),
                 };
-                if place::poly_overlap(&pk.crtyd, &cr) {
-                    let q = cr.iter().copied().fold(p(0.0, 0.0), |s, q| s + q)
-                        * (1.0 / cr.len() as f64);
-                    out.push((format!("{rf}: courtyard overlaps {}", f.refd), q));
+                for cr in crs {
+                    if cr.len() >= 3 && place::poly_overlap(&pk.crtyd, &cr) {
+                        let q = cr.iter().copied().fold(p(0.0, 0.0), |s, q| s + q)
+                            * (1.0 / cr.len() as f64);
+                        out.push((format!("{rf}: courtyard overlaps {}", f.refd), q));
+                        break;
+                    }
                 }
             }
             for (s, layers, net, _, pi) in &pk.pads {
@@ -1024,10 +1054,12 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
     // ---- maps of everything that stays, shared by all candidates
     let tf = Instant::now();
     let was_quiet = droute::QUIET.swap(true, std::sync::atomic::Ordering::Relaxed);
+    let mut base_p = o.params.clone();
+    base_p.copper_comps = true;
     let fixed = droute::Router::fixed_maps(
         &mc,
         region,
-        o.params.clone(),
+        base_p.clone(),
         Some(&nets),
         parts.iter().map(|pt| pt.fi).collect(),
     );
@@ -1035,11 +1067,61 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
     // ---- routing of one candidate on a worker's copy of the cropped board
     // thread time (us) of model builds, router setups (maps) and searches
     let prof: [std::sync::atomic::AtomicU64; 3] = Default::default();
-    let mut prm = o.params.clone();
+    let mut prm = base_p.clone();
     prm.deadline = Some(deadline);
     // the search routes without the exact cleanup (much faster); the winner is routed again with it
     let mut fast = prm.clone();
     fast.clean = fast.clean && o.clean_search;
+    let zsel = |w: &Board| -> HashSet<usize> {
+        let near = region.inflate(1.0);
+        (0..w.zones.len())
+            .filter(|&zi| {
+                let z = &w.zones[zi];
+                !z.keepout && z.net != 0 && z.outline.iter().fold(BBox::empty(), |mut bb, q| {
+                    bb.add(*q);
+                    bb
+                }).overlaps(&near)
+            })
+            .collect()
+    };
+    let true_opens = |w: &Board, routed: &HashMap<usize, RNet>| -> usize {
+        let mut w2 = w.clone();
+        for (&net, rn) in routed {
+            for sg in &rn.segs {
+                w2.tracks.push(Track {
+                    a: sg.a,
+                    b: sg.b,
+                    w: sg.w,
+                    layer: sg.l,
+                    net,
+                    locked: false,
+                    uuid: String::new(),
+                });
+            }
+            for v in &rn.vias {
+                w2.vias.push(Via {
+                    at: v.at,
+                    d: v.d,
+                    drill: v.drill,
+                    net,
+                    locked: false,
+                    uuid: String::new(),
+                });
+            }
+        }
+        let sel = zsel(&w2);
+        crate::plane::fill_board(&mut w2, r, cfg, &|zi| sel.contains(&zi), &crate::plane::FillParams::default());
+        let m = Model::new(&w2, r, cfg.clone(), CopperMode::All);
+        let (pins, _) = pins_and_copper_of(&m, &|n| nets.contains(&n));
+        pins.values()
+            .map(|ps| {
+                let mut c: Vec<usize> = ps.iter().map(|p| p.comp).collect();
+                c.sort_unstable();
+                c.dedup();
+                c.len().saturating_sub(1)
+            })
+            .sum()
+    };
     let eval = |w: &mut Board, c: &Cand, prm: &DParams| -> Eval {
         let mut moved = 0.0;
         let mut rotated = 0;
@@ -1094,7 +1176,7 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
             .map(|s| (s.b - s.a).len())
             .sum();
         let vias: usize = res.routed.values().map(|x| x.vias.len()).sum();
-        Eval {
+        let mut e = Eval {
             opens,
             length,
             vias,
@@ -1107,7 +1189,12 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
             routed: res.routed,
             failed: res.failed,
             fails,
+            true_opens: None,
+        };
+        if o.fill_search {
+            e.true_opens = Some(true_opens(w, &e.routed));
         }
+        e
     };
     // ---- search: coarse scan per part, then pattern refinement, rounds over all parts
     let stop =
@@ -1320,14 +1407,63 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
             break;
         }
     }
+    // pour check: the best candidates again with the zones near the region refilled natively,
+    // judged by the open connections of the routed nets on the whole board
+    let mut true_before = None;
+    if o.verify_fill > 0 && best.is_some() && !droute::STOP.load(std::sync::atomic::Ordering::Relaxed) {
+        let tv = Instant::now();
+        // the board as it is: nothing ripped, nothing moved
+        let orig = crop(b, &win, &nets, &HashSet::new());
+        let t0v = true_opens(&orig, &HashMap::new());
+        true_before = Some(t0v);
+        let mut ranked: Vec<(&Cand, &Eval)> = cache
+            .iter()
+            .filter_map(|(c, e)| e.as_ref().map(|e| (c, e)))
+            .collect();
+        ranked.sort_by(|a, b| (a.1.opens, a.1.cost, a.0).partial_cmp(&(b.1.opens, b.1.cost, b.0)).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(o.verify_fill);
+        let checked: Vec<(Cand, Eval)> = ranked
+            .par_iter()
+            .map(|(c, e)| {
+                let mut w = cb.clone();
+                for (k, pt) in parts.iter().enumerate() {
+                    let (at, rot) = pose_of(pt, c[k]);
+                    place_into(&mut w, pt, &cb.fps[pt.fi], at, rot);
+                }
+                let mut e = (*e).clone();
+                e.true_opens = Some(true_opens(&w, &e.routed));
+                ((*c).clone(), e)
+            })
+            .collect();
+        let pick = checked
+            .iter()
+            .min_by(|a, b| {
+                (a.1.true_opens, a.1.opens, a.1.cost)
+                    .partial_cmp(&(b.1.true_opens, b.1.opens, b.1.cost))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned();
+        log.push(json!({"phase": "pour check", "board_opens_before": t0v,
+            "checked": checked.iter().map(|(c, e)| json!({"cand": c, "opens": e.opens, "true_opens": e.true_opens, "cost": round3(e.cost)})).collect::<Vec<_>>(),
+            "s": round3(tv.elapsed().as_secs_f64())}));
+        if let Some((c, e)) = pick {
+            cur = c;
+            best = Some(e);
+        }
+    }
     // the winner with the exact cleanup (kept unless it loses connections)
     if let Some(b) = &best {
         if prm.clean && !fast.clean && !droute::STOP.load(std::sync::atomic::Ordering::Relaxed) {
             let mut full = prm.clone();
             full.deadline = None;
-            let fin = eval(&mut cb.clone(), &cur, &full);
-            log.push(json!({"phase": "final cleanup", "opens": fin.opens, "cost": round3(fin.cost), "kept": fin.opens <= b.opens}));
-            if fin.opens <= b.opens {
+            let mut w = cb.clone();
+            let mut fin = eval(&mut w, &cur, &full);
+            if b.true_opens.is_some() {
+                fin.true_opens = Some(true_opens(&w, &fin.routed));
+            }
+            let keep = (fin.true_opens, fin.opens) <= (b.true_opens, b.opens);
+            log.push(json!({"phase": "final cleanup", "opens": fin.opens, "true_opens": fin.true_opens, "cost": round3(fin.cost), "kept": keep}));
+            if keep {
                 best = Some(fin);
             }
         }
@@ -1381,6 +1517,7 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
         log,
         reasons,
         pushed,
+        true_before,
     })
 }
 
