@@ -53,6 +53,8 @@ pub struct DParams {
     pub deadline: Option<std::time::Instant>,
     /// iterations without a new minimum of conflict cells before the negotiation stops
     pub stall_iters: usize,
+    /// a new minimum counts only if it is this fraction below the earlier one (0 = any gain)
+    pub stall_gain: f32,
     /// experimental: parallel connection searches inside a multi-pin net (0 = number of threads,
     /// 1 = serial; parallel was slower and not shorter on the public benchmark boards)
     pub par_conn: usize,
@@ -100,6 +102,7 @@ impl Default for DParams {
             par_nets: 1,
             deadline: None,
             stall_iters: 3,
+            stall_gain: 0.0,
             par_conn: 1,
             job_margin: 6.0,
             hweight: 1.02,
@@ -1355,8 +1358,9 @@ impl<'a> Router<'a> {
             // no new best for `stall_iters` iterations: stop negotiating, rip and reroute hard
             let sw = self.p.stall_iters.max(1);
             let stalled = best_hist.len() > sw
-                && best_hist[best_hist.len() - sw..].iter().min().unwrap()
-                    >= best_hist[..best_hist.len() - sw].iter().min().unwrap();
+                && (*best_hist[best_hist.len() - sw..].iter().min().unwrap() as f32)
+                    >= (1.0 - self.p.stall_gain)
+                        * *best_hist[..best_hist.len() - sw].iter().min().unwrap() as f32;
             if total == 0 || it + 1 >= self.p.nego_iters || stalled || out_of_time {
                 hotspots = self.hotspots(&conf);
                 for h in hotspots.iter().take(10) {

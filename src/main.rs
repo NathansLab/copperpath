@@ -1154,6 +1154,7 @@ fn route_once(a: &Args) -> CmdResult {
     droute::install_stop_handler();
     watch_cancel(a.get("cancel-file"), a.get("cancel-on-stdin-eof").is_some());
     p.stall_iters = a.u("stall-iters", p.stall_iters);
+    p.stall_gain = a.f("stall-gain", p.stall_gain as f64) as f32;
     p.par_conn = a.u("par-conn", p.par_conn);
     p.bend_cost = a.f("bend-cost", p.bend_cost as f64) as f32;
     p.bend90 = a.f("bend90", p.bend90 as f64) as f32;
@@ -1195,7 +1196,10 @@ fn route_once(a: &Args) -> CmdResult {
             res.failed.len()
         );
     }
-    if !res.failed.is_empty() && cleanup_suspect && p.clean && !halted() {
+    // --no-fallback: no extra full routes; such nets are dropped and reported (an agent reroutes
+    // them with --nets)
+    let fallback = a.get("no-fallback").is_none();
+    if !res.failed.is_empty() && cleanup_suspect && p.clean && fallback && !halted() {
         // both fallback levels run at the same time (a route mostly uses one core); the choice
         // is the same as trying them one after the other
         let run_level = |slide: bool, clean: bool| {

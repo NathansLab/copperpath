@@ -89,6 +89,8 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `--cancel-file PATH` | | stop like `--time-limit` as soon as this file exists (checked once per second); a cancel path that also works on Windows, where a GUI can only kill the process otherwise. The file should not exist at the start |
 | `--cancel-on-stdin-eof` | | stop like `--time-limit` when stdin is closed, e.g. because the calling plugin or KiCad ended |
 | `--stall-iters` | 3 | stop negotiating after this many iterations without fewer conflict cells, then rip up and reroute the conflicting nets |
+| `--stall-gain` | 0 | an iteration counts as progress only if it cuts the best conflict count by this fraction (0.1 = 10 %); stops plateaus early |
+| `--no-fallback` | off | skip the cleanup fallback ladder (two more full routes when the exact check drops nets); the dropped nets stay open and are reported |
 | `--par-nets` | 1 | 1 = nets whose windows cannot interact route in parallel (same result as serial); N > 1 = blocks of N nets against one snapshot (experimental) |
 | `--par-conn` | 1 | experimental: parallel connection searches inside a multi-pin net (0 = all threads); slower on the benchmark boards so far |
 | `--no-stubs` / `--no-clean` | | disable straight pad exits / the cleanup |

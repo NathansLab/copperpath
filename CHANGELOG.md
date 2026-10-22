@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `route --stall-gain F` (stop negotiating when iterations gain less than F) and `--no-fallback`
+  (no extra full routes for nets the exact check dropped).
 - Routing intents per net (`--prio NET=PROFILE`, config `net_prio`): `low_r`, `low_l`, `short`,
   `few_vias`, `wide`, `first` and raw multipliers scale the via, bend and layer-direction costs
   and the track width per net and route marked nets first.
