@@ -3,3 +3,5 @@ target/
 *-backups/
 fp-info-cache
 out/
+__pycache__/
+*.pyc
