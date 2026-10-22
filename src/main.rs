@@ -1665,8 +1665,25 @@ fn cmd_nudge(a: &Args) -> CmdResult {
             .parse()
             .map_err(|_| format!("--margin {v}: expected mm"))?;
     }
+    if let Some(v) = a.get("reach") {
+        spec.reach = v.parse().map_err(|_| format!("--reach {v}: expected mm"))?;
+    }
+    if let Some(v) = a.get("rip-classes") {
+        spec.rip_classes = v.split(',').map(String::from).collect();
+    }
+    if let Some(v) = a.get("exclude-nets") {
+        spec.exclude_nets = v.split(',').map(String::from).collect();
+    }
     if a.get("move-locked").is_some() {
         spec.move_locked = true;
+    }
+    if let Some(v) = a.get("push") {
+        spec.push = v.parse().map_err(|_| format!("--push {v}: expected mm"))?;
+    }
+    if let Some(v) = a.get("push-range") {
+        spec.push_range = v
+            .parse()
+            .map_err(|_| format!("--push-range {v}: expected mm"))?;
     }
     if let Some(v) = a.get("rip") {
         spec.rip = v.to_string();
@@ -1788,11 +1805,94 @@ fn cmd_nudge(a: &Args) -> CmdResult {
     let failed: HashMap<usize, usize> = best
         .map(|b| b.failed.iter().copied().collect())
         .unwrap_or_default();
+    // optional ROI images of what blocks (`render`)
+    let img_dir = a.get("explain-img");
+    let mut img_n = 0usize;
+    let mut render_roi = |name: &str, roi: geom::BBox, hl: Option<usize>| -> Option<String> {
+        let dir = img_dir?;
+        img_n += 1;
+        if img_n > 12 {
+            return None;
+        }
+        let path = format!("{dir}/{name}.png");
+        let o = render::Opts {
+            roi: Some(roi),
+            layers: render::parse_layers("all").ok()?,
+            nets: None,
+            hl_net: hl,
+            fills: false,
+            labels: true,
+            courtyards: true,
+            opens: true,
+            halo_min: 1.0,
+            drc: Vec::new(),
+            px: 900,
+            per_layer: false,
+            title: name.to_string(),
+        };
+        let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
+        let r = render::render(&m, &o).ok()?;
+        write_bytes(&path, &r.png).ok()?;
+        Some(path)
+    };
+    let fails: HashMap<usize, &nudge::Fail> = best
+        .map(|b| b.fails.iter().map(|f| (f.net, f)).collect())
+        .unwrap_or_default();
     let per_net: Vec<Value> = res
         .nets
         .iter()
-        .map(|n| json!({"net": c.board.nets[*n], "opens_before": res.open_before.get(n).copied().unwrap_or(0), "opens_after": failed.get(n).copied().unwrap_or(0)}))
+        .map(|n| {
+            let mut v = json!({"net": c.board.nets[*n], "opens_before": res.open_before.get(n).copied().unwrap_or(0), "opens_after": failed.get(n).copied().unwrap_or(0)});
+            if let Some(f) = fails.get(n) {
+                v["reason"] = json!(format!("router: {}", f.why));
+                v["components"] = json!(f
+                    .comps
+                    .iter()
+                    .map(|cp| cp.iter().map(|(r, q)| json!({"pin": r, "at": [geom_r(q.x), geom_r(q.y)]})).collect::<Vec<_>>())
+                    .collect::<Vec<_>>());
+                let mut bb = geom::BBox::empty();
+                for (_, q) in f.comps.iter().flatten() {
+                    bb.add(*q);
+                }
+                if bb.valid() {
+                    let name = format!("fail_{}", render::short_net(&c.board.nets[*n]).replace(['/', '\\', ' ', '~', '{', '}'], "_"));
+                    if let Some(pth) = render_roi(&name, bb.inflate(2.0), Some(*n)) {
+                        v["img"] = json!(pth);
+                    }
+                }
+            }
+            v
+        })
         .collect();
+    let reasons: Vec<Value> = res
+        .reasons
+        .iter()
+        .enumerate()
+        .map(|(i, (w, n, at))| {
+            let mut v = json!({"reason": w, "candidates": n, "at": [geom_r(at.x), geom_r(at.y)]});
+            if i < 4 {
+                let roi = geom::BBox::empty_at(*at).inflate(3.0);
+                if let Some(pth) = render_roi(&format!("blocked_{}", i + 1), roi, None) {
+                    v["img"] = json!(pth);
+                }
+            }
+            v
+        })
+        .collect();
+    for rs in res.reasons.iter().take(5) {
+        eprintln!("[nudge]   infeasible x{}: {}", rs.1, rs.0);
+    }
+    let unfilled = c
+        .board
+        .zones
+        .iter()
+        .filter(|z| !z.keepout && z.net != 0 && z.fills.is_empty())
+        .count();
+    let mut warnings: Vec<String> = Vec::new();
+    if unfilled > 0 {
+        warnings.push(format!("{unfilled} copper zones have no saved fill: pour connectivity is unknown, so the opens may be wrong (refill and save the board first, e.g. kicad-cli pcb drc --refill-zones --save-board)"));
+        eprintln!("[nudge] warning: {}", warnings[0]);
+    }
     let mut summary = json!({
         "improved": improved,
         "opens_before": res.opens_before,
@@ -1802,6 +1902,7 @@ fn cmd_nudge(a: &Args) -> CmdResult {
         "ripped_items": res.ripped.len(),
         "region": [geom_r(res.region.x0), geom_r(res.region.y0), geom_r(res.region.x1), geom_r(res.region.y1)],
         "candidates": res.evaluated, "infeasible": res.infeasible,
+        "infeasible_reasons": reasons, "pushed": res.pushed, "warnings": warnings,
         "route_ms_per_candidate": check::round2(res.route_ms),
         "search_s": check::round2(res.search_s),
         "stopped": res.stopped,
