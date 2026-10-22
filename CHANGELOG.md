@@ -14,6 +14,13 @@ All notable changes to this project are documented here. The format follows
 - `explain` and `--explain` / `--explain-img DIR` (route, fanout, stitch, plane report): a
   one-line reason per failure (`congestion`, `routed-copper` with rip-up candidates, `too-narrow`
   with the widest corridor, bottleneck and blockers, `enclosed`) and a ROI image of it.
+- `nudge` joint moves: group shifts of all scanned parts, and `--push R [--push-range 1]` pushes
+  colliding small passives (2-pad SMD) near the move envelopes out of the way within one
+  candidate. `--reach D` routes open connections from the parts up to D mm away,
+  `--rip-classes` rips and reroutes blocking nets of these classes, `--exclude-nets`.
+- `nudge --json` explains failures: `infeasible_reasons` (rule, part, blocking item, position),
+  per failed net the router's reason and the pins of its components; `--explain-img DIR` renders
+  ROI images of them. Warning when copper zones have no saved fill.
 - `nudge`: local placement optimisation by real routing. Movable parts (`--parts`, `--spec` JSON
   with per part offset ranges, grid step, rotations and keep-in, or `--auto` = unlocked 2-pad SMD
   parts near open connections) are searched on a discrete grid (coarse scan + pattern search,

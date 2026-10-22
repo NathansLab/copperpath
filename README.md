@@ -288,6 +288,10 @@ copperpath nudge --pcb board.kicad_pcb --parts R5 --dry-run --json
 # pick the parts automatically: unlocked 2-pad SMD parts within 3 mm of an open connection
 copperpath nudge --pcb board.kicad_pcb --region 40,20,60,35 --auto --auto-dist 3 --auto-max 4 \
   --out nudged.kicad_pcb
+# joint moves: neighbouring small passives within 2 mm may be pushed up to 1.5 mm out of the way;
+# open connections from the parts up to 40 mm away are routed too; LV signal tracks may be ripped
+copperpath nudge --pcb board.kicad_pcb --parts C316 --range 2 --rots 0,90,180,270 --push 2 \
+  --push-range 1.5 --reach 40 --rip-classes "LV_SIG*" --exclude-nets "GND*" --explain-img why/ --out n.kicad_pcb
 # full move spec (per part ranges, rotations, keep-in polygon; see examples/nudge.json)
 copperpath nudge --pcb board.kicad_pcb --spec examples/nudge.json --time-limit 30 --out nudged.kicad_pcb
 ```
@@ -305,6 +309,16 @@ copperpath nudge --pcb board.kicad_pcb --spec examples/nudge.json --time-limit 3
   (`--rip region`; `attached` rips only the copper connected to the movable parts, `none` keeps
   everything), then every candidate is routed by the detailed router inside the region (default:
   the parts' move envelope + `--margin` 2 mm).
+- **Joint moves.** With several parts, candidates also shift all scanned parts together. With
+  `--push R` the small passives (2 SMD pads) within R mm of a part's move envelope join as push
+  parts (range `--push-range`, rotation kept): a move whose courtyard or pads collide with a
+  movable part pushes that part along the move (or away after a pure rotation) until it is
+  clear, up to two levels deep; the repaired candidate is checked and routed like any other
+  (`pushed` counts them). Connectors, ICs and parts not allowed to move are never pushed.
+- **More nets.** `--reach D`: an open connection that starts in the move envelope and ends
+  within D mm is routed too (the region grows to its far end; `log[0].reach` lists them).
+  `--rip-classes PATS`: unlocked copper of nets of these classes inside the region is ripped and
+  rerouted as well (blocking nets). `--exclude-nets PATS`: never routed or ripped (e.g. pours).
 - **Score.** Opens first, then cost = track length + `via_w` (2 mm) per via + `move_w` (2 per mm)
   × moved distance + `rot_w` (0.5) per turned part. The result is written only if it has fewer
   opens than the board as it is (`improved`).
@@ -323,8 +337,14 @@ copperpath nudge --pcb board.kicad_pcb --spec examples/nudge.json --time-limit 3
 `--json` / `OUT_nudge.json`: `moves` (per part `from`/`to` as x, y, rotation and `dx`, `dy`,
 `drot`), `nets` (opens before/after per net), `score` (opens, length, vias, moved mm, rotated
 parts, cost), `opens_before`, `opens` (counted again on the written board), `candidates`,
-`infeasible`, `route_ms_per_candidate`, `search_s`, `stopped`, `log` (search phases and a time
-profile), `ripped_items`, `region`. `--drc` compares kicad-cli DRC before/after as in `route`.
+`infeasible`, `infeasible_reasons` (most frequent rule hits of the rejected candidates: courtyard
+overlap with which part, pad too close to which item of which net, outline, keep-in, edge, rule
+area; with an example position), `pushed`, per failed net `reason` (why the router gave up) and
+`components` (pins per unconnected copper component), `route_ms_per_candidate`, `search_s`, `stopped`, `log` (search phases and a time
+profile), `ripped_items`, `region`, `warnings` (e.g. zones without saved fill: refill the board
+first, otherwise pour connectivity is unknown and the opens are wrong). `--explain-img DIR` renders
+a `render` ROI image (labels, courtyards, ratsnest) per failed net and for the top blocking
+reasons and adds its path as `img`. `--drc` compares kicad-cli DRC before/after as in `route`.
 
 Limits: no side flip; copper graphics inside a moved footprint are not moved in the routing model
 (the written board moves them, KiCad keeps them local); the saved zone fills are not refilled

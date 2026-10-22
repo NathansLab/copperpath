@@ -68,6 +68,19 @@ pub struct Spec {
     pub rot_w: f64,
     /// listed parts may move although they are locked
     pub move_locked: bool,
+    /// open connections that start in the move envelope and end within this distance (mm) are
+    /// routed too: their net joins and the region grows to their far end (0 = off)
+    pub reach: f64,
+    /// net classes (wildcards) whose unlocked copper inside the region is ripped and rerouted
+    /// as well (blocking nets)
+    pub rip_classes: Vec<String>,
+    /// nets (wildcards) never routed or ripped by nudge, e.g. pour nets
+    pub exclude_nets: Vec<String>,
+    /// small passives (2-pad SMD) within this distance (mm) of a movable part's move envelope
+    /// may be pushed out of the way when a move collides with them (0 = off)
+    pub push: f64,
+    /// how far a pushed part may move (mm, each axis)
+    pub push_range: f64,
 }
 
 impl Default for Spec {
@@ -85,6 +98,11 @@ impl Default for Spec {
             move_w: 2.0,
             rot_w: 0.5,
             move_locked: false,
+            reach: 0.0,
+            rip_classes: Vec::new(),
+            exclude_nets: Vec::new(),
+            push: 0.0,
+            push_range: 1.0,
         }
     }
 }
@@ -130,6 +148,8 @@ struct Part {
     /// rule areas owned by the footprint (indices into the cropped board's zones) and their
     /// outlines at the start pose
     zones: Vec<(usize, Vec<P>)>,
+    /// only moved to make room for another part (not scanned on its own)
+    push: bool,
 }
 
 /// a candidate: per part (x steps, y steps, rotation index)
@@ -146,6 +166,18 @@ pub struct Eval {
     pub cost: f64,
     pub routed: HashMap<usize, RNet>,
     pub failed: Vec<(usize, usize)>,
+    /// per failed net: why the router gave up and the pins of its unconnected components
+    pub fails: Vec<Fail>,
+}
+
+/// a net the router could not complete in a candidate
+#[derive(Clone, Debug)]
+pub struct Fail {
+    pub net: usize,
+    pub left: usize,
+    pub why: String,
+    /// pins ("REF.PAD", position) per copper component in the region
+    pub comps: Vec<Vec<(String, P)>>,
 }
 
 impl Eval {
@@ -172,6 +204,10 @@ pub struct Outcome {
     pub route_ms: f64,
     pub stopped: Option<&'static str>,
     pub log: Vec<Value>,
+    /// why candidates were infeasible: (reason, count, example position), most frequent first
+    pub reasons: Vec<(String, usize, P)>,
+    /// joint moves: candidates repaired by pushing neighbours
+    pub pushed: usize,
 }
 
 impl Outcome {
@@ -434,6 +470,42 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
         }
         fis.push(fi);
     }
+    let mut pspecs: Vec<PartSpec> = spec.parts.clone();
+    let mut is_push = vec![false; pspecs.len()];
+    if spec.push > 0.0 {
+        // neighbours that may be pushed: small passives near the move envelopes
+        let mut env: Vec<BBox> = Vec::new();
+        for (ps, &fi) in spec.parts.iter().zip(&fis) {
+            let f = &b.fps[fi];
+            let rg = spec.range;
+            let (dx, dy) = (ps.dx.unwrap_or([-rg, rg]), ps.dy.unwrap_or([-rg, rg]));
+            let mut bb = fp_bbox(f);
+            bb.x0 += dx[0];
+            bb.x1 += dx[1];
+            bb.y0 += dy[0];
+            bb.y1 += dy[1];
+            env.push(bb.inflate(spec.push));
+        }
+        for (fi, f) in b.fps.iter().enumerate() {
+            if fis.contains(&fi) || (f.locked && !spec.move_locked) || !small_passive(f) {
+                continue;
+            }
+            let bb = fp_bbox(f);
+            if env.iter().any(|e| e.overlaps(&bb)) {
+                fis.push(fi);
+                let pr = spec.push_range;
+                pspecs.push(PartSpec {
+                    refd: f.refd.clone(),
+                    dx: Some([-pr, pr]),
+                    dy: Some([-pr, pr]),
+                    step: Some(spec.step),
+                    drot: Some(vec![0.0]),
+                    ..Default::default()
+                });
+                is_push.push(true);
+            }
+        }
+    }
     // ---- region: the move envelope of every part plus the margin
     let region = match spec.region {
         Some(rg) => BBox {
@@ -444,7 +516,7 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
         },
         None => {
             let mut bb = BBox::empty();
-            for (ps, &fi) in spec.parts.iter().zip(&fis) {
+            for (ps, &fi) in pspecs.iter().zip(&fis) {
                 let f = &b.fps[fi];
                 let rg = spec.range;
                 let (dx, dy) = (ps.dx.unwrap_or([-rg, rg]), ps.dy.unwrap_or([-rg, rg]));
@@ -464,7 +536,66 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
     };
     // ---- nets: given, or the parts' nets plus the nets open in the region
     let m0 = Model::new(b, r, cfg.clone(), CopperMode::All);
-    let routable: HashSet<usize> = (0..b.nets.len()).filter(|&n| m0.routable[n]).collect();
+    let excluded = |n: usize| spec.exclude_nets.iter().any(|pt| wild(&b.nets[n], pt));
+    let given = |n: usize| {
+        spec.nets
+            .as_ref()
+            .is_none_or(|pats| pats.iter().any(|pt| wild(&b.nets[n], pt)))
+    };
+    let routable: HashSet<usize> = (0..b.nets.len())
+        .filter(|&n| m0.routable[n] && !excluded(n))
+        .collect();
+    let mut region = region;
+    let mut reach_nets: Vec<Value> = Vec::new();
+    let mut extra: HashSet<usize> = HashSet::new();
+    if spec.reach > 0.0 && spec.region.is_none() {
+        // open connections from the envelope: nearest pin of another component of the net
+        let env = region;
+        let (pins, _) = pins_and_copper_of(&m0, &|n| routable.contains(&n) && given(n));
+        let mut keys: Vec<&usize> = pins.keys().collect();
+        keys.sort();
+        let mut grow = region;
+        for &n in keys {
+            let ps = &pins[&n];
+            let mut best: Option<(f64, P, P)> = None;
+            for a in ps.iter().filter(|a| env.contains(a.at)) {
+                for c in ps.iter().filter(|c| c.comp != a.comp) {
+                    let d = (c.at - a.at).len();
+                    if d <= spec.reach && best.is_none_or(|bb| d < bb.0) {
+                        best = Some((d, a.at, c.at));
+                    }
+                }
+            }
+            if let Some((d, a, c)) = best {
+                extra.insert(n);
+                grow.add(p(c.x - spec.margin, c.y - spec.margin));
+                grow.add(p(c.x + spec.margin, c.y + spec.margin));
+                reach_nets.push(json!({"net": b.nets[n], "from": [round3(a.x), round3(a.y)], "to": [round3(c.x), round3(c.y)], "mm": round3(d)}));
+            }
+        }
+        region = grow;
+    }
+    if !spec.rip_classes.is_empty() {
+        // blocking nets: unlocked copper of these classes inside the region
+        for t in &b.tracks {
+            if !t.locked && region.contains(t.a) && region.contains(t.b) {
+                extra.insert(t.net);
+            }
+        }
+        for v in &b.vias {
+            if !v.locked && region.contains(v.at) {
+                extra.insert(v.net);
+            }
+        }
+        extra.retain(|&n| {
+            routable.contains(&n)
+                && (reach_nets.iter().any(|x| x["net"] == b.nets[n].as_str())
+                    || spec
+                        .rip_classes
+                        .iter()
+                        .any(|pt| wild(&r.class_of(n).name, pt)))
+        });
+    }
     let open0 = opens_in(&m0, &region, &routable);
     let mut nets: HashSet<usize> = match &spec.nets {
         Some(pats) => (0..b.nets.len())
@@ -482,6 +613,7 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
             s
         }
     };
+    nets.extend(extra.iter().copied());
     nets.retain(|n| routable.contains(n));
     let mut net_list: Vec<usize> = nets.iter().copied().collect();
     net_list.sort_unstable();
@@ -511,8 +643,10 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
             search_s: t0.elapsed().as_secs_f64(),
             route_ms: 0.0,
             stopped: None,
+            reasons: Vec::new(),
+            pushed: 0,
             log: vec![
-                json!({"phase": "start", "note": "no open connection of the routed nets in the region"}),
+                json!({"phase": "start", "note": "no open connection of the routed nets in the region", "reach": reach_nets}),
             ],
         });
     }
@@ -532,13 +666,13 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
     let win = region.inflate(o.params.job_margin + maxd + 3.0);
     let mut cb = crop(b, &win, &nets, &ripped_set);
     for f in cb.fps.iter_mut() {
-        if spec.parts.iter().any(|ps| ps.refd == f.refd) {
+        if pspecs.iter().any(|ps| ps.refd == f.refd) {
             f.locked = false; // --move-locked (the placement checker skips locked parts)
         }
     }
     let cb = cb;
     let mut parts = Vec::new();
-    for (ps, &fi) in spec.parts.iter().zip(&fis) {
+    for ((ps, &fi), &push) in pspecs.iter().zip(&fis).zip(&is_push) {
         let f = &b.fps[fi];
         let step = ps.step.unwrap_or(spec.step).max(1e-3);
         let rg = spec.range;
@@ -582,6 +716,7 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
                 .filter(|(_, z)| z.fp.as_deref() == Some(f.refd.as_str()))
                 .map(|(i, z)| (i, z.outline.clone()))
                 .collect(),
+            push,
         });
     }
     // ---- hard placement rules (placement checker of `place`) on the ripped, cropped board
@@ -645,6 +780,247 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
     let start: Cand = parts.iter().map(|_| (0, 0, 0)).collect();
     let v0 = viol(&start);
     let feasible = |c: &Cand| viol(c).iter().zip(&v0).all(|(a, b)| a <= b);
+    let placed_of = |k: usize, ck: (i32, i32, usize)| -> place::Placed {
+        let (at, rot) = pose_of(&parts[k], ck);
+        let f = &cb.fps[parts[k].fi];
+        place::place_part(
+            f,
+            &place::Pose {
+                at,
+                rot,
+                back: f.back,
+            },
+        )
+    };
+    let back_of = |k: usize| cb.fps[parts[k].fi].back;
+    let collide = |a: &place::Placed, ab: bool, c: &place::Placed, cbk: bool| -> bool {
+        if !a.cbb.inflate(1.0).overlaps(&c.cbb.inflate(1.0)) && !a.pbb.inflate(1.0).overlaps(&c.pbb)
+        {
+            return false;
+        }
+        if ab == cbk
+            && a.crtyd.len() >= 3
+            && c.crtyd.len() >= 3
+            && place::poly_overlap(&a.crtyd, &c.crtyd)
+        {
+            return true;
+        }
+        for (s, la, na, _, _) in &a.pads {
+            for (t, lb, nb, _, _) in &c.pads {
+                let common = la & lb;
+                if common == 0 || (na == nb && *na != 0) {
+                    continue;
+                }
+                let mut cl: f64 = 0.0;
+                for l in 0..NL {
+                    if common & (1 << l) != 0 {
+                        cl = cl.max(r.clr(*na, *nb, is_outer(l)));
+                    }
+                }
+                if s.bbox().inflate(cl).overlaps(&t.bbox()) && shape_dist(s, t) < cl - 1e-4 {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    // joint move: the parts that moved against `base` push the movable parts they collide with
+    // along their own move (or away from them after a pure rotation), up to two levels deep
+    let repair = |c: &Cand, base: &Cand| -> Option<Cand> {
+        let n = parts.len();
+        let mut c = c.clone();
+        let mut moved: Vec<usize> = (0..n).filter(|&i| c[i] != base[i]).collect();
+        if moved.is_empty() {
+            return None;
+        }
+        for _ in 0..3 {
+            if feasible(&c) {
+                return Some(c);
+            }
+            let mut pushed_any = false;
+            let snapshot = moved.clone();
+            for &k in &snapshot {
+                let pk = placed_of(k, c[k]);
+                for j in 0..n {
+                    if moved.contains(&j)
+                        || !collide(&pk, back_of(k), &placed_of(j, c[j]), back_of(j))
+                    {
+                        continue;
+                    }
+                    let (ak, _) = pose_of(&parts[k], c[k]);
+                    let (ak0, _) = pose_of(&parts[k], base[k]);
+                    let (aj, _) = pose_of(&parts[j], c[j]);
+                    let mut d = ak - ak0;
+                    if d.len() < 1e-9 {
+                        d = aj - ak;
+                    }
+                    let l = d.len().max(1e-9);
+                    let sx = if d.x.abs() > 0.3 * l {
+                        d.x.signum() as i32
+                    } else {
+                        0
+                    };
+                    let sy = if d.y.abs() > 0.3 * l {
+                        d.y.signum() as i32
+                    } else {
+                        0
+                    };
+                    if sx == 0 && sy == 0 {
+                        return None;
+                    }
+                    let pj = &parts[j];
+                    let (xj, yj, rj) = c[j];
+                    let mut ok = false;
+                    for t in 1..=(pj.ix.1 - pj.ix.0).max(pj.iy.1 - pj.iy.0) {
+                        let (nx, ny) = (xj + sx * t, yj + sy * t);
+                        if nx < pj.ix.0 || nx > pj.ix.1 || ny < pj.iy.0 || ny > pj.iy.1 {
+                            break;
+                        }
+                        if !collide(&pk, back_of(k), &placed_of(j, (nx, ny, rj)), back_of(j)) {
+                            c[j] = (nx, ny, rj);
+                            ok = true;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        return None;
+                    }
+                    moved.push(j);
+                    pushed_any = true;
+                }
+            }
+            if !pushed_any {
+                return None;
+            }
+        }
+        feasible(&c).then_some(c)
+    };
+    // what makes a candidate infeasible (rule, part, other item; example position)
+    let kind_name = |o: &Obj| -> String {
+        match o.kind {
+            Kind::Pad { fp, pad } => {
+                format!("pad {}.{}", cb.fps[fp].refd, cb.fps[fp].pads[pad].num)
+            }
+            Kind::Track => "track".into(),
+            Kind::Via => "via".into(),
+            Kind::Zone => "zone".into(),
+            Kind::Keepout { .. } => "rule area".into(),
+            Kind::ViaKeepout => "via keepout".into(),
+            Kind::Mask { .. } => "mask aperture".into(),
+        }
+    };
+    let explain = |c: &Cand| -> Vec<(String, P)> {
+        let mut out: Vec<(String, P)> = Vec::new();
+        let vs = viol(c);
+        for k in 0..parts.len() {
+            if vs[pidx[k]] <= v0[pidx[k]] {
+                continue;
+            }
+            let pk = placed_of(k, c[k]);
+            let rf = &parts[k].refd;
+            let (at, _) = pose_of(&parts[k], c[k]);
+            if !cb.edge.is_empty() && !pk.crtyd.iter().all(|q| cb.inside(*q)) {
+                out.push((format!("{rf}: courtyard outside the board outline"), at));
+            }
+            if let Some(kp) = &parts[k].keepin {
+                if !pk.crtyd.iter().all(|q| point_in_poly(*q, kp)) {
+                    out.push((format!("{rf}: outside its keep-in"), at));
+                }
+            }
+            let bk = back_of(k);
+            for (fi, f) in cb.fps.iter().enumerate() {
+                if f.back != bk || f.crtyd.len() < 3 {
+                    continue;
+                }
+                let other = parts.iter().position(|pt| pt.fi == fi);
+                if other == Some(k) {
+                    continue;
+                }
+                let cr = match other {
+                    Some(j) => placed_of(j, c[j]).crtyd,
+                    None => f.crtyd_world(),
+                };
+                if place::poly_overlap(&pk.crtyd, &cr) {
+                    let q = cr.iter().copied().fold(p(0.0, 0.0), |s, q| s + q)
+                        * (1.0 / cr.len() as f64);
+                    out.push((format!("{rf}: courtyard overlaps {}", f.refd), q));
+                }
+            }
+            for (s, layers, net, _, pi) in &pk.pads {
+                let sb = s.bbox();
+                let num = &cb.fps[parts[k].fi].pads[*pi].num;
+                for o in &pb.fixed {
+                    let common = layers & o.layers;
+                    if common == 0
+                        || matches!(o.kind, Kind::ViaKeepout | Kind::Keepout { .. })
+                        || !sb.inflate(pb.maxclr + 0.2).overlaps(&o.bbox)
+                    {
+                        continue;
+                    }
+                    let mut cl: f64 = -1.0;
+                    for l in 0..NL {
+                        if common & (1 << l) != 0 {
+                            cl = cl.max(mc.clr(*net, o, l));
+                        }
+                    }
+                    if matches!(o.kind, Kind::Via) {
+                        cl = cl.max(0.2);
+                    }
+                    if cl < 0.0 {
+                        continue;
+                    }
+                    if shape_dist(s, &o.shape) < cl - 1e-4 {
+                        let on = if o.net != 0 {
+                            format!(" of {}", b.nets[o.net])
+                        } else {
+                            String::new()
+                        };
+                        out.push((
+                            format!(
+                                "{rf}.{num} ({}): too close to {}{on} (needs {:.2} mm)",
+                                if *net == 0 {
+                                    "no net"
+                                } else {
+                                    b.nets[*net].as_str()
+                                },
+                                kind_name(o),
+                                cl
+                            ),
+                            sb.center(),
+                        ));
+                    }
+                }
+                let ec = r.edge_clearance(*net);
+                for (a, e) in &cb.edge_segs {
+                    if shape_dist(
+                        s,
+                        &Shape::Capsule {
+                            a: *a,
+                            b: *e,
+                            r: 0.0,
+                        },
+                    ) < ec - 1e-4
+                    {
+                        out.push((
+                            format!("{rf}.{num}: board edge clearance {:.2}", ec),
+                            sb.center(),
+                        ));
+                        break;
+                    }
+                }
+            }
+            for z in &cb.zones {
+                if z.keepout && z.ko_footprints && z.outline.len() >= 3 {
+                    let side_bit = if bk { 1 << 5 } else { 1 };
+                    if z.layers & side_bit != 0 && place::poly_overlap(&pk.crtyd, &z.outline) {
+                        out.push((format!("{rf}: courtyard in a footprint rule area"), at));
+                    }
+                }
+            }
+        }
+        out.truncate(4);
+        out
+    };
     // ---- maps of everything that stays, shared by all candidates
     let tf = Instant::now();
     let was_quiet = droute::QUIET.swap(true, std::sync::atomic::Ordering::Relaxed);
@@ -687,6 +1063,30 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
         prof[1].fetch_add(us(t2 - t1), Relaxed);
         prof[2].fetch_add(us(t2.elapsed()), Relaxed);
         let opens: usize = res.failed.iter().map(|f| f.1).sum();
+        let fails: Vec<Fail> = res
+            .failed
+            .iter()
+            .zip(&res.why)
+            .map(|(&(net, left), why)| {
+                let mut comps: Vec<(usize, Vec<(String, P)>)> = Vec::new();
+                if let Some(j) = rt.jobs.iter().find(|j| j.net == net) {
+                    for pn in &j.pins {
+                        let f = &m.b.fps[pn.fp];
+                        let e = (format!("{}.{}", f.refd, f.pads[pn.pad].num), pn.at);
+                        match comps.iter_mut().find(|c| c.0 == pn.comp) {
+                            Some(c) => c.1.push(e),
+                            None => comps.push((pn.comp, vec![e])),
+                        }
+                    }
+                }
+                Fail {
+                    net,
+                    left,
+                    why: why.to_string(),
+                    comps: comps.into_iter().map(|c| c.1).collect(),
+                }
+            })
+            .collect();
         let length: f64 = res
             .routed
             .values()
@@ -706,6 +1106,7 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
                 + spec.rot_w * rotated as f64,
             routed: res.routed,
             failed: res.failed,
+            fails,
         }
     };
     // ---- search: coarse scan per part, then pattern refinement, rounds over all parts
@@ -717,11 +1118,16 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
     let mut route_s = 0.0f64;
     let mut log: Vec<Value> = Vec::new();
     // evaluates the new candidates of `cs` (parallel), returns the best of all of `cs`
+    let mut reasons: HashMap<String, (usize, P)> = HashMap::new();
+    let mut pushed = 0usize;
+    let joint = parts.len() > 1;
     let mut batch = |cs: Vec<Cand>,
+                     base: &Cand,
                      cache: &mut HashMap<Cand, Option<Eval>>,
                      evaluated: &mut usize,
                      infeasible: &mut usize|
      -> Option<(Cand, Eval)> {
+        let mut cs = cs;
         let mut new: Vec<Cand> = cs
             .iter()
             .filter(|c| !cache.contains_key(*c))
@@ -729,14 +1135,36 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
             .collect();
         new.sort();
         new.dedup();
-        let ok: Vec<bool> = new.par_iter().map(&feasible).collect();
+        // infeasible: a joint move that pushes the colliding movable parts, else the reasons
+        type Check = (bool, Option<Cand>, Vec<(String, P)>);
+        let ok: Vec<Check> = new
+            .par_iter()
+            .map(|c| {
+                if feasible(c) {
+                    return (true, None, Vec::new());
+                }
+                let rc = if joint { repair(c, base) } else { None };
+                let why = if rc.is_none() { explain(c) } else { Vec::new() };
+                (false, rc, why)
+            })
+            .collect();
         let mut todo = Vec::new();
-        for (c, f) in new.into_iter().zip(ok) {
+        for (c, (f, rc, why)) in new.into_iter().zip(ok) {
             if f {
                 todo.push(c);
-            } else {
-                *infeasible += 1;
-                cache.insert(c, None);
+                continue;
+            }
+            *infeasible += 1;
+            cache.insert(c, None);
+            if let Some(rc) = rc {
+                if !cache.contains_key(&rc) && !todo.contains(&rc) {
+                    pushed += 1;
+                    todo.push(rc.clone());
+                }
+                cs.push(rc);
+            }
+            for (w, at) in why {
+                reasons.entry(w).or_insert((0, at)).0 += 1;
             }
         }
         let room = o.max_cands.saturating_sub(*evaluated);
@@ -780,13 +1208,14 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
     let mut cur = start.clone();
     let mut best: Option<Eval> = batch(
         vec![start.clone()],
+        &start,
         &mut cache,
         &mut evaluated,
         &mut infeasible,
     )
     .map(|x| x.1);
     if let Some(e) = &best {
-        log.push(json!({"phase": "start", "opens": e.opens, "cost": round3(e.cost)}));
+        log.push(json!({"phase": "start", "opens": e.opens, "cost": round3(e.cost), "reach": reach_nets}));
     }
     let take = |cand: Option<(Cand, Eval)>, cur: &mut Cand, best: &mut Option<Eval>| -> bool {
         if let Some((c, e)) = cand {
@@ -805,6 +1234,9 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
                 break;
             }
             let pt = &parts[k];
+            if pt.push {
+                continue; // pushed parts move only to make room
+            }
             let span = (pt.ix.1 - pt.ix.0).max(pt.iy.1 - pt.iy.0);
             let mut s = if round == 0 {
                 // coarse scan of the whole move space of this part
@@ -818,7 +1250,8 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
                         }
                     }
                 }
-                let b = batch(cs, &mut cache, &mut evaluated, &mut infeasible);
+                let base = cur.clone();
+                let b = batch(cs, &base, &mut cache, &mut evaluated, &mut infeasible);
                 if take(b, &mut cur, &mut best) {
                     improved = true;
                 }
@@ -853,7 +1286,26 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
                     c[k] = (x, y, r2);
                     cs.push(c);
                 }
-                let b = batch(cs, &mut cache, &mut evaluated, &mut infeasible);
+                // group moves: all scanned parts shift together
+                if parts.iter().filter(|q| !q.push).count() > 1 {
+                    for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        let mut c = cur.clone();
+                        let mut inside = true;
+                        for (i, q) in parts.iter().enumerate() {
+                            if q.push {
+                                continue;
+                            }
+                            let (nx, ny) = (c[i].0 + dx * s, c[i].1 + dy * s);
+                            inside &= nx >= q.ix.0 && nx <= q.ix.1 && ny >= q.iy.0 && ny <= q.iy.1;
+                            c[i] = (nx, ny, c[i].2);
+                        }
+                        if inside {
+                            cs.push(c);
+                        }
+                    }
+                }
+                let base = cur.clone();
+                let b = batch(cs, &base, &mut cache, &mut evaluated, &mut infeasible);
                 if take(b, &mut cur, &mut best) {
                     improved = true;
                 } else {
@@ -897,6 +1349,10 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
     } else {
         None
     };
+    let mut reasons: Vec<(String, usize, P)> =
+        reasons.into_iter().map(|(k, (n, at))| (k, n, at)).collect();
+    reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    reasons.truncate(15);
     let moves = parts
         .iter()
         .zip(&cur)
@@ -923,7 +1379,35 @@ pub fn run(b: &Board, r: &Rules, cfg: &BoardCfg, spec: &Spec, o: &Opts) -> Resul
         },
         stopped,
         log,
+        reasons,
+        pushed,
     })
+}
+
+/// bounding box of a footprint's courtyard and pads in board coordinates
+fn fp_bbox(f: &Footprint) -> BBox {
+    let mut bb = BBox::empty();
+    for q in f.crtyd_world() {
+        bb.add(q);
+    }
+    for pd in &f.pads {
+        for s in f.pad_shapes(pd) {
+            let sb = s.bbox();
+            bb.add(p(sb.x0, sb.y0));
+            bb.add(p(sb.x1, sb.y1));
+        }
+    }
+    bb
+}
+
+/// a small passive: exactly two copper pads, both SMD
+pub fn small_passive(f: &Footprint) -> bool {
+    let cu: Vec<&Pad> = f
+        .pads
+        .iter()
+        .filter(|pd| pd.kind != "np_thru_hole" && pd.layers != 0)
+        .collect();
+    cu.len() == 2 && cu.iter().all(|pd| pd.kind == "smd")
 }
 
 fn round3(v: f64) -> f64 {
@@ -959,14 +1443,14 @@ pub fn auto_parts(
     }
     let mut cand: Vec<(f64, String)> = Vec::new();
     for f in &b.fps {
+        if f.locked || !small_passive(f) {
+            continue;
+        }
         let cu: Vec<&Pad> = f
             .pads
             .iter()
             .filter(|pd| pd.kind != "np_thru_hole" && pd.layers != 0)
             .collect();
-        if f.locked || cu.len() != 2 || !cu.iter().all(|pd| pd.kind == "smd") {
-            continue;
-        }
         let d = cu
             .iter()
             .map(|pd| f.pad_world(pd).0)

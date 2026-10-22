@@ -322,7 +322,7 @@ pub fn place_part(f: &Footprint, pose: &Pose) -> Placed {
     }
 }
 
-fn poly_overlap(a: &[P], b: &[P]) -> bool {
+pub fn poly_overlap(a: &[P], b: &[P]) -> bool {
     if a.len() < 3 || b.len() < 3 {
         return false;
     }
