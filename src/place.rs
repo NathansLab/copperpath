@@ -482,16 +482,15 @@ impl<'a> Problem<'a> {
             .iter()
             .enumerate()
             .filter(|(fi, _)| !idx_of_fp.contains_key(fi))
-            .filter_map(|(_, f)| {
-                let c = f.crtyd_world();
-                if c.len() < 3 {
-                    return None;
-                }
-                let mut bb = BBox::empty();
-                for q in &c {
-                    bb.add(*q);
-                }
-                Some((c, bb, f.back))
+            .flat_map(|(_, f)| {
+                // each courtyard polygon of a footprint on its own (no hull over a header pair)
+                f.crtyd_parts_world().into_iter().map(move |c| {
+                    let mut bb = BBox::empty();
+                    for q in &c {
+                        bb.add(*q);
+                    }
+                    (c, bb, f.back)
+                })
             })
             .collect();
         // nets
