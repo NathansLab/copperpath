@@ -88,6 +88,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `--time-limit S` | | stop negotiating in time and write the best iteration so far (conflicting nets ripped and rerouted, or left as failed); SIGTERM / Ctrl+C (Ctrl+Break on Windows) do the same at once. `--json` reports `stopped` (`time-limit`, `signal`, `cancel`) and `hotspots` (net, conflict cells, location, layer) |
 | `--cancel-file PATH` | | stop like `--time-limit` as soon as this file exists (checked once per second); a cancel path that also works on Windows, where a GUI can only kill the process otherwise. The file should not exist at the start |
 | `--cancel-on-stdin-eof` | | stop like `--time-limit` when stdin is closed, e.g. because the calling plugin or KiCad ended |
+| `--progress-json` | | machine-readable progress on stderr, one JSON object per line ([events](#progress-events---progress-json)) |
 | `--stall-iters` | 3 | stop negotiating after this many iterations without fewer conflict cells, then rip up and reroute the conflicting nets |
 | `--stall-gain` | 0 | an iteration counts as progress only if it cuts the best conflict count by this fraction (0.1 = 10 %); stops plateaus early |
 | `--no-fallback` | off | skip the cleanup fallback ladder (two more full routes when the exact check drops nets); the dropped nets stay open and are reported |
@@ -97,7 +98,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `--stub-ext` / `--stub-ext-long` | 0.6 / 0.6 | exit stub length beyond the pad (mm) |
 | `--own-pad-cost` / `--stub-side-cost` | 40 / 20 | cost of crossing own pads / of side exits on long pads |
 | `--yield-pours PATTERNS` | | locked pours (zone name wildcards) that do not block (KiCad refills them); also `yield_pours` in the config |
-| `--ignore-unlocked` | | ignore unlocked tracks/vias of the input (old behaviour; by default all existing copper blocks other nets) |
+| `--ignore-unlocked` | | the router does not see unlocked tracks, vias and zones of the input, but they stay in the output (route never removes copper), so new copper can overlap or short them. Only for experiments where the old copper is deleted afterwards; rip up instead (see below) |
 | `--reroute-blockers` | | after routing, for each net still open: a coarse search (0.1 mm, all layers) in which unlocked tracks/vias of other nets are passable at a high cost finds the cheapest corridor; the unlocked copper on it is ripped and the net is routed again together with the ripped nets (negotiated as usual). A try is kept only if the net gets fewer opens and no ripped net and no other net ends up with more opens; otherwise it is rolled back. Locked copper, pads, rule areas and the edge are never moved. `--json`: `reroute` = per net `ripped_nets`, `ripped_items`, `accepted`, opens before/after, `reason` |
 | `--max-ripped N` / `--max-targets N` | 3 / 10 | blocking nets ripped per try / open nets tried |
 | `--dbg-net NAME` | | verbose trace of one net |
@@ -310,6 +311,20 @@ Example reason: `widest free corridor fits a 0.05 mm track < 0.20 mm needed at (
 F.Cu: blocked by locked track SIG on F.Cu (0.20 mm away, needs 0.20)`. Options: `--explain-max`
 (20), `--explain-px` (900). About 0.05 s per connection including the image.
 
+### Existing copper, "route the rest" and rip-up
+
+`route` never removes or moves existing copper: every track, via and zone of the input stays in
+the output with its UUID, and the delta's `remove` list is empty. Existing tracks and vias of a
+net count as connectivity for that net and as obstacles for all other nets, locked or not
+(unlocked zones yield, KiCad refills them). So routing
+again after manual work only adds the missing connections ("route the rest"); a separate
+`--lock-all-existing` option is not needed, it is the default. New copper is written unlocked
+with fresh UUIDs (seeded from the input board, so a second run never repeats the first run's
+UUIDs).
+
+To redo nets, rip them up first: delete their unlocked tracks and vias (in KiCad, or with the
+plugin's **Rip up selected nets**), then route them with `--nets`.
+
 ## How routing works
 
 - **Model.** Grid of 0.05 mm cells on every copper layer of the board, 8 directions plus through
@@ -501,10 +516,37 @@ explicitly then (stdin is read to the end, so cancel with `--cancel-file`, not
   to rounding; `v` is the schema version.
 - `remove`: UUIDs of input items that were ripped up or replaced. `route` keeps all existing
   copper today, so the list is empty; the field is there for the incremental modes.
+- `add` items carry no UUID; KiCad assigns one when the plugin creates them.
 - `add`: new items in output order. The router emits `track` and through `via` items; `arc` is
   part of the schema for later cleanup steps.
 - Applying the delta to the input board (`copperpath::delta::apply`) gives the same copper as
   `--out` (tested on the demo: same tracks and vias within 1 nm, same opens).
+
+### Progress events (`--progress-json`)
+
+`route --progress-json` writes one JSON object per line (NDJSON) to **stderr**, between the
+normal log lines, for a progress bar in a GUI. Each line is written and flushed at once, so a
+reader never sees a fragment; lines starting with `{` are events, all others are log. stdout and
+the output files are unchanged, and without the flag no event is written.
+
+```json
+{"ev":"phase","phase":"droute","t":0.41}
+{"ev":"iter","iter":0,"conflict_cells":412,"nets_conflicted":9,"nets_left":14,"nets_total":120,"iters_max":25,"eta_s":90.0,"t":12.3}
+{"ev":"done","v":1,"ok":true,"routed":118,"failed":2,"opens":2,"stopped":null,"out":null,"delta_json":"delta.json","t":180.3}
+```
+
+- `t`: seconds since the start (every event).
+- `phase`: `load`, `droute` (maps and negotiation), `resolve` (rip-up and hard reroute of the
+  remaining conflicts), `clean` (final polish and exact check), `fallback` (the cleanup fallback
+  runs, if needed), `write`, `check` (opens, `--drc`). `resolve` and `fallback` are skipped when
+  not needed.
+- `iter`: one per negotiation iteration (counted from 0, at most `iters_max`). `nets_left`: nets
+  with conflicts or unrouted connections; `eta_s`: rough time to the end of the negotiation (mean
+  iteration time × iterations left, capped by `--time-limit`; 0 once there are no conflicts;
+  `null` if unknown). The negotiation often stops early on a plateau (`--stall-iters`), so treat
+  the ETA as an upper bound.
+- `done`: always the last event, also on errors (`"ok":false,"error":"…"`). `v` is the schema
+  version; `stopped` is `null`, `time-limit`, `signal` or `cancel` as in `--json`.
 
 ## Comparison with Freerouting
 
@@ -564,7 +606,11 @@ Run the `pcbnew` scripts with KiCad's bundled Python (e.g. on macOS
 
 [`kicad-plugin/`](kicad-plugin/README.md) adds a **Route with copperpath** button to the KiCad
 9/10 PCB editor (IPC API). It routes the open board and pushes the result as one commit, so one
-Ctrl+Z undoes it and no file is reloaded.
+Ctrl+Z undoes it and no file is reloaded. Further actions work on the selection: **Route selected
+nets**, **Route region** (a rectangle on a User layer), **Rip up selected nets** and **Rip up and
+reroute selected nets**. While copperpath runs, a progress dialog shows the phase, iteration,
+conflicts, nets left and an ETA; the editor stays usable, and the route can be stopped (the best
+result so far is applied) or cancelled and discarded.
 
 ## Contributing and issues
 

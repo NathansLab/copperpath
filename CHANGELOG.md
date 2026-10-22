@@ -157,6 +157,8 @@ All notable changes to this project are documented here. The format follows
 - Tracks and vias of other nets stay out of solder mask apertures: F.Mask/B.Mask graphics of
   footprints and the board (e.g. over a solder jumper) and pad mask expansions only admit the
   nets of the pads and locked zones inside them; no more `solder_mask_bridge` (#3).
+- `route --out` on an already routed board handed out the earlier run's UUIDs again (fixed
+  seed); the seed now comes from the input board (#22).
 - `class_layers`: the most specific matching pattern wins; before, `"*"` won because JSON keys
   are sorted. The log prints the effective layers per class (#38).
 - A multi-pin net whose start pin cannot be joined keeps the rest of its routing (the tree is
@@ -206,6 +208,20 @@ All notable changes to this project are documented here. The format follows
 - `route --delta-json FILE` (or `-` for stdout): added and removed items in integer nanometres
   for the KiCad IPC API, with or instead of `--out`; `--pcb -` reads the board from stdin.
   `copperpath::delta::apply` applies a delta to board text (#20).
+- KiCad plugin: **Route selected nets** (`--nets` from the selected tracks, vias, pads and
+  footprints), **Route region** (`--region` from a selected rectangle or zone), **Rip up selected
+  nets** and **Rip up and reroute** (rip-up and route as two commits). Route deltas that remove
+  copper or touch nets outside the selection are refused; `--ignore-unlocked` is refused in the
+  plugin settings. README documents that `route` never changes existing copper ("route the
+  rest") and what `--ignore-unlocked` does (#22).
+- `route --progress-json`: NDJSON progress events on stderr (`phase`, one `iter` per negotiation
+  iteration with conflict cells, nets left and an ETA, a final versioned `done`); without the
+  flag the output is unchanged (#18).
+- KiCad plugin: progress dialog (phase, iteration, conflict cells, nets left, progress bar, ETA)
+  while copperpath runs; the editor stays usable. **Stop and apply best result** cancels the
+  router and applies its best result as one commit, **Cancel and discard** throws it away. If the
+  board changed during the run, the plugin asks before applying. The board goes to copperpath
+  as a temporary file so stdin stays open: the router stops when the plugin ends (#23).
 
 ## [0.1.0] - 2026-10-21
 
