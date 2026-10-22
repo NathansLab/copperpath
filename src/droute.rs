@@ -374,6 +374,8 @@ pub struct AesStats {
     pub jogs: usize,
     pub kept90: [usize; 5],
     pub exact_fail: usize,
+    /// nets whose copper failed the exact check and was not written
+    pub exact_dropped: usize,
 }
 
 /// min-heap of u64 with four children per node: same pop order as a binary heap, fewer levels
@@ -1400,7 +1402,7 @@ impl<'a> Router<'a> {
             .filter(|k| left[*k] > 0)
             .map(|k| (self.jobs[k].net, left[k]))
             .collect();
-        let why = (0..nj)
+        let why: Vec<&'static str> = (0..nj)
             .filter(|k| left[*k] > 0)
             .map(
                 |k| match self.why[k].load(std::sync::atomic::Ordering::Relaxed) {
@@ -1506,7 +1508,7 @@ impl<'a> Router<'a> {
             }
         }
         // exact verification of all routed copper (fixed objects + other nets)
-        let fails: Vec<String> = (0..nj)
+        let fails: Vec<(usize, String)> = (0..nj)
             .into_par_iter()
             .flat_map(|k| {
                 let fr = self.foreign(k, &routed);
@@ -1517,9 +1519,18 @@ impl<'a> Router<'a> {
                     if !ck.seg_ok_fixed(job.net, sg.a, sg.b, hw, sg.l)
                         || !ck.seg_ok_foreign(job.net, sg.a, sg.b, hw, sg.l, &fr)
                     {
-                        out.push(format!(
-                            "{} {} ({:.3},{:.3})-({:.3},{:.3}) w {}",
-                            self.m.b.nets[job.net], CU[sg.l], sg.a.x, sg.a.y, sg.b.x, sg.b.y, sg.w
+                        out.push((
+                            k,
+                            format!(
+                                "{} {} ({:.3},{:.3})-({:.3},{:.3}) w {}",
+                                self.m.b.nets[job.net],
+                                CU[sg.l],
+                                sg.a.x,
+                                sg.a.y,
+                                sg.b.x,
+                                sg.b.y,
+                                sg.w
+                            ),
                         ));
                     }
                 }
@@ -1528,10 +1539,28 @@ impl<'a> Router<'a> {
             .collect();
         stats.exact_fail = fails.len();
         if dbg {
-            for f in &fails {
+            for (_, f) in &fails {
                 eprintln!("[dbg] exact check fails: {f}");
             }
         }
+        // never write copper that fails the exact check: such a net is dropped (left open)
+        let mut failed = failed;
+        let mut why = why;
+        let mut bad: Vec<usize> = fails.iter().map(|(k, _)| *k).collect();
+        bad.sort();
+        bad.dedup();
+        for &k in &bad {
+            eprintln!(
+                "[route] {}: routed copper fails the exact clearance check, net dropped (left open)",
+                self.m.b.nets[self.jobs[k].net]
+            );
+            routed[k] = RNet::default();
+            if !failed.iter().any(|(n, _)| *n == self.jobs[k].net) {
+                failed.push((self.jobs[k].net, 1));
+                why.push("exact-check");
+            }
+        }
+        stats.exact_dropped = bad.len();
         DResult {
             stats,
             routed: (0..nj)

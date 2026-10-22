@@ -64,6 +64,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `fanout --net GND --plane REGEX [--reach 6] --out OUT.kicad_pcb` | Connects every open island of a plane net (a copper island with pads that touches no fill of a `--plane` zone) with one short track and a via onto the plane: grid search (0.05 mm, 8 directions) from an SMD pad of the island on its outer layer to the nearest legal via spot within `--reach` mm of track. Track legality as in the router (DRU/net-class clearance incl. outer-layer creepage, rule areas, mask apertures, edge); via legality as in `stitch`. Width: `--width` or the net class / DRU width, inside the pad's own courtyard the width of a DRU `track_width` rule with `A.intersectsCourtyard('REF')` (neck-down). Pads whose own cells are already too close to other copper (in-package creepage) are skipped. Options: `--via D,DRILL`, `--margin`, `--min-clr`, `--islands opens.json` (only islands listed by `opens --json`), `--base`. `--json` lists per island the pad used, track length and via, or why each pad failed and the nearest blockers (`net`, `kind`, `fp`, `layer`, `dist_mm`, `need_mm`, `locked`, `at`: the copper closest to violating its clearance, i.e. what to move). The search runs in 8 directions, so 45-degree tracks to a via spot are tried as well. |
 | `nudge (--parts R5,R7 \| --spec moves.json \| --auto) [--range 1] [--step 0.05] [--rots 0,90] --out OUT.kicad_pcb [--dry-run]` | Local placement optimisation by real routing: moves a few small parts (translation on a grid, rotation about the footprint origin, side kept) until their nets route, see [Nudge](#nudge-local-placement-by-real-routing). Writes the moved footprints and the new copper to a copy and `OUT_nudge.json`. |
 | `render [--roi x0,y0,x1,y1] --out roi.png` | PNG of a board region for AI agents and humans, native rasteriser (about 0.05 s per image). See [Rendering](#rendering-render). |
+| `autoroute --out OUT.kicad_pcb [--time 600] [--planes In1.Cu=GND]` | Placed board to routed board in one command: plane zones, plane fanout, signal routing, rip-up of blockers, stitching, quality gate. See [One-shot routing](#one-shot-routing-autoroute). |
 | `explain [--net N] [--pad REF.PIN] [--explain-img DIR]` | Why connections are open: reason, widest corridor, blockers, ROI image. See [Explaining failures](#explaining-failures-explain). |
 | `plane list\|report\|fill\|create\|adjust` | Plane zones: detection, native zone filler, report (islands, unconnected pads, necks, stitching coverage), zone creation with HV cut-back, grow/merge. See [Planes](#planes-plane). |
 | `pads` | Pad world positions, sizes and nets (tab separated). |
@@ -167,6 +168,44 @@ that both hold copper of the net meet (widest-path tree over the distance to the
 `--native-fill` on `fanout`, `stitch`, `opens` and `render` fills all copper zones natively first
 (instead of the saved fills), so the plane loop needs no kicad-cli refill.
 
+## One-shot routing (`autoroute`)
+
+```bash
+$B autoroute --pcb placed.kicad_pcb --planes In1.Cu=GND,In4.Cu=+3V3 --time 600 --drc    --explain-img why/ --out routed.kicad_pcb --json
+```
+
+Stages (each writes its board to `OUT_stages/`, the input is never modified):
+
+1. **planes**: `--planes LAYER=NET[+NET],...` creates the missing plane zones (`plane create`).
+   Plane nets = the nets of `--plane-nets A,B`, of `--planes` and every net with a copper zone;
+   they are not routed as signals.
+2. **fanout**: every open island of each plane net gets a track + via onto its plane
+   (`fanout --native-fill`; the plane = its zones on inner layers).
+3. **route**: the negotiated router for all other nets with `--time-limit` = the time left minus
+   a reserve, plus `--reroute-blockers` (off with `--no-reroute`).
+   `--second-pass` retries the nets left open with `--job-margin 20 --max-expand 2e7` in the
+   time left.
+4. **stitch**: stitching vias for outer pours of the plane nets onto their inner planes
+   (`--stitch-grid G` adds a grid; off with `--no-stitch`).
+5. **gate**: opens of every net counted with native fills; with `--drc` KiCad DRC of the result
+   against the input; if a stage added DRC errors, the latest stage without new errors is
+   written, and if none is clean nothing is written (exit 1, `--allow-drc` writes anyway).
+
+`--json`: `opens_before`, `opens`, `open_nets`, `plane_nets`, `within_budget` and per stage
+`s`, `opens`, `note`, `out` and details (fanout islands, route `open_nets`, DRC deltas). With
+`--explain` / `--explain-img DIR` the open connections of the result are explained (see
+[Explaining failures](#explaining-failures-explain)). Routed copper that fails the exact
+clearance check is never written: such a net is dropped and left open (`aes.exact_dropped`).
+
+Synthetic stress board (`scripts/make_stress.py --parts 800`: 798 footprints, 6 layers, 515
+signal nets, GND/+3V3 zones on In1/In4; 4 cores, 8 GB): 1331 to 174 opens in 75 s (fanout 3 s,
+route 70 s). Before skipping the fallback ladder for pure search failures (#54) the route stage
+took 217 s. The 134 signal opens left are router search failures where `explain` finds a legal
+corridor (#87), the 40 plane opens are pads whose fanout found no via spot.
+
+Demo board, `--planes In1.Cu=GND`: 50 to 0 opens in 8 s (gate with KiCad DRC +16 s, 0 new
+errors; KiCad warns about dangling GND vias until the plane is refilled).
+
 ## Explaining failures (`explain`)
 
 Every failure comes with a one-line reason for humans and agents, and optionally a small image.
@@ -189,6 +228,7 @@ fits; clearances from the DRU/net classes incl. creepage, rule areas, mask apert
 |---|---|
 | `congestion` | a corridor at the net's minimum width exists: the router ran out of iterations or budget (try `--reroute-blockers`, `--iters`, a region route) |
 | `routed-copper` | only unlocked tracks/vias of other nets block it; `rip_nets` lists the rip-up candidates |
+| `neck-down` | only the minimum width gets through, but the router allows it within 1.5 mm of the own pads only; `at` is where the net width does not fit |
 | `too-narrow` | fixed obstacles leave at most `corridor_mm` of track (< `need_mm`); `at`/`layer` is the bottleneck, `blockers` what to move |
 | `enclosed` | no legal path even for a zero-width track; `at` is the reachable point closest to the target |
 
@@ -390,6 +430,7 @@ same placed input):
 |---|---|---|
 | `scripts/make_demo.py [OUT_DIR]` | KiCad 10 Python (`pcbnew`), KiCad footprint library | regenerate the demo board |
 | `scripts/apply_place.py IN place.json OUT` | KiCad 10 Python (`pcbnew`) | apply a `place` result to a copy |
+| `scripts/make_stress.py OUT.kicad_pcb [--parts 800] [--layers 6]` | Python 3 | synthetic stress board (SOIC-8 clusters with 0603 passives, GND/+3V3 zones) for benchmarks |
 | `scripts/plot_route.py OUT.png x0,y0,x1,y1 TITLE=B.kicad_pcb ...` | Python 3, matplotlib | side-by-side copper plots |
 | `scripts/drc_compare.py base.json new.json` | Python 3 | diff two kicad-cli DRC reports |
 | `scripts/release.sh [--no-latest]` | bash, git, cargo | build, test, copy the binary to `$COPPERPATH_RELEASE_DIR` |
