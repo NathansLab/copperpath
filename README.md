@@ -64,6 +64,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `fanout --net GND --plane REGEX [--reach 6] --out OUT.kicad_pcb` | Connects every open island of a plane net (a copper island with pads that touches no fill of a `--plane` zone) with one short track and a via onto the plane: grid search (0.05 mm, 8 directions) from an SMD pad of the island on its outer layer to the nearest legal via spot within `--reach` mm of track. Track legality as in the router (DRU/net-class clearance incl. outer-layer creepage, rule areas, mask apertures, edge); via legality as in `stitch`. Width: `--width` or the net class / DRU width, inside the pad's own courtyard the width of a DRU `track_width` rule with `A.intersectsCourtyard('REF')` (neck-down). Pads whose own cells are already too close to other copper (in-package creepage) are skipped. Options: `--via D,DRILL`, `--margin`, `--min-clr`, `--islands opens.json` (only islands listed by `opens --json`), `--base`. `--json` lists per island the pad used, track length and via, or why each pad failed and the nearest blockers (`net`, `kind`, `fp`, `layer`, `dist_mm`, `need_mm`, `locked`, `at`: the copper closest to violating its clearance, i.e. what to move). The search runs in 8 directions, so 45-degree tracks to a via spot are tried as well. |
 | `nudge (--parts R5,R7 \| --spec moves.json \| --auto) [--range 1] [--step 0.05] [--rots 0,90] --out OUT.kicad_pcb [--dry-run]` | Local placement optimisation by real routing: moves a few small parts (translation on a grid, rotation about the footprint origin, side kept) until their nets route, see [Nudge](#nudge-local-placement-by-real-routing). Writes the moved footprints and the new copper to a copy and `OUT_nudge.json`. |
 | `render [--roi x0,y0,x1,y1] --out roi.png` | PNG of a board region for AI agents and humans, native rasteriser (about 0.05 s per image). See [Rendering](#rendering-render). |
+| `plane list\|report\|fill\|create\|adjust` | Plane zones: detection, native zone filler, report (islands, unconnected pads, necks, stitching coverage), zone creation with HV cut-back, grow/merge. See [Planes](#planes-plane). |
 | `pads` | Pad world positions, sizes and nets (tab separated). |
 | `netclass` | net → net class table (tab separated). |
 
@@ -129,6 +130,41 @@ Always drawn: board outline, rule areas (orange hatch), vias and drill holes, a 
 with coordinates along the top and left edge, a scale bar and a legend. `--json` returns the
 image size, the region, `px_per_mm`, the number of labels and the open connections in the region
 (`ratsnest`: net, both pads, end points, length).
+
+## Planes (`plane`)
+
+Plane nets (GND, supply rails) get zones instead of tracks. `plane` creates and edits those
+zones, fills them natively and reports how well they connect, without `kicad-cli`.
+
+```bash
+B=target/release/copperpath
+$B plane list --pcb board.kicad_pcb                       # plane/pour nets and power-like candidates
+$B plane create --pcb board.kicad_pcb --net GND --layer In1.Cu --out step1.kicad_pcb
+$B plane create --pcb board.kicad_pcb --net +3V3 --layer In2.Cu --region 100,100,140,150 \
+   --hv "HV_.*" --creepage 3 --out step1.kicad_pcb       # cut back 3 mm from the HV nets
+$B plane adjust --pcb step1.kicad_pcb --zone "cp_plane_*" --grow max --merge --out step2.kicad_pcb
+$B plane report --pcb step2.kicad_pcb --net GND --json --png gnd.png
+$B plane fill --pcb step2.kicad_pcb --out filled.kicad_pcb  # write native fills (filled_polygon)
+```
+
+| subcommand | job |
+|---|---|
+| `list [--min-pads 4]` | nets with copper zones (`plane`: a zone on an inner layer, `pour`: any zone) and power-like nets (`GND*`, `+*`, `VCC*`, `VDD*`, `VBAT*`, ...) with at least N pads and no zone (`candidate`), with net class, pad count and zones. |
+| `create --net N --layer L [--region box] [--hv REGEX --creepage D] [--priority P] [--name NAME] --out F` | one zone of net N on layer L over the board (or the region): the free area of the layer, i.e. inside the board, outside pour keep-outs, rule clearance (+ `--margin`) away from zones of other nets, and `--creepage` mm away from all copper of the `--hv` nets on that layer. Parts narrower than `--min-neck` (1.0 mm) and outlines under `--min-area` (4 mm²) are dropped. The outline is cut back where HV copper reaches it; HV copper inside the plane gets a pour keep-out rule area (`NAME_hvK`, copper pour not allowed, tracks and vias allowed). Name `cp_plane_<net>_<layer>`; a re-run replaces its own zone and keep-outs. Clearance from the net class, `--min-width` (0.25) as minimum thickness, thermal reliefs; KiCad fills it. |
+| `adjust --zone NAME [--grow D\|max] [--hv REGEX --creepage D] [--merge] --out F` | edits existing zones (name wildcards): grow the outline by up to D mm (`max`: the whole free area connected to it) into the free area as above, cut it back from HV copper, `--merge` joins the selected zones of one net and layer set into one outline. Only the polygon changes; every other zone setting is kept, saved fills are dropped. |
+| `report [--net N] [--stitch-radius 5] [--necks 5] [--png F [--roi] [--labels]]` | native fill of every zone of the net (default: all nets with zones), then per zone and layer: outline and fill area, lost area (%), islands, isolated islands (no copper of the net: KiCad removes them), connected islands without a via, share of the largest island, stitching coverage (fill within `--stitch-radius` mm of a via or plated hole, %), narrowest neck; per net: copper components through all copper (tracks, vias, pads, native fills), unconnected pads (not in the largest component), the narrowest necks with position. `--png` renders the net with its native fill, ratsnest and the necks as markers. |
+| `fill [--net N] --out F` | writes the native fill as `filled_polygon` into a copy (fractured polygons like KiCad's). |
+
+Native filler: raster of the zone's layer (`--fill-res`, 0.1 mm), KiCad's recipe: the area where
+a disk of half the minimum width (`--min-width`, 0.25 mm) fits (outline, board edge clearance,
+clearance + half width to foreign copper, holes, pour keep-outs, zones of other nets with a higher
+priority) grown again by half the width. Pads of the net connect solidly (thermal spokes are not
+modelled), isolated islands are dropped. On the demo board with a GND plane on In2 the filled
+area matches KiCad's within 0.2 %; 0.05 s per zone layer. A neck is where two parts of an island
+that both hold copper of the net meet (widest-path tree over the distance to the fill edge).
+
+`--native-fill` on `fanout`, `stitch`, `opens` and `render` fills all copper zones natively first
+(instead of the saved fills), so the plane loop needs no kicad-cli refill.
 
 ## How routing works
 
@@ -269,9 +305,10 @@ islands instead of one per pad:
 Saved fills are read as KiCad wrote them (`filled_polygon`); refill first (`kicad-cli pcb drc
 --refill-zones --save-board` on a copy) so they match the copper.
 
-Plane-net loop for an agent: refill a copy (`kicad-cli pcb drc --refill-zones --save-board`),
-`opens --nets GND --json` for the islands, `fanout` for islands of pads and tracks, `stitch` for
-the pour islands, refill and check again.
+Plane-net loop for an agent: `plane report --net GND --json` (native fill, no kicad-cli) for the
+islands, unconnected pads and necks, `fanout --native-fill` for islands of pads and tracks,
+`stitch --native-fill` for the pour islands, report again. With KiCad's own fill instead: refill
+a copy (`kicad-cli pcb drc --refill-zones --save-board`) and drop `--native-fill`.
 
 Suggested agent loop: `hints` → fix placement → `route --drc --json` → accept if `ok`, `opens == 0`
 and `drc.new_errors == 0`, else inspect `open_nets`, `drc.new` and `aes` and adjust nets, region
