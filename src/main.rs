@@ -2051,6 +2051,9 @@ fn cmd_nudge(a: &Args) -> CmdResult {
     if a.get("move-locked").is_some() {
         spec.move_locked = true;
     }
+    if a.get("rip-locked").is_some() {
+        spec.rip_locked = true;
+    }
     if let Some(v) = a.get("push") {
         spec.push = v.parse().map_err(|_| format!("--push {v}: expected mm"))?;
     }
@@ -2122,6 +2125,8 @@ fn cmd_nudge(a: &Args) -> CmdResult {
         max_cands: a.u("max-cands", 20000),
         coarse: a.u("coarse", 9),
         clean_search: a.get("clean-search").is_some(),
+        verify_fill: a.u("verify-fill", 8),
+        fill_search: a.get("fill-search").is_some(),
         ..Default::default()
     };
     let p = &mut o.params;
@@ -2270,6 +2275,7 @@ fn cmd_nudge(a: &Args) -> CmdResult {
     let mut summary = json!({
         "improved": improved,
         "opens_before": res.opens_before,
+        "pour_check": {"board_opens_before": res.true_before, "board_opens_after": best.and_then(|b| b.true_opens)},
         "score": best.map(|b| json!({"opens": b.opens, "length_mm": check::round2(b.length), "vias": b.vias, "moved_mm": geom_r(b.moved), "rotated": b.rotated, "cost": check::round2(b.cost)})),
         "moves": moves,
         "nets": per_net,
@@ -2331,6 +2337,33 @@ fn cmd_nudge(a: &Args) -> CmdResult {
         .iter()
         .map(|(n, k, _)| json!({"net": n, "opens": k}))
         .collect::<Vec<_>>());
+    // the routed nets on the whole board (saved fills as they are): no net may get worse
+    let filt0: std::collections::HashSet<usize> = res.nets.iter().copied().collect();
+    let whole = |cx: &Ctx, f: &std::collections::HashSet<usize>| -> HashMap<String, usize> {
+        count_opens(cx, None, Some(f))
+            .1
+            .into_iter()
+            .map(|(n, k, _)| (n, k))
+            .collect()
+    };
+    let (wb, wa) = (whole(&c, &filt0), whole(&c2, &filt));
+    let worse: Vec<Value> = wa
+        .iter()
+        .filter(|(n, k)| **k > wb.get(*n).copied().unwrap_or(0))
+        .map(|(n, k)| json!({"net": n, "before": wb.get(n).copied().unwrap_or(0), "after": k}))
+        .collect();
+    summary["board_opens_before"] = json!(wb.values().sum::<usize>());
+    summary["board_opens_after"] = json!(wa.values().sum::<usize>());
+    if !worse.is_empty() {
+        eprintln!("[nudge] warning: nets with more opens on the whole board: {worse:?}");
+        if let Some(w) = summary["warnings"].as_array_mut() {
+            w.push(json!(format!(
+                "nets with more opens on the whole board: {}",
+                worse.len()
+            )));
+        }
+    }
+    summary["worse_nets"] = json!(worse);
     if a.get("drc").is_some() {
         summary["drc"] = drc_delta(a, &c.pcb, &out)?;
     }

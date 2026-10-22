@@ -81,6 +81,9 @@ pub struct DParams {
     pub clean: bool,
     /// cleanup may slide stub ends / switch stub axes / slide junctions (off in the fallback pass)
     pub slide: bool,
+    /// also connect copper components (tracks, vias) that reach into the region while their
+    /// pins lie outside it, e.g. stubs left by ripping copper inside the region (`nudge`)
+    pub copper_comps: bool,
 }
 
 impl Default for DParams {
@@ -116,6 +119,7 @@ impl Default for DParams {
             slide: true,
             bend90: 1.4,
             clean: true,
+            copper_comps: false,
         }
     }
 }
@@ -264,6 +268,9 @@ pub struct NetJob {
     /// existing tracks, vias and zone fills of the pin components: a connection may start or
     /// end on them, not only at the pads
     pub copper: Vec<Seed>,
+    /// the components to connect (sorted): those of the pins, plus copper-only ones with
+    /// [`DParams::copper_comps`]
+    pub comps: Vec<usize>,
 }
 
 /// existing copper of a pin component that can start or end a connection
@@ -702,6 +709,14 @@ impl<'a> Router<'a> {
                 .cloned()
                 .collect();
             let mut comps: Vec<usize> = ps.iter().map(|pn| pn.comp).collect();
+            if p.copper_comps {
+                for &(oi, c) in copper.get(&net).into_iter().flatten() {
+                    let o = m.cu(oi);
+                    if matches!(o.kind, Kind::Track | Kind::Via) && o.bbox.overlaps(&region) {
+                        comps.push(c);
+                    }
+                }
+            }
             comps.sort();
             comps.dedup();
             if comps.len() < 2 {
@@ -764,6 +779,7 @@ impl<'a> Router<'a> {
                 dr: vdr / 2.0,
                 prio,
                 copper: cu,
+                comps: comps.clone(),
             });
         }
         let gs = match fixed {
@@ -1472,16 +1488,7 @@ impl<'a> Router<'a> {
                 },
             )
             .collect();
-        let conns = self
-            .jobs
-            .iter()
-            .map(|j| {
-                let mut c: Vec<usize> = j.pins.iter().map(|p| p.comp).collect();
-                c.sort();
-                c.dedup();
-                c.len() - 1
-            })
-            .sum();
+        let conns = self.jobs.iter().map(|j| j.comps.len() - 1).sum();
         let mut stats = AesStats::default();
         for x in &nst {
             stats.pins += x.pins;
@@ -1695,9 +1702,7 @@ impl<'a> Router<'a> {
         let mp = &self.maps[k];
         let n = mp.g.n();
         let soft = nego.is_some();
-        let mut comp_ids: Vec<usize> = job.pins.iter().map(|p| p.comp).collect();
-        comp_ids.sort();
-        comp_ids.dedup();
+        let comp_ids: Vec<usize> = job.comps.clone();
         let nc = comp_ids.len();
         let stubs = &self.stubs[k];
         // usable stubs and their start cost

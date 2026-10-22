@@ -106,6 +106,9 @@ pub struct Footprint {
     pub pads: Vec<Pad>,
     /// courtyard polygon in the footprint frame (as stored, i.e. already mirrored for B)
     pub crtyd: Vec<P>,
+    /// the separate courtyard polygons when there are several (footprint frame; `crtyd` is
+    /// then their hull); empty for a single outline
+    pub crtyd_parts: Vec<Vec<P>>,
     /// solder mask graphics (fp_* on F.Mask / B.Mask) in the footprint frame, as (shape, mask of
     /// the copper layer they expose)
     pub mask: Vec<(Shape, u8)>,
@@ -134,6 +137,17 @@ impl Footprint {
             .map(|(s, lm)| (s.xform(self.at, self.rot), *lm))
             .collect()
     }
+    /// every courtyard polygon in world coordinates (the separate ones, else the single outline)
+    pub fn crtyd_parts_world(&self) -> Vec<Vec<P>> {
+        if self.crtyd_parts.is_empty() {
+            let c = self.crtyd_world();
+            return if c.len() >= 3 { vec![c] } else { vec![] };
+        }
+        self.crtyd_parts
+            .iter()
+            .map(|pl| pl.iter().map(|q| self.at + q.rot(self.rot)).collect())
+            .collect()
+    }
     pub fn crtyd_world(&self) -> Vec<P> {
         self.crtyd
             .iter()
@@ -148,6 +162,11 @@ impl Footprint {
         if back != self.back {
             f.back = back;
             f.crtyd = f.crtyd.iter().rev().map(|q| p(q.x, -q.y)).collect();
+            f.crtyd_parts = f
+                .crtyd_parts
+                .iter()
+                .map(|pl| pl.iter().rev().map(|q| p(q.x, -q.y)).collect())
+                .collect();
             for pd in &mut f.pads {
                 pd.pos = p(pd.pos.x, -pd.pos.y);
                 pd.rel_rot = -pd.rel_rot;
@@ -661,6 +680,57 @@ fn courtyard(f: &List) -> Vec<P> {
     hull(all)
 }
 
+/// the separate closed courtyard polygons of a footprint when it has more than one (rects,
+/// polys, circles and closed line loops); empty otherwise
+fn courtyard_parts(f: &List) -> Vec<Vec<P>> {
+    let mut polys: Vec<Vec<P>> = Vec::new();
+    let mut lines: Vec<(P, P)> = Vec::new();
+    for g in f.lists() {
+        if !g.val("layer").unwrap_or("").ends_with("CrtYd") {
+            continue;
+        }
+        match g.head() {
+            "fp_rect" => {
+                if let (Some(s), Some(e)) = (g.xy("start"), g.xy("end")) {
+                    polys.push(vec![p(s.0, s.1), p(e.0, s.1), p(e.0, e.1), p(s.0, e.1)]);
+                }
+            }
+            "fp_poly" => polys.push(pts_of(g)),
+            "fp_line" => {
+                if let (Some(s), Some(e)) = (g.xy("start"), g.xy("end")) {
+                    lines.push((p(s.0, s.1), p(e.0, e.1)));
+                }
+            }
+            "fp_arc" => {
+                if let (Some(s), Some(m), Some(e)) = (g.xy("start"), g.xy("mid"), g.xy("end")) {
+                    lines.push((p(s.0, s.1), p(m.0, m.1)));
+                    lines.push((p(m.0, m.1), p(e.0, e.1)));
+                }
+            }
+            "fp_circle" => {
+                if let (Some(c), Some(e)) = (g.xy("center"), g.xy("end")) {
+                    let r = ((e.0 - c.0).powi(2) + (e.1 - c.1).powi(2)).sqrt();
+                    polys.push(
+                        (0..16)
+                            .map(|k| {
+                                let t = k as f64 * std::f64::consts::PI / 8.0;
+                                p(c.0 + r * t.cos(), c.1 + r * t.sin())
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    polys.retain(|pl| pl.len() >= 3);
+    polys.extend(chain(&lines).into_iter().filter(|pl| pl.len() >= 3));
+    if polys.len() < 2 {
+        return Vec::new();
+    }
+    polys
+}
+
 /// chain line segments into closed loops (several board outlines in one file, cut-outs);
 /// segments that close no loop are left out
 fn chain(lines: &[(P, P)]) -> Vec<Vec<P>> {
@@ -867,6 +937,7 @@ pub fn parse_board(text: String) -> Result<Board, String> {
                     board,
                     pads,
                     crtyd: courtyard(it),
+                    crtyd_parts: courtyard_parts(it),
                     mask,
                     span: it.span,
                 });
