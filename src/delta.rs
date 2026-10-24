@@ -64,6 +64,7 @@ pub fn apply(text: &str, delta: &Value) -> Result<String, String> {
         .map(|a| a.iter().filter_map(|u| u.as_str()).collect())
         .unwrap_or_default();
     let root = sexpr::parse(text)?;
+    let format = sexpr::NetFormat::from_root(&root)?;
     let mut cut: Vec<(usize, usize)> = root
         .lists()
         .filter(|it| matches!(it.head(), "segment" | "arc" | "via"))
@@ -84,7 +85,7 @@ pub fn apply(text: &str, delta: &Value) -> Result<String, String> {
     o.push_str(&text[at..end]);
     let add = delta["add"].as_array().map(Vec::as_slice).unwrap_or(&[]);
     for it in add {
-        let net = sexpr::q(it["net"].as_str().unwrap_or(""));
+        let net = format.expression(it["net"].as_str().unwrap_or(""))?;
         match it["type"].as_str() {
             Some(t @ ("track" | "arc")) => {
                 let (s, e) = (xy(&it["start"])?, xy(&it["end"])?);

@@ -156,6 +156,58 @@ pub fn q(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// Net references are numeric codes through KiCad 9 and quoted names in KiCad 10.
+#[derive(Debug, Clone, Default)]
+pub struct NetFormat {
+    pub codes: std::collections::HashMap<String, String>,
+}
+impl NetFormat {
+    pub fn from_root(root: &List) -> Result<Self, String> {
+        let mut format = Self::default();
+        let mut names = std::collections::HashSet::new();
+        for net in root.children("net").filter(|n| n.arg(1).is_some()) {
+            let code = net.arg(0).ok_or("net code missing")?;
+            if code.parse::<u32>().is_err() {
+                return Err(format!("invalid numeric net code {code}"));
+            }
+            let name = net.arg(1).unwrap();
+            if format.codes.insert(code.into(), name.into()).is_some() || !names.insert(name) {
+                return Err("duplicate net code or name".into());
+            }
+        }
+        if !format.codes.is_empty() {
+            Self::validate(root, &format)?;
+        }
+        Ok(format)
+    }
+    fn validate(node: &List, format: &Self) -> Result<(), String> {
+        if node.head() == "net" {
+            let code = node.arg(0).ok_or("missing net code")?;
+            let name = format
+                .codes
+                .get(code)
+                .ok_or_else(|| format!("undefined net code {code}"))?;
+            if node.arg(1).is_some_and(|n| n != name) {
+                return Err(format!("net code {code} disagrees with declared name"));
+            }
+        }
+        for child in node.lists() {
+            Self::validate(child, format)?;
+        }
+        Ok(())
+    }
+    pub fn expression(&self, name: &str) -> Result<String, String> {
+        if self.codes.is_empty() {
+            return Ok(q(name));
+        }
+        self.codes
+            .iter()
+            .find(|(_, n)| n.as_str() == name)
+            .map(|(code, _)| code.clone())
+            .ok_or_else(|| format!("net {name:?} has no code in input board"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

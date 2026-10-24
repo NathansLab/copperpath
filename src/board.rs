@@ -1,4 +1,4 @@
-//! Board model parsed from a .kicad_pcb (KiCad 10 text format, nets referenced by name).
+//! Board model parsed from a .kicad_pcb (KiCad 6+ text format; numbered or named net references).
 //! Footprint geometry is kept in the footprint frame so the placer can move/rotate/flip parts.
 
 use crate::geom::*;
@@ -239,6 +239,7 @@ pub struct Board {
     pub text: String,
     pub nets: Vec<String>,
     pub net_id: HashMap<String, usize>,
+    pub net_codes: HashMap<String, String>,
     pub fps: Vec<Footprint>,
     pub tracks: Vec<Track>,
     pub vias: Vec<Via>,
@@ -266,6 +267,14 @@ impl Board {
         self.net_id.insert(name.to_string(), i);
         i
     }
+    fn net_reference(&mut self, token: &str) -> usize {
+        let name = self
+            .net_codes
+            .get(token)
+            .cloned()
+            .unwrap_or_else(|| token.to_owned());
+        self.net(&name)
+    }
     pub fn fp(&self, r: &str) -> Option<&Footprint> {
         self.fps.iter().find(|f| f.refd == r)
     }
@@ -290,7 +299,7 @@ fn parse_pad(l: &List, b: &mut Board, fp_rot: f64, fp_margin: Option<f64>) -> Pa
     let shape = l.arg(2).unwrap_or("").to_string();
     let (x, y, a) = l.xy("at").unwrap_or((0.0, 0.0, 0.0));
     let (w, h, _) = l.xy("size").unwrap_or((0.0, 0.0, 0.0));
-    let net = l.val("net").map(|n| b.net(n)).unwrap_or(0);
+    let net = l.val("net").map(|n| b.net_reference(n)).unwrap_or(0);
     let layers = layer_mask(&l.atoms("layers"));
     let drill = l
         .child("drill")
@@ -557,7 +566,7 @@ fn graphic_layers(g: &List) -> u8 {
 }
 
 fn parse_zone(z: &List, b: &mut Board, fp: Option<&str>, fp_at: Option<(P, f64)>) -> Zone {
-    let net = z.val("net").map(|n| b.net(n)).unwrap_or(0);
+    let net = z.val("net").map(|n| b.net_reference(n)).unwrap_or(0);
     let mut ls = z.atoms("layers");
     if ls.is_empty() {
         ls = z.atoms("layer");
@@ -839,7 +848,11 @@ pub fn parse_board(text: String) -> Result<Board, String> {
             ));
         }
     }
-    let mut b = Board::default();
+    let format = sexpr::NetFormat::from_root(&root)?;
+    let mut b = Board {
+        net_codes: format.codes,
+        ..Board::default()
+    };
     b.net(""); // net 0 = no net
     for it in root.lists() {
         match it.head() {
@@ -949,7 +962,7 @@ pub fn parse_board(text: String) -> Result<Board, String> {
                 let Some(layer) = it.val("layer").and_then(layer_idx) else {
                     continue;
                 };
-                let net = it.val("net").map(|n| b.net(n)).unwrap_or(0);
+                let net = it.val("net").map(|n| b.net_reference(n)).unwrap_or(0);
                 let w = it.valf("width").unwrap_or(0.2);
                 let locked = it.flag("locked");
                 let uuid = it.val("uuid").unwrap_or("").to_string();
@@ -988,7 +1001,7 @@ pub fn parse_board(text: String) -> Result<Board, String> {
             }
             "via" => {
                 let Some(a) = it.xy("at") else { continue };
-                let net = it.val("net").map(|n| b.net(n)).unwrap_or(0);
+                let net = it.val("net").map(|n| b.net_reference(n)).unwrap_or(0);
                 b.vias.push(Via {
                     at: p(a.0, a.1),
                     d: it.valf("size").unwrap_or(0.6),
