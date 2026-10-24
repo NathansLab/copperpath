@@ -1359,7 +1359,8 @@ pub fn set_zone_outline(
     None
 }
 
-/// KiCad text of a copper zone (unfilled; KiCad fills it)
+/// KiCad text of a copper zone (unfilled; KiCad fills it).
+/// `net` is a validated expression from sexpr::NetFormat.
 pub fn zone_text(
     net: &str,
     layer: &str,
@@ -1372,7 +1373,7 @@ pub fn zone_text(
 ) -> String {
     format!(
         "\t(zone\n\t\t(net {})\n\t\t(layer \"{layer}\")\n\t\t(uuid \"{}\")\n\t\t(name {})\n\t\t(hatch edge 0.5)\n\t\t(priority {priority})\n\t\t(connect_pads\n\t\t\t(clearance {clearance})\n\t\t)\n\t\t(min_thickness {min_width})\n\t\t(filled_areas_thickness no)\n\t\t(fill\n\t\t\t(thermal_gap 0.5)\n\t\t\t(thermal_bridge_width 0.5)\n\t\t)\n{}\t)\n",
-        crate::sexpr::q(net),
+        net,
         uuid_from(seed),
         crate::sexpr::q(name),
         pts_text(pts)

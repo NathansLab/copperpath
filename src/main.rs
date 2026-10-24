@@ -2,7 +2,7 @@
 
 use copperpath::{
     board, check, delta, drc, droute, elec, explain, fanout, geom, groute, model, nudge, place,
-    plane, progress, render, reroute, rules, sch, sites, stitch,
+    plane, progress, render, reroute, rules, sch, sexpr, sites, stitch,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -1309,7 +1309,7 @@ fn route_once(a: &Args) -> CmdResult {
         }
     }
     progress::phase("write");
-    let text = droute::pcb_text(&c.board.text, &c.board.nets, &res);
+    let text = droute::pcb_text(&c.board.text, &c.board.nets, &res)?;
     if write_board {
         write_file(&out, &text)?;
         for (src, ext) in [(&c.pro, "kicad_pro"), (&c.dru, "kicad_dru")] {
@@ -2736,8 +2736,10 @@ fn plane_outline(a: &Args, sub: &str) -> CmdResult {
             } else {
                 format!("{name}_{}", k + 1)
             };
+            let expression =
+                sexpr::NetFormat::from_root(&sexpr::parse(&b.text)?)?.expression(net_name)?;
             add += &plane::zone_text(
-                net_name,
+                &expression,
                 board::CU[l],
                 &nm,
                 a.f("priority", 0.0) as i64,

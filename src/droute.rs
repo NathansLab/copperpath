@@ -3120,16 +3120,24 @@ pub fn write_copper(
     routed: &HashMap<usize, RNet>,
     out: &str,
 ) -> std::io::Result<()> {
-    std::fs::write(out, copper_text(text, nets, routed))
+    std::fs::write(
+        out,
+        copper_text(text, nets, routed).map_err(std::io::Error::other)?,
+    )
 }
 
 /// the board text with the routed copper appended (what `write_pcb` writes)
-pub fn pcb_text(text: &str, nets: &[String], res: &DResult) -> String {
+pub fn pcb_text(text: &str, nets: &[String], res: &DResult) -> Result<String, String> {
     copper_text(text, nets, &res.routed)
 }
 
 /// the board text with new copper per net (unlocked) appended
-fn copper_text(text: &str, nets: &[String], routed: &HashMap<usize, RNet>) -> String {
+fn copper_text(
+    text: &str,
+    nets: &[String],
+    routed: &HashMap<usize, RNet>,
+) -> Result<String, String> {
+    let format = crate::sexpr::NetFormat::from_root(&crate::sexpr::parse(text)?)?;
     // seed from the board text: copper added to an output of an earlier run gets new uuids
     let mut seed = 0x1234_5678_9abc_def1u64;
     for b in text.bytes().step_by(97).chain(text.len().to_le_bytes()) {
@@ -3141,7 +3149,7 @@ fn copper_text(text: &str, nets: &[String], routed: &HashMap<usize, RNet>) -> St
     keys.sort();
     for &net in keys {
         let rn = &routed[&net];
-        let name = crate::sexpr::q(&nets[net]);
+        let name = format.expression(&nets[net])?;
         for s in &rn.segs {
             add += &format!(
                 "\t(segment\n\t\t(start {:.6} {:.6})\n\t\t(end {:.6} {:.6})\n\t\t(width {})\n\t\t(layer \"{}\")\n\t\t(net {})\n\t\t(uuid \"{}\")\n\t)\n",
@@ -3160,7 +3168,7 @@ fn copper_text(text: &str, nets: &[String], routed: &HashMap<usize, RNet>) -> St
     o.push_str(&text[..end]);
     o.push_str(&add);
     o.push_str(&text[end..]);
-    o
+    Ok(o)
 }
 
 #[cfg(test)]

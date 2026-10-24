@@ -11,6 +11,12 @@ and plane nets are not routed. Expect rough edges; see [Limitations](#limitation
 
 ![Demo board before and after routing](docs/demo_before_after.png)
 
+## Numbered net compatibility
+
+KiCad 6–9 boards use a numbered net table; KiCad 10 references nets by name. CopperPath now resolves numbered pads, tracks, vias and zones to their real names, validates code/name consistency, and preserves the input net-reference format when routing, applying deltas or creating planes. This fixes routed KiCad-9 output containing invalid quoted numeric net references. Named numeric strings on KiCad-10 boards remain names. Complete compatibility with every older KiCad feature is not implied.
+
+The agentic-eda divider integration independently checks the routed output with KiCad 9 DRC and exports Gerbers; `tests/numbered_nets.rs` covers non-contiguous codes, malformed tables, delta application and roundtrip routing. Existing named-net tests remain required.
+
 ## Build
 
 Requires a recent stable Rust toolchain (developed with 1.95).
