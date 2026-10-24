@@ -64,7 +64,9 @@ pub fn fanout(m: &Model, p: &FanoutParams) -> Result<FanoutResult, String> {
     // plane fills of the net and the components that touch one
     let no = m.objs.len();
     let mut plane_fill: Vec<usize> = (0..m.fills.len())
-        .filter(|&k| m.fills[k].net == net && p.plane.is_match(&m.b.zones[m.fill_zone[k]].name))
+        .filter(|&k| {
+            m.fills[k].net == net && p.plane.is_match(&m.b.zones[m.fill_zone[k]].key(&m.b.nets))
+        })
         .collect();
     // the plane is on the inner layers when the pattern matches inner fills: outer pour
     // fragments of the same net that the pattern also matches (F/B pours named like the plane)

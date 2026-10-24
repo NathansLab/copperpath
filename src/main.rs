@@ -1821,7 +1821,7 @@ fn cmd_stitch(a: &Args) -> CmdResult {
         .board
         .zones
         .iter()
-        .filter(|z| z.net == net && p.zones.is_match(&z.name))
+        .filter(|z| z.net == net && p.zones.is_match(&z.key(&c.board.nets)))
         .map(|z| z.fills.len())
         .sum();
     if nfill == 0 {
@@ -3263,11 +3263,11 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
     // zone name patterns per plane net: inner zones are the plane, outer ones the pours
     let zone_pats = |pcb: &str, net: &str| -> Result<(String, String), String> {
         let b = board::load(pcb)?;
-        let esc = |z: &board::Zone| regex::escape(&z.name);
+        let esc = |z: &board::Zone| regex::escape(&z.key(&b.nets));
         let zs: Vec<&board::Zone> = b
             .zones
             .iter()
-            .filter(|z| !z.keepout && b.nets[z.net] == net && !z.name.is_empty())
+            .filter(|z| !z.keepout && b.nets[z.net] == net)
             .collect();
         let inner: Vec<String> = zs
             .iter()

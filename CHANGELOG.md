@@ -109,6 +109,9 @@ All notable changes to this project are documented here. The format follows
   parallel, so the autoroute quality gate and repeated runs check an unchanged input once.
 
 ### Fixed
+- `autoroute` / `fanout` / `stitch`: unnamed zones (boards from KiCad 5) are selected by the key
+  `NET@LAYER` (e.g. `GND@In1.Cu`). `autoroute` skipped the plane fanout on such boards, so no pad
+  reached its inner plane (PCBench rxadc_14: 29 -> 11 unconnected, 1 new KiCad DRC item).
 - The board setup minimum clearance defaults to 0 like in KiCad (was 0.2 mm), so net classes
   below 0.2 mm are honoured: the router was too strict and `drc` flagged legal pad pairs (28 on
   PCBench rxadc_14, where kicad-cli reports none).

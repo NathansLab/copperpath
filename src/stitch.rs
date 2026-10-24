@@ -67,13 +67,13 @@ pub fn stitch(m: &Model, p: &StitchParams) -> StitchResult {
     for z in m.b.zones.iter().filter(|z| !z.keepout && z.net != 0) {
         let n = z.fills.len();
         if z.net == net {
-            if p.plane.is_match(&z.name) {
+            if p.plane.is_match(&z.key(&m.b.nets)) {
                 if n == 0 && z.outline.len() >= 3 {
                     plane_outlines.push(PolyIndex::new(z.outline.clone()));
                 }
                 planes.extend((fi..fi + n).map(|k| &m.fill_idx[k]));
             }
-            if p.zones.is_match(&z.name) {
+            if p.zones.is_match(&z.key(&m.b.nets)) {
                 for k in fi..fi + n {
                     let poly = &m.fill_idx[k];
                     let area = poly.area();
