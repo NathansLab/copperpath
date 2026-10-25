@@ -367,6 +367,9 @@ struct NetMaps {
     neck: Vec<bool>,
     /// layer bits of the net's own pads (pins that have exit stubs) per window cell
     own: Vec<u8>,
+    /// layers with at least one free cell (wide or narrow): the only layers the net's copper,
+    /// and so its owner maps, can use
+    lmask: u8,
 }
 
 /// extra cost per cell inside the `iso` spacing of another net's copper
@@ -995,6 +998,9 @@ impl<'a> Router<'a> {
                         g.stamp(&s, p.neck, |x, y| neck[g.idx(x, y)] = true);
                     }
                 }
+                let lmask = (0..NL)
+                    .filter(|&l| t[l].contains(&R_FREE) || tn[l].contains(&R_FREE))
+                    .fold(0u8, |m, l| m | 1 << l);
                 let mut mp = NetMaps {
                     g,
                     ox,
@@ -1004,6 +1010,7 @@ impl<'a> Router<'a> {
                     v,
                     neck,
                     own: vec![0u8; g.n()],
+                    lmask,
                 };
                 let stubs = if p.stubs {
                     make_stubs(m, &ck, &gs, j, &mp, &p)
@@ -1080,15 +1087,22 @@ impl<'a> Router<'a> {
         let n = g.n();
         let wb = g.bbox().inflate(3.0);
         let job = &self.jobs[k];
+        // layers the net cannot use get no owner map (never read: their own map is blocked)
+        let lm = self.maps[k].lmask;
+        let per_layer = || -> Vec<Vec<u16>> {
+            (0..NL)
+                .map(|l| vec![0u16; if lm & (1 << l) != 0 { n } else { 0 }])
+                .collect()
+        };
         let mut o = Owners {
-            t: vec![vec![0u16; n]; NL],
-            tn: vec![vec![0u16; n]; NL],
+            t: per_layer(),
+            tn: per_layer(),
             v: vec![0u16; n],
             cost: std::sync::OnceLock::new(),
             iso: std::sync::OnceLock::new(),
         };
-        let mut lt = vec![vec![0u16; n]; NL];
-        let mut ltn = vec![vec![0u16; n]; NL];
+        let mut lt = per_layer();
+        let mut ltn = per_layer();
         let mut lv = vec![0u16; n];
         let mg = self.p.margin;
         for (j, rn) in routed.iter().enumerate() {
@@ -1107,8 +1121,10 @@ impl<'a> Router<'a> {
                     continue;
                 }
                 let c = self.m.r.clr(job.net, oj.net, is_outer(s.l)).max(0.0);
-                Self::stamp_owner(g, &mut o.t[s.l], &mut lt[s.l], &sh, c + job.hw + mg, id);
-                Self::stamp_owner(g, &mut o.tn[s.l], &mut ltn[s.l], &sh, c + job.hn + mg, id);
+                if lm & (1 << s.l) != 0 {
+                    Self::stamp_owner(g, &mut o.t[s.l], &mut lt[s.l], &sh, c + job.hw + mg, id);
+                    Self::stamp_owner(g, &mut o.tn[s.l], &mut ltn[s.l], &sh, c + job.hn + mg, id);
+                }
                 // a new via also keeps the hole clearance from this track
                 let cv = (c + job.vr).max(job.dr + self.m.r.min_hole_clearance);
                 Self::stamp_owner(g, &mut o.v, &mut lv, &sh, cv + mg, id);
@@ -1124,6 +1140,9 @@ impl<'a> Router<'a> {
                 for l in 0..NL {
                     let c = self.m.r.clr(job.net, oj.net, is_outer(l)).max(0.0).max(ch);
                     cm = cm.max(c);
+                    if lm & (1 << l) == 0 {
+                        continue;
+                    }
                     Self::stamp_owner(g, &mut o.t[l], &mut lt[l], &sh, c + job.hw + mg, id);
                     Self::stamp_owner(g, &mut o.tn[l], &mut ltn[l], &sh, c + job.hn + mg, id);
                 }
@@ -1195,11 +1214,9 @@ impl<'a> Router<'a> {
         if l >= NL {
             return o.v[w] > 0;
         }
-        if wide {
-            o.t[l][w] > 0
-        } else {
-            o.tn[l][w] > 0
-        }
+        // layers without an owner map (the net cannot use them) have no conflicts
+        let m = if wide { &o.t[l] } else { &o.tn[l] };
+        m.get(w).is_some_and(|&c| c > 0)
     }
 
     /// negotiated congestion on the detailed grid (PathFinder): every net is routed with foreign
@@ -1862,7 +1879,8 @@ impl<'a> Router<'a> {
             let mut ok = true;
             for &ci in &s.cells {
                 let Some(w) = self.wi(k, ci) else { continue };
-                let own = if s.wide { o.t[s.l][w] } else { o.tn[s.l][w] };
+                let m = if s.wide { &o.t[s.l] } else { &o.tn[s.l] };
+                let own = m.get(w).copied().unwrap_or(0);
                 match nego {
                     Some((pres, hist)) => c += pres * own as f32 + hist[s.l][ci],
                     None => {
