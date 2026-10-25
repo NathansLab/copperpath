@@ -2000,6 +2000,16 @@ fn cmd_status(a: &Args) -> CmdResult {
     // next commands
     let pcb = &c.pcb;
     let mut next: Vec<String> = Vec::new();
+    let unfilled = b
+        .zones
+        .iter()
+        .filter(|z| !z.keepout && z.net != 0 && z.fills.is_empty())
+        .count();
+    if unfilled > 0 && a.get("refill-zones").is_none() && a.get("native-fill").is_none() {
+        next.push(format!(
+            "{unfilled} zone(s) have no saved fill, so their pads count as open: add --refill-zones"
+        ));
+    }
     let inner_free: Vec<&str> = layers
         .iter()
         .copied()
