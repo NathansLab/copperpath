@@ -265,7 +265,8 @@ $B drc --pcb routed.kicad_pcb --refill-zones --out report.json --json
 
 The copper checks of `kicad-cli pcb drc`, on copperpath's model: `clearance`, `shorting_items`,
 `tracks_crossing`, `hole_clearance`, `hole_to_hole`, `copper_edge_clearance`, `track_width`,
-`via_diameter`, `annular_width`, `drill_out_of_range` and `unconnected_items`, with KiCad's semantics (net classes, DRU and pad clearances, the 0.0005 mm
+`via_diameter`, `annular_width`, `drill_out_of_range`, `starved_thermal` (with `--refill-zones`) and
+`unconnected_items`, with KiCad's semantics (net classes, DRU and pad clearances, the 0.0005 mm
 epsilon, one collision per net pair, collisions only between nets with pads). `--refill-zones`
 fills the zones natively first (like kicad-cli's flag, with thermal reliefs), otherwise the
 saved fills count. `--out` writes a report in kicad-cli's JSON layout.
@@ -276,15 +277,15 @@ synthetic boards:
 - with the zone fills saved by KiCad: the same violations per type and the same unconnected
   items per net, in 10-40 ms instead of 0.8-0.9 s per board;
 - with `--refill-zones` (native filler, 0.05 mm raster by default, `--fill-res`): the same
-  violations, unconnected items within 1 of kicad-cli's (the filler rasterises necks that are
-  exactly the minimum width), 0.1-1.2 s instead of 1-2 s.
+  copper violations, unconnected items within 1-2 of kicad-cli's and `starved_thermal` within 2
+  (the filler rasterises necks that are exactly the minimum width), 0.1-1.2 s instead of 1-2 s.
 
 `route`, `nudge` and `autoroute` take `--drc native` for their DRC gate: the same comparison
 against the input as `--drc` (kicad-cli), with the input's rules for both boards, in
 milliseconds. Pads with the same number in one footprint count as one terminal (as in KiCad).
 Board setup minimums missing from the project take KiCad's defaults (0.5 mm via, 0.1 mm annular
 ring, 0.3 mm hole), for the router as well. Not covered: silk, courtyard, solder mask, footprint
-library and starved-thermal checks, and copper islands without pads (KiCad counts floating
+library checks, and copper islands without pads (KiCad counts floating
 tracks as unconnected items). Use it as the fast check while iterating and kicad-cli for
 sign-off.
 

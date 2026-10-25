@@ -10,7 +10,8 @@
 //! - `copper_edge_clearance`: copper closer to Edge.Cuts than the edge clearance;
 //! - `track_width`: a track narrower than the rule minimum;
 //! - `via_diameter`, `annular_width` (vias), `drill_out_of_range` (holes) against the board
-//!   setup minimums.
+//!   setup minimums;
+//! - `starved_thermal`: a thermal-relief pad with 1 spoke (native fill, `--refill-zones`).
 //!
 //! Like KiCad, a violation needs `actual < required - epsilon` (epsilon 0.0005 mm), items of one
 //! net never collide, net-less pads collide with every net, and each item pair is reported once
@@ -23,6 +24,9 @@ use crate::board::{is_outer, CU};
 use crate::geom::{shape_dist, BBox, Shape, P};
 use crate::model::{Kind, Model, Obj};
 use std::collections::HashMap;
+
+/// KiCad's default minimum number of thermal spokes (`min_resolved_spokes`)
+pub const MIN_SPOKES: u8 = 2;
 
 /// KiCad's default DRC epsilon (advanced config `DRCEpsilon`), mm
 pub const EPS: f64 = 0.0005;
@@ -236,6 +240,57 @@ pub fn check(m: &Model) -> Vec<Violation> {
     let mut hits: Vec<_> = hits.into_iter().collect();
     hits.sort_by_key(|(k, _)| *k);
     out.extend(hits.into_iter().map(|(_, v)| v));
+    // thermal reliefs of a native fill with fewer spokes than KiCad's default minimum (2); a pad
+    // with no spoke is not starved but unconnected (as in kicad-cli)
+    for z in &m.b.zones {
+        for &(l, fi, pad, n) in &z.spokes {
+            if n == 0 || n >= MIN_SPOKES {
+                continue;
+            }
+            let f = &m.b.fps[fi];
+            let (c, _) = f.pad_world(&f.pads[pad]);
+            // a track of the net that leaves the pad on this layer counts as a spoke (kicad-cli)
+            let shapes = f.pad_shapes(&f.pads[pad]);
+            let tracks = m
+                .objs
+                .iter()
+                .filter(|o| {
+                    matches!(o.kind, Kind::Track) && o.net == z.net && o.layers & (1 << l) != 0
+                })
+                .filter(|o| match &o.shape {
+                    Shape::Capsule { a, b, .. } => {
+                        shapes.iter().any(|ps| shape_dist(ps, &o.shape) <= 0.0)
+                            && !shapes
+                                .iter()
+                                .any(|ps| ps.dist(*a) <= 0.0 && ps.dist(*b) <= 0.0)
+                    }
+                    _ => false,
+                })
+                .count();
+            if n as usize + tracks >= MIN_SPOKES as usize {
+                continue;
+            }
+            let zone = if z.name.is_empty() {
+                format!("Zone [{}]", m.b.nets[z.net])
+            } else {
+                format!("Zone '{}' [{}]", z.name, m.b.nets[z.net])
+            };
+            out.push(Violation {
+                typ: "starved_thermal",
+                need: MIN_SPOKES as f64,
+                actual: n as f64,
+                layer: l,
+                at: c,
+                items: vec![
+                    zone,
+                    format!(
+                        "Pad {} [{}] of {}",
+                        f.pads[pad].num, m.b.nets[z.net], f.refd
+                    ),
+                ],
+            });
+        }
+    }
     // copper to board edge, track width
     for o in &objs {
         let need = r.edge_clearance(o.net);

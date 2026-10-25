@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `drc --refill-zones` reports `starved_thermal` (a thermal-relief pad with one spoke; none is
+  unconnected, as in kicad-cli). The native filler keeps a spoke whose tip meets a spoke of a
+  neighbouring pad of the net (pads closer than twice the relief gap, as KiCad joins them).
 - `status`: one-call board overview for agents (stack, classes, zones, plane candidates, opens,
   native DRC, suggested next commands) in milliseconds.
 - `Benchmark` workflow: the PCBench benchmark on every release tag and by hand for any commit or
