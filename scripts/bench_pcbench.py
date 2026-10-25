@@ -149,8 +149,19 @@ def copper(t):
 
 
 def drc(cli, pcb, rep):
-    subprocess.run([cli, "pcb", "drc", "--refill-zones", "--format", "json", "--severity-all",
-                    "-o", rep, pcb], capture_output=True)
+    # a lock file left by an interrupted KiCad run makes kicad-cli wait forever
+    d = os.path.dirname(os.path.abspath(pcb))
+    for f in os.listdir(d):
+        if f.endswith(".lck"):
+            os.remove(os.path.join(d, f))
+    if os.path.exists(rep):
+        os.remove(rep)
+    try:
+        subprocess.run([cli, "pcb", "drc", "--refill-zones", "--format", "json", "--severity-all",
+                        "-o", rep, pcb], capture_output=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        print(f"{pcb}: kicad-cli DRC timed out after 600 s", file=sys.stderr)
+        return -1, {}
     d = json.load(open(rep))
     types = {}
     for v in d.get("violations", []):
