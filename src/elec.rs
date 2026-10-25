@@ -12,6 +12,8 @@
 //!   routes, not as a field solution.
 
 use crate::board::Board;
+use crate::geom::{shape_dist, Shape, P};
+use crate::model::{Kind, Model};
 use serde::Serialize;
 
 /// copper resistivity, Ohm mm
@@ -48,6 +50,10 @@ pub struct NetElec {
     pub width_max_mm: f64,
     pub r_mohm: f64,
     pub l_nh: f64,
+    /// track length running closer than `near` mm (edge to edge) to another net's copper on the
+    /// same layer, and the smallest such gap (mm); filled by [`coupling`]
+    pub coupled_mm: f64,
+    pub gap_min_mm: Option<f64>,
 }
 
 /// partial self-inductance of a flat conductor (Grover), nH; l, w, t in mm
@@ -106,11 +112,77 @@ pub fn nets(b: &Board, st: &Stack, sel: &dyn Fn(usize) -> bool) -> Vec<NetElec> 
                 width_max_mm: r3(wmax[i]),
                 r_mohm: r3(r[i] * 1000.0),
                 l_nh: r3(l_flat(len[i], w.max(0.01), st.cu) + lv[i]),
+                coupled_mm: 0.0,
+                gap_min_mm: None,
             }
         })
         .collect();
     out.sort_by(|a, b| a.net.cmp(&b.net));
     out
+}
+
+/// coupled length and smallest gap of each net's tracks to other nets' copper (pads, tracks,
+/// vias) on the same layer: tracks are sampled every 0.1 mm; a sample counts when the gap at it
+/// is below `near` mm. Fills `coupled_mm` / `gap_min_mm` of `rows` (matched by net name).
+pub fn coupling(m: &Model, near: f64, rows: &mut [NetElec]) {
+    use std::collections::HashMap;
+    let cu: Vec<&crate::model::Obj> = m
+        .objs
+        .iter()
+        .filter(|o| matches!(o.kind, Kind::Pad { .. } | Kind::Track | Kind::Via))
+        .collect();
+    let cs = 1.0f64;
+    let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    for (k, o) in cu.iter().enumerate() {
+        let b = o.bbox.inflate(near);
+        for x in (b.x0 / cs).floor() as i32..=(b.x1 / cs).floor() as i32 {
+            for y in (b.y0 / cs).floor() as i32..=(b.y1 / cs).floor() as i32 {
+                grid.entry((x, y)).or_default().push(k);
+            }
+        }
+    }
+    let idx: HashMap<String, usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.net.clone(), i))
+        .collect();
+    for t in &m.b.tracks {
+        let Some(&ri) = idx.get(&m.b.nets[t.net]) else {
+            continue;
+        };
+        let l = (t.b - t.a).len();
+        let n = ((l / 0.1).ceil() as usize).max(1);
+        let step = l / n as f64;
+        for s in 0..=n {
+            let f = s as f64 / n as f64;
+            let q = P {
+                x: t.a.x + (t.b.x - t.a.x) * f,
+                y: t.a.y + (t.b.y - t.a.y) * f,
+            };
+            let probe = Shape::circle(q, t.w / 2.0);
+            let mut gap = f64::INFINITY;
+            if let Some(v) = grid.get(&((q.x / cs).floor() as i32, (q.y / cs).floor() as i32)) {
+                for &k in v {
+                    let o = cu[k];
+                    if o.net == t.net || o.layers & (1 << t.layer) == 0 {
+                        continue;
+                    }
+                    gap = gap.min(shape_dist(&probe, &o.shape));
+                }
+            }
+            if gap < near {
+                let r = &mut rows[ri];
+                if s < n {
+                    r.coupled_mm += step;
+                }
+                r.gap_min_mm = Some(r.gap_min_mm.map_or(gap, |g| g.min(gap)));
+            }
+        }
+    }
+    for r in rows.iter_mut() {
+        r.coupled_mm = r3(r.coupled_mm);
+        r.gap_min_mm = r.gap_min_mm.map(|g| r3(g.max(0.0)));
+    }
 }
 
 #[cfg(test)]

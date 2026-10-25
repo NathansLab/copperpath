@@ -239,8 +239,13 @@ nets marked `first` are routed before the others:
 | `short` | bends and the wrong layer direction cheap | sense lines, short analog paths |
 | `few_vias` | vias cost 4x | signals that should stay on one layer |
 | `wide` | 1.5x the class width | moderate current |
+| `quiet` | cells within 0.5 mm beyond the clearance of other nets' copper (fixed and routed) cost more | sensitive analog, clocks next to aggressors |
 | `first` | routed before the other nets | the nets that matter most |
-| `via:X` `bend:X` `dir:X` `width:X` | the multipliers themselves | fine tuning |
+| `via:X` `bend:X` `dir:X` `width:X` `iso:X` | the multipliers themselves, `iso` the soft spacing in mm | fine tuning |
+
+`netinfo` also reports `coupled_mm`, the track length running closer than `--near` (0.5 mm, edge
+to edge) to another net's copper on the same layer: on the demo, `CLK=quiet` cuts it from 11.2 to
+0.1 mm at the same length.
 
 Profiles combine with `+` (`CLK=low_l+wide`). A key `class:PATTERN` applies to the nets of the
 matching net classes (`--prio 'class:Power=low_r'`). The intents can live in the KiCad project

@@ -2049,15 +2049,17 @@ fn stack(a: &Args) -> elec::Stack {
 fn cmd_netinfo(a: &Args) -> CmdResult {
     let c = load_ctx(a)?;
     let filt = net_filter(a, &c.board.nets);
-    let v = elec::nets(&c.board, &stack(a), &|n| {
+    let mut v = elec::nets(&c.board, &stack(a), &|n| {
         filt.as_ref().is_none_or(|f| f.contains(&n))
     });
+    let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
+    elec::coupling(&m, a.f("near", 0.5), &mut v);
     if !a.json() {
-        println!("net\tlength_mm\tvias\twidth_mm\tR_mOhm\tL_nH");
+        println!("net\tlength_mm\tvias\twidth_mm\tR_mOhm\tL_nH\tcoupled_mm");
         for e in &v {
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
-                e.net, e.length_mm, e.vias, e.width_min_mm, e.r_mohm, e.l_nh
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                e.net, e.length_mm, e.vias, e.width_min_mm, e.r_mohm, e.l_nh, e.coupled_mm
             );
         }
     }

@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Routing intent `quiet` / `iso:X`: soft extra spacing to other nets' copper (fixed and routed),
+  e.g. for sensitive analog nets; `netinfo` reports `coupled_mm` and `gap_min_mm` per net
+  (demo: CLK coupled length 11.2 -> 0.1 mm with `CLK=quiet`).
 - `route --signal-layers F.Cu,B.Cu`: tracks of signal nets only on these layers (vias pass all).
 - `fanout --plane-only`: only the plane zones' fills join pads.
 - `drc --refill-zones` reports `starved_thermal` (a thermal-relief pad with one spoke; none is

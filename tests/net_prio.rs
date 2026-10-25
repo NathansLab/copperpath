@@ -97,3 +97,24 @@ fn class_intent_from_the_project_file() {
         "{info}"
     );
 }
+
+/// `quiet` keeps a net away from other nets' copper: much less length within 0.5 mm of it
+#[test]
+fn quiet_reduces_coupled_length() {
+    let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("net_prio_quiet");
+    std::fs::create_dir_all(&d).unwrap();
+    let pro = DEMO.replace("kicad_pcb", "kicad_pro");
+    let mut coupled = Vec::new();
+    for (name, prio) in [("base", ""), ("quiet", "CLK=quiet")] {
+        let out = d.join(format!("{name}.kicad_pcb"));
+        let out = out.to_str().unwrap();
+        let mut args = vec!["route", "--pcb", DEMO, "--out", out];
+        if !prio.is_empty() {
+            args.extend(["--prio", prio]);
+        }
+        assert_eq!(cp(&args)["opens"], 0);
+        let info = cp(&["netinfo", "--pcb", out, "--pro", &pro, "--nets", "CLK"]);
+        coupled.push(net(&info, "CLK")["coupled_mm"].as_f64().unwrap());
+    }
+    assert!(coupled[1] < 0.5 * coupled[0], "{coupled:?}");
+}

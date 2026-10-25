@@ -128,8 +128,9 @@ pub struct BoardCfg {
 /// the net is routed before the others. Profiles (combine with `+`):
 /// `low_r` (low resistance: twice the width, vias cost twice, first), `low_l` (low inductance:
 /// short and direct, vias cost three times, first), `short` (direct path: wrong layer direction
-/// and bends cheap), `few_vias` (vias cost four times), `wide` (1.5 times the width), `first`,
-/// and numbers `via:X`, `bend:X`, `dir:X`, `width:X`.
+/// and bends cheap), `few_vias` (vias cost four times), `wide` (1.5 times the width), `quiet`
+/// (keeps 0.5 mm more than the clearance from other nets where it can), `first`, and numbers
+/// `via:X`, `bend:X`, `dir:X`, `width:X`, `iso:X` (mm).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NetPrio {
     pub via: f32,
@@ -138,6 +139,9 @@ pub struct NetPrio {
     pub dir: f32,
     /// track width multiplier (the neck-down at pads keeps the class minimum)
     pub width: f64,
+    /// soft extra spacing (mm) to other nets' copper beyond the clearance: cells that close cost
+    /// more (`quiet`, `iso:X`)
+    pub iso: f64,
     pub first: bool,
 }
 
@@ -148,6 +152,7 @@ impl Default for NetPrio {
             bend: 1.0,
             dir: 1.0,
             width: 1.0,
+            iso: 0.0,
             first: false,
         }
     }
@@ -174,6 +179,7 @@ impl NetPrio {
                     p.dir *= 0.25;
                 }
                 "few_vias" => p.via *= 4.0,
+                "quiet" => p.iso = p.iso.max(0.5),
                 "wide" => p.width *= 1.5,
                 "first" => p.first = true,
                 _ => {
@@ -191,6 +197,7 @@ impl NetPrio {
                         "bend" => p.bend = x as f32,
                         "dir" => p.dir = x as f32,
                         "width" => p.width = x.max(0.1),
+                        "iso" => p.iso = x.min(5.0),
                         _ => return Err(format!("net priority '{t}': unknown key '{k}'")),
                     }
                 }

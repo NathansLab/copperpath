@@ -369,6 +369,33 @@ struct NetMaps {
     own: Vec<u8>,
 }
 
+/// extra cost per cell inside the `iso` spacing of another net's copper
+const ISO_COST: f32 = 1.5;
+
+/// square dilation of a mask by r cells (Chebyshev distance), two separable passes with prefix
+/// sums: O(cells) for any r
+fn dilate(m: &[bool], nx: usize, ny: usize, r: usize) -> Vec<bool> {
+    let run = |get: &dyn Fn(usize) -> bool, n: usize, out: &mut dyn FnMut(usize, bool)| {
+        let mut pre = vec![0u32; n + 1];
+        for i in 0..n {
+            pre[i + 1] = pre[i] + get(i) as u32;
+        }
+        for i in 0..n {
+            let (a, b) = (i.saturating_sub(r), (i + r + 1).min(n));
+            out(i, pre[b] > pre[a]);
+        }
+    };
+    let mut h = vec![false; m.len()];
+    for y in 0..ny {
+        run(&|x| m[y * nx + x], nx, &mut |x, v| h[y * nx + x] = v);
+    }
+    let mut out = vec![false; m.len()];
+    for x in 0..nx {
+        run(&|y| h[y * nx + x], ny, &mut |y, v| out[y * nx + x] = v);
+    }
+    out
+}
+
 /// pad exit stub: pad centre c -> e along the pad axis u, e projected from the grid cell g
 #[derive(Clone, Debug)]
 pub struct Stub {
@@ -412,6 +439,9 @@ struct Owners {
     /// negotiated cell cost per (layer, map cell), INFINITY = blocked; built on the first
     /// negotiated search (an Owners serves one route_net call, so one negotiation state)
     cost: std::sync::OnceLock<Vec<f32>>,
+    /// routing intent `iso`: map cells (layer-major) closer than the extra spacing to fixed or
+    /// routed copper of other nets; built on the first search that needs it
+    iso: std::sync::OnceLock<Vec<bool>>,
 }
 
 pub struct DResult {
@@ -1055,6 +1085,7 @@ impl<'a> Router<'a> {
             tn: vec![vec![0u16; n]; NL],
             v: vec![0u16; n],
             cost: std::sync::OnceLock::new(),
+            iso: std::sync::OnceLock::new(),
         };
         let mut lt = vec![vec![0u16; n]; NL];
         let mut ltn = vec![vec![0u16; n]; NL];
@@ -2433,6 +2464,34 @@ impl<'a> Router<'a> {
         // negotiated cost of every cell of the net's map, computed once per route_net call: one
         // load per neighbour instead of seven
         let mn = mp.g.n();
+        // routing intent iso: cells within the extra spacing of blocked or other nets' cells
+        let piso = self.jobs[k].prio.iso;
+        let isom: &[bool] = if piso > 0.0 {
+            o.iso.get_or_init(|| {
+                let r = (piso / self.p.res).round().max(1.0) as usize;
+                let (nx, ny) = (mp.g.nx, mp.g.ny);
+                let mut out = vec![false; NL * mn];
+                for l in 0..NL {
+                    let occ: Vec<bool> = (0..mn)
+                        .map(|w| mp.t[l][w] != R_FREE || o.t[l][w] > 0)
+                        .collect();
+                    let near = dilate(&occ, nx, ny, r);
+                    for w in 0..mn {
+                        out[l * mn + w] = near[w] && !occ[w];
+                    }
+                }
+                out
+            })
+        } else {
+            &[]
+        };
+        let iso_at = |l: usize, w: usize| -> f32 {
+            if !isom.is_empty() && isom[l * mn + w] {
+                ISO_COST
+            } else {
+                0.0
+            }
+        };
         let cc: &[f32] = match nego {
             Some((pres, hist)) => o.cost.get_or_init(|| {
                 let mut cc = vec![f32::INFINITY; NL * mn];
@@ -2458,7 +2517,7 @@ impl<'a> Router<'a> {
                             } else {
                                 f32::INFINITY
                             };
-                            cc[l * mn + w] = cw.min(cn) + hist[l][row + mx] + own;
+                            cc[l * mn + w] = cw.min(cn) + hist[l][row + mx] + own + iso_at(l, w);
                         }
                     }
                 }
@@ -2474,6 +2533,7 @@ impl<'a> Router<'a> {
                 }
                 None => {
                     let own = if mp.own[w] & (1 << l) != 0 { opc } else { 0.0 };
+                    let own = own + iso_at(l, w);
                     if mp.t[l][w] == R_FREE && o.t[l][w] == 0 {
                         (true, own)
                     } else if mp.neck[w] && mp.tn[l][w] == R_FREE && o.tn[l][w] == 0 {
