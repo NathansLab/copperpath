@@ -218,6 +218,18 @@ pub fn load_ctx(a: &Args) -> Result<Ctx, String> {
         cfg.yield_pours
             .extend(y.split(',').filter(|s| !s.is_empty()).map(String::from));
     }
+    // signal tracks only on these layers: --signal-layers F.Cu,B.Cu (vias still pass every layer)
+    if let Some(sl) = a
+        .get("signal-layers")
+        .filter(|v| *v != "auto" && *v != "all")
+    {
+        let names: Vec<String> = sl.split(',').map(|x| x.trim().to_string()).collect();
+        let m = board::layer_mask(&names);
+        if m == 0 {
+            return Err(format!("--signal-layers {sl}: no copper layer"));
+        }
+        cfg.signal_layers = m;
+    }
     // routing intent per net or class: --prio 'VBUS=low_r,class:Power=low_r' before --cfg, then
     // the project's "copperpath": {"net_prio": ...} block next to its net classes
     if let Some(p) = a.get("prio") {
@@ -1703,7 +1715,7 @@ fn base_text(a: &Args, c: &Ctx) -> Result<String, String> {
 /// fanout --pcb FILLED --net GND --plane REGEX [--reach 6] [--via D,DRILL] [--width W]
 /// [--margin 0.05] [--min-clr 0] [--islands opens.json] [--base B] --out OUT.kicad_pcb
 fn cmd_fanout(a: &Args) -> CmdResult {
-    let c = load_ctx_filled(a)?;
+    let mut c = load_ctx_filled(a)?;
     let out = out_path(a, &c, "fanout.kicad_pcb")?;
     let net_name = a.s("net", "GND");
     let net = *c
@@ -1711,6 +1723,17 @@ fn cmd_fanout(a: &Args) -> CmdResult {
         .net_id
         .get(&net_name)
         .ok_or(format!("--net {net_name}: no such net"))?;
+    // --plane-only: other fills of the net (outer pours) do not join pads; every pad reaches the
+    // plane itself, so later tracks that cut the pour do not strand it
+    if a.get("plane-only").is_some() {
+        let plane = full_regex(a, "plane")?;
+        let nets = c.board.nets.clone();
+        for z in c.board.zones.iter_mut() {
+            if z.net == net && !plane.is_match(&z.key(&nets)) {
+                z.fills.clear();
+            }
+        }
+    }
     let (via_d, drill) = via_arg(a, &c, net)?;
     // --islands: `opens --json` output; only islands with one of its pads of this net
     let mut only = std::collections::HashSet::new();
@@ -3364,6 +3387,54 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
     };
     let pn = plane_nets.join(",");
     eprintln!("[autoroute] plane nets: {pn}");
+    // inner layers that are planes (plane-net zones cover at least half the board): signal tracks
+    // stay off them so the planes stay whole; vias still pass (the plane refills around them)
+    let sig_layers: String = match a.s("signal-layers", "auto").as_str() {
+        "all" => String::new(),
+        "auto" => {
+            let b = board::load(&cur)?;
+            let area = |p: &[geom::P]| {
+                let n = p.len();
+                (0..n)
+                    .map(|i| p[i].x * p[(i + 1) % n].y - p[(i + 1) % n].x * p[i].y)
+                    .sum::<f64>()
+                    .abs()
+                    / 2.0
+            };
+            let board_area: f64 = if b.edge.is_empty() {
+                (b.bbox.x1 - b.bbox.x0) * (b.bbox.y1 - b.bbox.y0)
+            } else {
+                b.outer_outlines().iter().map(|&i| area(&b.edge[i])).sum()
+            };
+            let mut planes = 0u8;
+            for l in 1..5 {
+                let cov: f64 = b
+                    .zones
+                    .iter()
+                    .filter(|z| !z.keepout && z.layers & (1 << l) != 0)
+                    .filter(|z| plane_nets.contains(&b.nets[z.net]))
+                    .map(|z| area(&z.outline))
+                    .sum();
+                if board_area > 0.0 && cov >= 0.5 * board_area {
+                    planes |= 1 << l;
+                }
+            }
+            let keep: Vec<&str> = (0..board::CU.len())
+                .filter(|l| b.cu_mask & (1 << l) != 0 && planes & (1 << l) == 0)
+                .map(|l| board::CU[l])
+                .collect();
+            if planes == 0 || keep.is_empty() {
+                String::new()
+            } else {
+                eprintln!(
+                    "[autoroute] signal layers: {} (inner planes kept whole)",
+                    keep.join(",")
+                );
+                keep.join(",")
+            }
+        }
+        list => list.to_string(),
+    };
     let skip_sig = plane_nets
         .iter()
         .chain(&pour_nets)
@@ -3423,6 +3494,7 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
                     ("plane", &plane),
                     ("out", &o),
                     ("native-fill", "1"),
+                    ("plane-only", "1"),
                 ],
             )) {
                 Ok(v) => {
@@ -3452,6 +3524,9 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
         let mut kv: Vec<(&str, &str)> = vec![("pcb", &cur), ("out", &o), ("time-limit", &tls)];
         if !skip_sig.is_empty() {
             kv.push(("plane-nets", &skip_sig));
+        }
+        if !sig_layers.is_empty() {
+            kv.push(("signal-layers", &sig_layers));
         }
         if a.get("no-reroute").is_none() {
             kv.push(("reroute-blockers", "1"));
@@ -3512,6 +3587,9 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
         if !skip_sig.is_empty() {
             kv.push(("plane-nets", &skip_sig));
         }
+        if !sig_layers.is_empty() {
+            kv.push(("signal-layers", &sig_layers));
+        }
         match cmd_route_core(&sub_args("route", &kv)) {
             Ok(v) => {
                 let before = open_sig.len();
@@ -3559,6 +3637,9 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
             ];
             if !pn.is_empty() {
                 kv.push(("plane-nets", &pn));
+            }
+            if !sig_layers.is_empty() {
+                kv.push(("signal-layers", &sig_layers));
             }
             let r = cmd_plane(&sub_args(
                 "plane",

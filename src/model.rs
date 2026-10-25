@@ -119,6 +119,9 @@ pub struct BoardCfg {
     pub yield_pours: Vec<String>,
     /// routing intent per net (net wildcard, profile); the first match wins
     pub net_prio: Vec<(String, NetPrio)>,
+    /// copper layers for the tracks of signal nets (not plane nets); vias pass every layer
+    /// (`--signal-layers`; autoroute keeps signals off inner plane layers)
+    pub signal_layers: u8,
 }
 
 /// Routing intent of a net: multipliers on the router's costs and the track width, and whether
@@ -265,6 +268,7 @@ impl Default for BoardCfg {
             mh_pattern: "MH*".into(),
             yield_pours: Vec::new(),
             net_prio: Vec::new(),
+            signal_layers: 0x3f,
         }
     }
 }
@@ -522,7 +526,12 @@ impl<'a> Model<'a> {
         let net_layers: Vec<u8> = (0..n)
             .map(|i| {
                 let cls = &r.class_of(i).name;
-                class_layer_mask(&cfg.class_layers, cls).unwrap_or(0x3f) & b.cu_mask
+                let sig = if cfg.plane_nets.contains(&b.nets[i]) {
+                    0x3f
+                } else {
+                    cfg.signal_layers
+                };
+                class_layer_mask(&cfg.class_layers, cls).unwrap_or(0x3f) & b.cu_mask & sig
             })
             .collect();
         let fill_idx: Vec<PolyIndex> = {

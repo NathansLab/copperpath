@@ -1599,19 +1599,20 @@ impl<'a> Router<'a> {
             }
         }
         // exact verification of all routed copper (fixed objects + other nets)
-        let fails: Vec<(usize, String)> = (0..nj)
+        let fails: Vec<(usize, usize, String)> = (0..nj)
             .into_par_iter()
             .flat_map(|k| {
                 let fr = self.foreign(k, &routed);
                 let job = &self.jobs[k];
                 let mut out = Vec::new();
-                for sg in &routed[k].segs {
+                for (si, sg) in routed[k].segs.iter().enumerate() {
                     let hw = sg.w / 2.0 - EXACT_TOL;
                     if !ck.seg_ok_fixed(job.net, sg.a, sg.b, hw, sg.l)
                         || !ck.seg_ok_foreign(job.net, sg.a, sg.b, hw, sg.l, &fr)
                     {
                         out.push((
                             k,
+                            si,
                             format!(
                                 "{} {} ({:.3},{:.3})-({:.3},{:.3}) w {}",
                                 self.m.b.nets[job.net],
@@ -1630,22 +1631,32 @@ impl<'a> Router<'a> {
             .collect();
         stats.exact_fail = fails.len();
         if dbg {
-            for (_, f) in &fails {
+            for (_, _, f) in &fails {
                 eprintln!("[dbg] exact check fails: {f}");
             }
         }
-        // never write copper that fails the exact check: such a net is dropped (left open)
+        // never write copper that fails the exact check: the failing segments are removed, then
+        // whatever dangles from them; the rest of the net stays (its other connections hold)
         let mut failed = failed;
         let mut why = why;
-        let mut bad: Vec<usize> = fails.iter().map(|(k, _)| *k).collect();
+        let mut bad: Vec<usize> = fails.iter().map(|(k, _, _)| *k).collect();
         bad.sort();
         bad.dedup();
         for &k in &bad {
+            let segs: Vec<usize> = fails
+                .iter()
+                .filter(|(kk, _, _)| *kk == k)
+                .map(|(_, si, _)| *si)
+                .collect();
+            let before = routed[k].segs.len();
+            self.prune_failed(k, &mut routed[k], &segs);
             eprintln!(
-                "[route] {}: routed copper fails the exact clearance check, net dropped (left open)",
-                self.m.b.nets[self.jobs[k].net]
+                "[route] {}: {} segment(s) fail the exact clearance check; removed with what dangled ({} of {} segments kept, connection left open)",
+                self.m.b.nets[self.jobs[k].net],
+                segs.len(),
+                routed[k].segs.len(),
+                before
             );
-            routed[k] = RNet::default();
             if !failed.iter().any(|(n, _)| *n == self.jobs[k].net) {
                 failed.push((self.jobs[k].net, 1));
                 why.push("exact-check");
@@ -2131,6 +2142,88 @@ impl<'a> Router<'a> {
         self.astar_win(
             k, src, src_info, tmark, tinfo, tree_mark, &bbs, o, nego, full,
         )
+    }
+
+    /// remove the segments `bad` of a routed net, then every segment with an end that touches no
+    /// other segment, via, pad of the net or existing copper of its pins, and every via with fewer
+    /// than two attachments (no dangling copper is written)
+    fn prune_failed(&self, k: usize, rn: &mut RNet, bad: &[usize]) {
+        let job = &self.jobs[k];
+        let mut keep: Vec<bool> = (0..rn.segs.len()).map(|i| !bad.contains(&i)).collect();
+        let mut vkeep = vec![true; rn.vias.len()];
+        let pads: Vec<(u8, Shape)> = job
+            .pins
+            .iter()
+            .flat_map(|pn| {
+                let f = &self.m.b.fps[pn.fp];
+                f.pad_shapes(&f.pads[pn.pad])
+                    .into_iter()
+                    .map(move |sh| (pn.layers, sh))
+            })
+            .collect();
+        let fixed = |q: P, l: usize| {
+            pads.iter()
+                .any(|(ls, sh)| ls & (1 << l) != 0 && sh.dist(q) <= 1e-6)
+                || job
+                    .copper
+                    .iter()
+                    .any(|sd| sd.layers & (1 << l) != 0 && sd.shape.dist(q) <= 1e-6)
+        };
+        loop {
+            let mut changed = false;
+            for i in 0..rn.segs.len() {
+                if !keep[i] {
+                    continue;
+                }
+                let s = &rn.segs[i];
+                let anchored =
+                    |q: P| {
+                        fixed(q, s.l)
+                            || rn.segs.iter().enumerate().any(|(j, t)| {
+                                j != i
+                                    && keep[j]
+                                    && t.l == s.l
+                                    && dist_seg(q, t.a, t.b) <= t.w.max(s.w) / 2.0 + 1e-6
+                            })
+                            || rn.vias.iter().enumerate().any(|(v, via)| {
+                                vkeep[v] && (q - via.at).len() <= via.d / 2.0 + 1e-6
+                            })
+                    };
+                if !(anchored(s.a) && anchored(s.b)) {
+                    keep[i] = false;
+                    changed = true;
+                }
+            }
+            for (v, via) in rn.vias.iter().enumerate() {
+                if !vkeep[v] {
+                    continue;
+                }
+                let segs = rn
+                    .segs
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, t)| keep[*j] && dist_seg(via.at, t.a, t.b) <= via.d / 2.0 + 1e-6)
+                    .count();
+                let fx = (0..NL).filter(|&l| fixed(via.at, l)).count().min(1);
+                if segs + fx < 2 {
+                    vkeep[v] = false;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut i = 0;
+        rn.segs.retain(|_| {
+            i += 1;
+            keep[i - 1]
+        });
+        let mut v = 0;
+        rn.vias.retain(|_| {
+            v += 1;
+            vkeep[v - 1]
+        });
     }
 
     /// [`Self::astar_win_in`] with this thread's search buffers (reused across searches, so a

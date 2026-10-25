@@ -193,9 +193,12 @@ Stages (each writes its board to `OUT_stages/`, the input is never modified):
    on an inner layer; they are not routed as signals. Nets with outer pours only (two-layer
    boards) are pour nets, see stage 3c.
 2. **fanout**: every open island of each plane net gets a track + via onto its plane
-   (`fanout --native-fill`; the plane = its zones on inner layers).
+   (`fanout --native-fill --plane-only`; the plane = its zones on inner layers; outer pours of
+   the net do not join pads here, so tracks routed later cannot strand a pad cut off a pour).
 3. **route**: the negotiated router for all other nets with `--time-limit` = the time left minus
-   a reserve, plus `--reroute-blockers` (off with `--no-reroute`).
+   a reserve, plus `--reroute-blockers` (off with `--no-reroute`). Signal tracks stay off inner
+   layers whose plane zones cover at least half the board (`--signal-layers auto`, the default;
+   `all` or a layer list to override); vias still pass through the planes.
    `--second-pass` retries the nets left open with `--job-margin 20 --max-expand 2e7` in the
    time left.
 3c. **pours**: the pour nets are routed after the signals: the zones are filled natively and
@@ -211,7 +214,8 @@ Stages (each writes its board to `OUT_stages/`, the input is never modified):
 `s`, `opens`, `note`, `out` and details (fanout islands, route `open_nets`, DRC deltas). With
 `--explain` / `--explain-img DIR` the open connections of the result are explained (see
 [Explaining failures](#explaining-failures-explain)). Routed copper that fails the exact
-clearance check is never written: such a net is dropped and left open (`aes.exact_dropped`).
+clearance check is never written: the failing segments and whatever then dangles are removed,
+the rest of the net stays, and the connection is left open (`aes.exact_dropped` counts the nets).
 
 Synthetic stress board (`scripts/make_stress.py --parts 800`: 798 footprints, 6 layers, 515
 signal nets, GND/+3V3 zones on In1/In4; 4 cores, 8 GB): 1331 to 174 opens in 75 s (fanout 3 s,

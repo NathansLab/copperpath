@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `route --signal-layers F.Cu,B.Cu`: tracks of signal nets only on these layers (vias pass all).
+- `fanout --plane-only`: only the plane zones' fills join pads.
 - `drc --refill-zones` reports `starved_thermal` (a thermal-relief pad with one spoke; none is
   unconnected, as in kicad-cli). The native filler keeps a spoke whose tip meets a spoke of a
   neighbouring pad of the net (pads closer than twice the relief gap, as KiCad joins them).
@@ -117,6 +119,13 @@ All notable changes to this project are documented here. The format follows
   parallel, so the autoroute quality gate and repeated runs check an unchanged input once.
 
 ### Fixed
+- `route`: a segment that fails the exact clearance check no longer drops its whole net; only
+  the failing segments and what dangles from them are removed (PCBench rf_siggen: two pour nets
+  kept 53 of 82 segments instead of none).
+- `autoroute`: the plane fanout ignores outer pours of the net (`fanout --plane-only`), so every
+  pad reaches the plane itself; signal tracks stay off inner plane layers (`--signal-layers`).
+  PCBench, unconnected items after autoroute (kicad-cli): rf_siggen 30 -> 14, icehat 16 -> 11,
+  rxadc_14 11 -> 14, fan_controller 0 -> 1, LVDS2TMDS 0.
 - `autoroute` / `fanout` / `stitch`: unnamed zones (boards from KiCad 5) are selected by the key
   `NET@LAYER` (e.g. `GND@In1.Cu`). `autoroute` skipped the plane fanout on such boards, so no pad
   reached its inner plane (PCBench rxadc_14: 29 -> 11 unconnected, 1 new KiCad DRC item).
