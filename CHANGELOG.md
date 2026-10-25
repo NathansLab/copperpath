@@ -119,6 +119,11 @@ All notable changes to this project are documented here. The format follows
   parallel, so the autoroute quality gate and repeated runs check an unchanged input once.
 
 ### Fixed
+- Dangling copper (`track_dangling` / `via_dangling` in KiCad): collinear overlapping segments of
+  a net are merged before writing (a pad exit stub lying on a run had a free end in the middle
+  of the other track); `--reroute-blockers` rips all unlocked copper of a ripped net, not only
+  the pieces on the corridor, and never rips plane nets (their fanout vias stayed half removed).
+  PCBench: new dangling items after autoroute 6 -> 1 (rf_siggen), 5 -> 1 (icehat).
 - `route`: a segment that fails the exact clearance check no longer drops its whole net; only
   the failing segments and what dangles from them are removed (PCBench rf_siggen: two pour nets
   kept 53 of 82 segments instead of none).

@@ -213,6 +213,73 @@ pub struct RNet {
 type Found = (Vec<(usize, usize)>, usize);
 type NetRouteResult = (RNet, usize, Vec<(usize, usize, bool)>, Vec<usize>);
 
+/// merge collinear overlapping segments of one net (same layer); returns how many were removed.
+/// A segment ending on a pad centre (`centres`) is kept unless the other one ends there too (the
+/// pad exit stays a track end at the pad centre).
+fn merge_collinear(segs: &mut Vec<RSeg>, centres: &[P]) -> usize {
+    const TOL: f64 = 1e-4;
+    let on_line = |q: P, s: &RSeg| {
+        let d = s.b - s.a;
+        let l = d.len();
+        l > 1e-9 && ((q.x - s.a.x) * d.y - (q.y - s.a.y) * d.x).abs() / l <= TOL
+    };
+    // position of q along s in [0, 1] (with tolerance)
+    let t = |q: P, s: &RSeg| {
+        let d = s.b - s.a;
+        ((q.x - s.a.x) * d.x + (q.y - s.a.y) * d.y) / (d.x * d.x + d.y * d.y)
+    };
+    let mut removed = 0;
+    'outer: loop {
+        for i in 0..segs.len() {
+            for j in 0..segs.len() {
+                if i == j || segs[i].l != segs[j].l {
+                    continue;
+                }
+                let (a, b) = (segs[i].clone(), segs[j].clone());
+                if (a.b - a.a).len() < 1e-9 || !on_line(a.a, &b) || !on_line(a.b, &b) {
+                    continue;
+                }
+                let at_centre = |q: P| centres.iter().any(|c| (*c - q).len() < 2e-3);
+                let ends_b = |q: P| (q - b.a).len() < 2e-3 || (q - b.b).len() < 2e-3;
+                if [a.a, a.b].iter().any(|&q| at_centre(q) && !ends_b(q)) {
+                    continue;
+                }
+                let lb = (b.b - b.a).len();
+                let eps = TOL / lb.max(1e-9);
+                let (ta, tb) = (t(a.a, &b), t(a.b, &b));
+                let inside = |x: f64| x >= -eps && x <= 1.0 + eps;
+                let strictly = |x: f64| x > eps && x < 1.0 - eps;
+                // a covered by b (not just meeting it at one end point)
+                let covered = inside(ta)
+                    && inside(tb)
+                    && (strictly(ta) || strictly(tb) || (ta - tb).abs() > 1.0 - 2.0 * eps);
+                if covered && a.w <= b.w + 1e-9 {
+                    segs.remove(i);
+                    removed += 1;
+                    continue 'outer;
+                }
+                // partial overlap of equal width: b grows to the union (segments that only meet
+                // end to end stay as they are)
+                if (a.w - b.w).abs() < 1e-9 && (strictly(ta) || strictly(tb)) {
+                    let lo = ta.min(tb).min(0.0);
+                    let hi = ta.max(tb).max(1.0);
+                    let at = |x: f64| P {
+                        x: b.a.x + (b.b.x - b.a.x) * x,
+                        y: b.a.y + (b.b.y - b.a.y) * x,
+                    };
+                    segs[j].a = at(lo);
+                    segs[j].b = at(hi);
+                    segs.remove(i);
+                    removed += 1;
+                    continue 'outer;
+                }
+            }
+        }
+        break;
+    }
+    removed
+}
+
 /// per-thread A* buffers, kept between searches; only the nodes a search wrote are reset
 #[derive(Default)]
 struct Scratch {
@@ -418,6 +485,8 @@ pub fn install_stop_handler() {
 
 #[derive(Default, Debug, Clone)]
 pub struct AesStats {
+    /// collinear overlapping segments merged before writing
+    pub merged: usize,
     pub pins: usize,
     pub pins_no_stub: Vec<String>,
     pub stubs_used: usize,
@@ -1597,6 +1666,20 @@ impl<'a> Router<'a> {
                     stats.jogs += 1;
                 }
             }
+        }
+        // collinear segments on top of each other (pad exit stubs over a run of the same net)
+        // become one: a covered segment is dropped, an overlapping one of the same width merged;
+        // an end lying on the middle of another track would dangle in KiCad
+        for (k, rn) in routed.iter_mut().enumerate() {
+            let centres: Vec<P> = self.jobs[k]
+                .pins
+                .iter()
+                .map(|pn| {
+                    let f = &self.m.b.fps[pn.fp];
+                    f.pad_world(&f.pads[pn.pad]).0
+                })
+                .collect();
+            stats.merged += merge_collinear(&mut rn.segs, &centres);
         }
         // exact verification of all routed copper (fixed objects + other nets)
         let fails: Vec<(usize, usize, String)> = (0..nj)
@@ -3267,6 +3350,30 @@ fn copper_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collinear_overlaps_merge() {
+        let s = |ax, ay, bx, by| RSeg {
+            a: p(ax, ay),
+            b: p(bx, by),
+            l: 0,
+            w: 0.2,
+        };
+        // a stub lying on a run: dropped
+        let mut v = vec![s(0.0, 0.0, 10.0, 0.0), s(3.0, 0.0, 4.0, 0.0)];
+        assert_eq!(merge_collinear(&mut v, &[]), 1);
+        assert_eq!(v.len(), 1);
+        // partial overlap: one segment over the union
+        let mut v = vec![s(0.0, 0.0, 5.0, 0.0), s(4.0, 0.0, 8.0, 0.0)];
+        assert_eq!(merge_collinear(&mut v, &[]), 1);
+        assert!((v[0].b - v[0].a).len() > 7.99);
+        // end to end: unchanged
+        let mut v = vec![s(0.0, 0.0, 5.0, 0.0), s(5.0, 0.0, 8.0, 0.0)];
+        assert_eq!(merge_collinear(&mut v, &[]), 0);
+        // a pad exit ending on a pad centre stays
+        let mut v = vec![s(0.0, 0.0, 10.0, 0.0), s(3.0, 0.0, 4.0, 0.0)];
+        assert_eq!(merge_collinear(&mut v, &[p(3.0, 0.0)]), 0);
+    }
 
     #[test]
     fn qheap_pops_in_ascending_order() {
