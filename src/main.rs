@@ -23,6 +23,7 @@ commands:
   place     simulated-annealing placement inside zones (--zones zones.json)
   route     detailed router for a region (--region x0,y0,x1,y1 --out OUT.kicad_pcb
             and/or --delta-json DELTA.json: added/removed items in nm for the KiCad IPC API)
+  status    board overview for agents: layers, classes, zones, opens, DRC, next commands
   netinfo   length, vias, width, est. resistance (mOhm) and inductance (nH) per net
   drc       native copper DRC (KiCad rule names, ms instead of s): [-o report.json]
   opens     unconnected connections per net, counted from the copper
@@ -277,6 +278,7 @@ fn main() {
         "opens" => cmd_opens(&a),
         "drc" => cmd_drc(&a),
         "netinfo" => cmd_netinfo(&a),
+        "status" => cmd_status(&a),
         "pads" => cmd_pads(&a),
         "hints" => cmd_hints(&a),
         "netclass" => cmd_netclass(&a),
@@ -1894,6 +1896,120 @@ fn cmd_opens(a: &Args) -> CmdResult {
         .iter()
         .map(|(n, k, isl)| json!({"net": n, "opens": k, "islands": isl.iter().take(cap).collect::<Vec<_>>()}))
         .collect::<Vec<_>>()}))
+}
+
+/// one-call board overview for agents (milliseconds): stack, net classes, zones (with their
+/// selection key), plane nets and candidates, opens per net, native DRC by type, and the next
+/// commands to run. `--refill-zones` fills the zones natively first (else saved fills count).
+fn cmd_status(a: &Args) -> CmdResult {
+    let c = load_ctx_filled(a)?;
+    let t = Instant::now();
+    let b = &c.board;
+    let layers: Vec<&str> = (0..board::CU.len())
+        .filter(|l| b.cu_mask & (1 << l) != 0)
+        .map(|l| board::CU[l])
+        .collect();
+    let (_, v, opens) = native_report(&c);
+    let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
+    for x in &v {
+        *by.entry(x.typ).or_default() += 1;
+    }
+    let all: std::collections::HashSet<usize> = (1..b.nets.len()).collect();
+    let (_, per) = count_opens(&c, None, Some(&all));
+    let planes = plane::detect(b, &c.rules, a.u("min-pads", 4));
+    let zones: Vec<Value> = b
+        .zones
+        .iter()
+        .filter(|z| !z.keepout && z.net != 0)
+        .map(|z| {
+            json!({"key": z.key(&b.nets), "net": b.nets[z.net], "priority": z.priority,
+                "filled": !z.fills.is_empty(), "locked": z.locked})
+        })
+        .collect();
+    let classes: Vec<Value> = c
+        .rules
+        .classes
+        .iter()
+        .map(|k| {
+            let n = (1..b.nets.len())
+                .filter(|&i| c.rules.class_of(i).name == k.name)
+                .count();
+            json!({"name": k.name, "nets": n, "clearance_mm": k.clearance,
+                "track_mm": k.track_width, "via_mm": [k.via_d, k.via_drill]})
+        })
+        .collect();
+    // next commands
+    let pcb = &c.pcb;
+    let mut next: Vec<String> = Vec::new();
+    let inner_free: Vec<&str> = layers
+        .iter()
+        .copied()
+        .filter(|l| l.starts_with("In"))
+        .filter(|l| {
+            !b.zones.iter().any(|z| {
+                !z.keepout && board::layer_idx(l).is_some_and(|i| z.layers & (1 << i) != 0)
+            })
+        })
+        .collect();
+    let cand: Vec<&str> = planes
+        .iter()
+        .filter(|p| p.candidate)
+        .map(|p| p.net.as_str())
+        .collect();
+    if opens > 0 {
+        let mut s =
+            format!("copperpath autoroute --pcb {pcb} --out routed.kicad_pcb --drc native --json");
+        if let (Some(l), Some(n)) = (inner_free.first(), cand.first()) {
+            s += &format!(" --planes {l}={n}");
+        }
+        next.push(s);
+    }
+    if let Some((n, _, _)) = per.iter().max_by_key(|(_, k, _)| *k) {
+        next.push(format!("copperpath explain --pcb {pcb} --net '{n}' --json"));
+    }
+    if c.rules.classes.iter().any(|k| k.name != "Default") && c.cfg.net_prio.is_empty() {
+        let k = &c
+            .rules
+            .classes
+            .iter()
+            .find(|k| k.name != "Default")
+            .unwrap()
+            .name;
+        next.push(format!(
+            "routing intent per class, e.g. --prio 'class:{k}=low_r' (or a copperpath block in the .kicad_pro)"
+        ));
+    }
+    if !v.is_empty() {
+        next.push(format!(
+            "copperpath drc --pcb {pcb} --out drc.json   # where the violations are"
+        ));
+    }
+    let dt = t.elapsed().as_secs_f64();
+    if !a.json() {
+        println!(
+            "{}: {} layers ({}), {} footprints, {} nets, {:.1} x {:.1} mm",
+            pcb,
+            layers.len(),
+            layers.join(","),
+            b.fps.len(),
+            b.nets.len() - 1,
+            b.bbox.x1 - b.bbox.x0,
+            b.bbox.y1 - b.bbox.y0
+        );
+        println!("opens {opens}, DRC {:?}", by);
+        for n in &next {
+            println!("next: {n}");
+        }
+    }
+    Ok(json!({
+        "layers": layers, "footprints": b.fps.len(), "nets": b.nets.len() - 1,
+        "size_mm": [check::round2(b.bbox.x1 - b.bbox.x0), check::round2(b.bbox.y1 - b.bbox.y0)],
+        "classes": classes, "zones": zones,
+        "planes": planes.iter().filter(|p| p.plane || p.pour || p.candidate).collect::<Vec<_>>(),
+        "opens": opens,
+        "open_nets": per.iter().map(|(n, k, _)| json!({"net": n, "opens": k})).collect::<Vec<_>>(),
+        "drc": by, "next": next, "s": check::round2(dt),
+    }))
 }
 
 /// copper stack for the electrical estimates: --cu-um 35, --plating-um 25, --thickness 1.6 (mm)

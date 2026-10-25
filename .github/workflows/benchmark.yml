@@ -1,0 +1,103 @@
+name: Benchmark
+
+# Routes the PCBench boards of scripts/bench_pcbench.py with one copperpath version and records
+# the result: on every release tag, or by hand for any commit or tag (past releases too).
+# The harness (script, method) always comes from the default branch, so all versions are
+# measured the same way; the version under test is built from `ref`.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: commit, tag or branch to benchmark
+        required: true
+        default: main
+      label:
+        description: row label in docs/benchmark.md (default the ref)
+        required: false
+      budget:
+        description: autoroute budget per board in s
+        required: false
+        default: '120'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: benchmark-${{ github.event.inputs.ref || github.ref }}
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      REF: ${{ github.event.inputs.ref || github.ref_name }}
+      LABEL: ${{ github.event.inputs.label || github.event.inputs.ref || github.ref_name }}
+      BUDGET: ${{ github.event.inputs.budget || '120' }}
+    steps:
+      - name: Harness (default branch)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: harness
+      - name: Version under test
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+          path: dut
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dut
+      - name: Build
+        run: cargo build --release --manifest-path dut/Cargo.toml
+      - name: KiCad 10 (kicad-cli for the DRC)
+        run: |
+          set -e
+          FP=FDA854F61C4D0D9572BB95E5245D5502FAD7A805
+          curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x$FP" \
+            | sudo gpg --dearmor -o /usr/share/keyrings/kicad.gpg
+          echo "deb [signed-by=/usr/share/keyrings/kicad.gpg] https://ppa.launchpadcontent.net/kicad/kicad-10.0-releases/ubuntu noble main" \
+            | sudo tee /etc/apt/sources.list.d/kicad.list
+          sudo apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends kicad
+          kicad-cli version
+      - name: Benchmark
+        run: |
+          python3 harness/scripts/bench_pcbench.py --time "$BUDGET" --work bench_work \
+            --copperpath dut/target/release/copperpath \
+            --label "$LABEL" --commit "$(git -C dut rev-parse HEAD)" \
+            --md bench_work/results.md --history harness/docs/benchmark.md
+          cat bench_work/results.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-${{ github.run_id }}
+          path: |
+            bench_work/results.json
+            bench_work/results.md
+            bench_work/*/*_route.log
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$REF" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$REF" --repo "$GITHUB_REPOSITORY" --title "$REF" --notes "copperpath $REF"
+          gh release upload "$REF" bench_work/results.json bench_work/results.md --clobber --repo "$GITHUB_REPOSITORY"
+      - name: Pull request with the history row
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd harness
+          git diff --quiet docs/benchmark.md && exit 0
+          b="benchmark/${LABEL//[^A-Za-z0-9._-]/-}-${{ github.run_id }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$b"
+          git add docs/benchmark.md
+          git commit -m "benchmark: $LABEL"
+          git push origin "$b"
+          gh pr create --title "benchmark: $LABEL" --body "Benchmark run ${{ github.run_id }} for \`$REF\` (budget $BUDGET s per board). Details: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/${{ github.run_id }}" --base "${{ github.event.repository.default_branch }}" --head "$b"

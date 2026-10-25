@@ -64,6 +64,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `route [--region x0,y0,x1,y1] [--nets PATTERNS] --out OUT.kicad_pcb [--delta-json DELTA.json] [--drc]` | Detailed router (below). Routes every routable net whose pads lie in the region (default: whole board). Appends unlocked tracks/vias to a copy and writes `OUT_route.json`; `--delta-json` writes the added/removed items in nm for the KiCad IPC API ([schema](#change-set-for-the-kicad-ipc-api---delta-json)). `--drc` runs `kicad-cli` on input and output and reports the new violations. |
 | `check [--out DIR] [--res 0.25] [--tile 1.0] [--copper locked\|all] [--crop x0,y0,x1,y1 --crop-class C]` | Routability report: via-site maps per net class, region analysis per schematic sheet, what-if ablation (without rule areas, via keepouts, locked copper), global route with congestion per tile and layer, hotspot list. Writes `report.json`, `groute.json`, `congestion.json` and PNG maps. |
 | `place --zones zones.json [--init keep\|schematic\|both] [--moves N] [--starts K] [--out DIR]` | Parallel simulated-annealing placement of the movable parts inside zones (see `examples/zones.json`). Writes `place.json`; apply it to a copy with `scripts/apply_place.py`. |
+| `status [--refill-zones]` | One-call overview for agents, in milliseconds: copper stack, net classes, zones with their selection key, plane nets and candidates, opens per net, native DRC by type, and the next commands to run (`--json`: `next`). |
 | `netinfo [--nets] [--cu-um 35]` | Length, vias, track width and estimated DC resistance (mΩ) and inductance (nH) per net, in milliseconds. See [Routing intents](#routing-intents-per-net---prio). |
 | `drc [--refill-zones] [--out report.json]` | Native copper DRC with KiCad's rule names in milliseconds. See [Native DRC](#native-drc-drc). |
 | `opens [--region] [--nets] [--max-islands 50]` | Unconnected connections per net, counted from all copper including saved zone fills (no 499-item cap as in kicad-cli). Nets named in `--nets` are counted even if they are plane nets. `--json` lists the islands of each open net (pads per copper component, largest first). |
@@ -462,6 +463,17 @@ kicad-cli failure), `2` unknown or missing command.
 
 Common fields: `ok`, `command`, `version`, `threads`, `total_s`, `warnings`. On error:
 `{"ok": false, "command": ..., "error": "...", "version": ...}`.
+
+A short loop for an agent (times on the PCBench icehat board, 4 cores):
+
+| step | command | time |
+|---|---|---|
+| look | `status --json` (opens, DRC, classes, zones, `next` commands) | 14 ms |
+| route | `autoroute --out r.kicad_pcb --drc native --json` (`--prio` for intents) | seconds to minutes |
+| check | `drc --pcb r.kicad_pcb --json`, `netinfo --json` | 10-40 ms |
+| why open | `explain --net N --json` (reason, blockers, ROI image) | 20 ms |
+| fix | `route --pcb r.kicad_pcb --nets N --out r2.kicad_pcb` (adds copper only) or `nudge` | 0.1-3 s |
+| see | `render --opens --out r.png` | 30 ms |
 
 `route --json` (also written to `OUT_route.json`):
 

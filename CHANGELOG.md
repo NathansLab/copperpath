@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `status`: one-call board overview for agents (stack, classes, zones, plane candidates, opens,
+  native DRC, suggested next commands) in milliseconds.
+- `Benchmark` workflow: the PCBench benchmark on every release tag and by hand for any commit or
+  tag; results attached to the release and added to `docs/benchmark.md` by pull request.
+- CI runs the KiCad plugin's Python tests.
 - Routing intents per net class (`class:PATTERN` keys) and from the project file
   (`.kicad_pro` block `"copperpath": {"net_prio": ...}`, next to the net classes).
 - `route --res auto`: 0.1 mm grid when the rules and pad pitches allow it (2.6-4x faster on

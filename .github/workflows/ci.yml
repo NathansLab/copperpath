@@ -26,3 +26,5 @@ jobs:
         run: cargo clippy --release --all-targets -- -D warnings
       - name: Test
         run: cargo test --release
+      - name: KiCad plugin tests (mocked kipy)
+        run: python3 -m unittest discover -s kicad-plugin/tests -v
