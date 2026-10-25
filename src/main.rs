@@ -3519,7 +3519,9 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
     // 3. signal routing (negotiated) + reroute of blockers, within the time left
     {
         let t = Instant::now();
-        let reserve = (budget * 0.15).clamp(5.0, 90.0);
+        // reserve for the gate, plus a fifth of the budget for the pour nets' own stage
+        let reserve = (budget * 0.15).clamp(5.0, 90.0)
+            + if pour_nets.is_empty() { 0.0 } else { budget * 0.2 };
         let tl = (left() - reserve).max(10.0);
         let o = format!("{work}/3_route.kicad_pcb");
         let tls = format!("{tl:.0}");
@@ -3620,7 +3622,9 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
     // 3c. pour nets: fill the zones natively, then route only what the fill leaves open (the
     // router starts on the fill), without ripping signals; new tracks can cut another pour, so
     // refill and repeat (up to 3 rounds) until the refilled board has no open pour net
-    if !pour_nets.is_empty() && left() > 5.0 {
+    // runs even when the signals overran the budget: unconnected pour nets (GND) are worse than
+    // a few seconds over it (each round then gets at least 10 s)
+    if !pour_nets.is_empty() {
         let t = Instant::now();
         let mut rounds = Vec::new();
         for round in 1..=3 {
@@ -3628,7 +3632,7 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
             let o = format!("{work}/3c_pours_{round}.kicad_pcb");
             let tls = format!(
                 "{:.0}",
-                (left() - (budget * 0.05).clamp(2.0, 30.0)).max(5.0)
+                (left() - (budget * 0.05).clamp(2.0, 30.0)).max(10.0)
             );
             let nets = pour_nets.join(",");
             let mut kv: Vec<(&str, &str)> = vec![

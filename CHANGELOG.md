@@ -122,6 +122,9 @@ All notable changes to this project are documented here. The format follows
   parallel, so the autoroute quality gate and repeated runs check an unchanged input once.
 
 ### Fixed
+- `autoroute`: the signal routing leaves a fifth of the budget to the pour nets, and the pour
+  stage runs even when the signals overran the budget (PCBench sizif128 at 120 s: the GND pour
+  stage was skipped, 32 -> 16 unconnected).
 - Dangling copper (`track_dangling` / `via_dangling` in KiCad): collinear overlapping segments of
   a net are merged before writing (a pad exit stub lying on a run had a free end in the middle
   of the other track); `--reroute-blockers` rips all unlocked copper of a ripped net, not only
