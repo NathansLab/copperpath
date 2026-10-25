@@ -23,6 +23,7 @@ commands:
   place     simulated-annealing placement inside zones (--zones zones.json)
   route     detailed router for a region (--region x0,y0,x1,y1 --out OUT.kicad_pcb
             and/or --delta-json DELTA.json: added/removed items in nm for the KiCad IPC API)
+  ripup     remove tracks/vias of nets (--nets PATS [--region] [--locked] --out OUT)
   status    board overview for agents: layers, classes, zones, opens, DRC, next commands
   netinfo   length, vias, width, est. resistance (mOhm) and inductance (nH) per net
   drc       native copper DRC (KiCad rule names, ms instead of s): [-o report.json]
@@ -291,6 +292,7 @@ fn main() {
         "drc" => cmd_drc(&a),
         "netinfo" => cmd_netinfo(&a),
         "status" => cmd_status(&a),
+        "ripup" => cmd_ripup(&a),
         "pads" => cmd_pads(&a),
         "hints" => cmd_hints(&a),
         "netclass" => cmd_netclass(&a),
@@ -1921,6 +1923,40 @@ fn cmd_opens(a: &Args) -> CmdResult {
         .collect::<Vec<_>>()}))
 }
 
+/// remove the tracks and vias of the nets matching `--nets` (wildcards), unlocked ones only unless
+/// `--locked`, optionally only those touching `--region`; writes `--out`
+fn cmd_ripup(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let out = out_path(a, &c, "ripped.kicad_pcb")?;
+    let filt = net_filter(a, &c.board.nets).ok_or("ripup: --nets PATTERNS is required")?;
+    let region = a.get("region").map(parse_box).transpose()?;
+    let locked = a.get("locked").is_some();
+    let b = &c.board;
+    let mut uuids: Vec<String> = Vec::new();
+    let mut per: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    for t in &b.tracks {
+        let inside = region.is_none_or(|r| r.contains(t.a) || r.contains(t.b));
+        if filt.contains(&t.net) && (locked || !t.locked) && inside && !t.uuid.is_empty() {
+            uuids.push(t.uuid.clone());
+            per.entry(b.nets[t.net].clone()).or_default().0 += 1;
+        }
+    }
+    for v in &b.vias {
+        let inside = region.is_none_or(|r| r.contains(v.at));
+        if filt.contains(&v.net) && (locked || !v.locked) && inside && !v.uuid.is_empty() {
+            uuids.push(v.uuid.clone());
+            per.entry(b.nets[v.net].clone()).or_default().1 += 1;
+        }
+    }
+    let (text, n) = reroute::remove_items(&b.text, &uuids);
+    write_file(&out, &text)?;
+    eprintln!("[ripup] {n} items of {} nets removed -> {out}", per.len());
+    Ok(json!({
+        "out": out, "removed": n,
+        "nets": per.iter().map(|(k, (t, v))| json!({"net": k, "tracks": t, "vias": v})).collect::<Vec<_>>(),
+    }))
+}
+
 /// one-call board overview for agents (milliseconds): stack, net classes, zones (with their
 /// selection key), plane nets and candidates, opens per net, native DRC by type, and the next
 /// commands to run. `--refill-zones` fills the zones natively first (else saved fills count).
@@ -3521,7 +3557,11 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
         let t = Instant::now();
         // reserve for the gate, plus a fifth of the budget for the pour nets' own stage
         let reserve = (budget * 0.15).clamp(5.0, 90.0)
-            + if pour_nets.is_empty() { 0.0 } else { budget * 0.2 };
+            + if pour_nets.is_empty() {
+                0.0
+            } else {
+                budget * 0.2
+            };
         let tl = (left() - reserve).max(10.0);
         let o = format!("{work}/3_route.kicad_pcb");
         let tls = format!("{tl:.0}");

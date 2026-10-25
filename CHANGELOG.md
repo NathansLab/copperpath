@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `ripup --nets PATS [--region] [--locked]`: remove the copper of nets (agents redo single nets
+  with `route --nets`).
 - Routing intent `quiet` / `iso:X`: soft extra spacing to other nets' copper (fixed and routed),
   e.g. for sensitive analog nets; `netinfo` reports `coupled_mm` and `gap_min_mm` per net
   (demo: CLK coupled length 11.2 -> 0.1 mm with `CLK=quiet`).
