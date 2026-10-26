@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `autoroute` stage `polish`: left-over budget goes to a rip-up-and-reroute round on the nets
+  still open, kept when the board has fewer opens (rf_siggen 16 -> 14, rxadc_14 5 -> 4;
+  `--no-polish`).
+- `explain`: `next` per open connection, the command that addresses it (`route --nets N
+  --reroute-blockers` for routed copper and congestion, `nudge --region … --auto` otherwise).
 - `docs/agent-session.md`: a recorded agent session on icehat (status, autoroute, drc, explain,
   ripup/route, netinfo, tune, render) with times and results.
 - `tune --match REGEX [--target MM]`: length matching with accordion meanders (exact target,

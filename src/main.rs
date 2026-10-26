@@ -3318,12 +3318,37 @@ fn cmd_explain(a: &Args) -> CmdResult {
     if let (Some(p), None) = (&pad, net) {
         return Err(format!("--pad {p} needs --net"));
     }
-    let ex = explain_board(
+    let mut ex = explain_board(
         a,
         &c,
         &|n| n != 0 && net.is_none_or(|k| k == n),
         pad.as_deref(),
     )?;
+    // the command that addresses each reason (agents run it as is)
+    let pcb = &c.pcb;
+    for e in ex.as_array_mut().into_iter().flatten() {
+        let n = e["net"].as_str().unwrap_or_default().to_string();
+        let roi = e["roi"]
+            .as_array()
+            .map(|r| {
+                r.iter()
+                    .filter_map(|x| x.as_f64())
+                    .map(|x| format!("{x:.1}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        let next = match e["kind"].as_str() {
+            Some("routed-copper") | Some("congestion") => format!(
+                "copperpath route --pcb {pcb} --nets '{n}' --reroute-blockers --out fixed.kicad_pcb --json"
+            ),
+            _ if !roi.is_empty() => format!(
+                "copperpath nudge --pcb {pcb} --region {roi} --auto --auto-dist 3 --auto-max 4 --out nudged.kicad_pcb --json"
+            ),
+            _ => continue,
+        };
+        e["next"] = json!(next);
+    }
     Ok(json!({"open": ex.as_array().map(|v| v.len()), "explain": ex}))
 }
 
@@ -4002,6 +4027,77 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
             ),
             detail: json!({"nets": late, "rounds": rounds}),
         });
+    }
+    // 3e. polish: budget left over (small boards finish early) goes to a rip-up-and-reroute round
+    // on every net still open, on the filled board; kept only when the board has fewer opens
+    if a.get("no-polish").is_none() && left() > budget * 0.25 {
+        let (n0, per) = match last_opens.take() {
+            Some((p, r)) if p == cur => r,
+            _ => opens_all(a, &cur, &c)?,
+        };
+        last_opens = Some((cur.clone(), (n0, per.clone())));
+        let open: Vec<String> = per
+            .iter()
+            .filter_map(|n| n["net"].as_str().map(String::from))
+            .collect();
+        if n0 > 0 && !open.is_empty() {
+            let t = Instant::now();
+            let fo = format!("{work}/3e_fill.kicad_pcb");
+            let o = format!("{work}/3e_polish.kicad_pcb");
+            let nets = open.join(",");
+            let pn_pol = plane_nets
+                .iter()
+                .filter(|p| !open.contains(p))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",");
+            let tls = format!("{:.0}", (left() - (budget * 0.1).clamp(1.0, 30.0)).max(1.0));
+            let mut kv: Vec<(&str, &str)> = vec![
+                ("pcb", &fo),
+                ("out", &o),
+                ("nets", &nets),
+                ("time-limit", &tls),
+                ("reroute-blockers", "1"),
+                ("max-targets", "20"),
+            ];
+            if !pn_pol.is_empty() {
+                kv.push(("plane-nets", &pn_pol));
+            }
+            if !sig_layers.is_empty() {
+                kv.push(("signal-layers", &sig_layers));
+            }
+            let r = cmd_plane(&sub_args(
+                "plane",
+                &[("pcb", &cur), ("out", &fo), ("_sub", "fill")],
+            ))
+            .and_then(|_| cmd_route_core(&sub_args("route", &kv)));
+            let (n1, keep) = match r {
+                Ok(_) => {
+                    let (n1, per1) = opens_all(a, &o, &c)?;
+                    if n1 < n0 {
+                        cur = o.clone();
+                        last_opens = Some((cur.clone(), (n1, per1)));
+                        (n1, true)
+                    } else {
+                        (n1, false)
+                    }
+                }
+                Err(_) => (n0, false),
+            };
+            stages.push(Stage {
+                name: "polish",
+                out: cur.clone(),
+                secs: t.elapsed().as_secs_f64(),
+                opens: Some(if keep { n1 } else { n0 }),
+                ok: true,
+                note: format!(
+                    "{} open net(s), {n0} -> {n1} opens{}",
+                    open.len(),
+                    if keep { "" } else { ", not kept" }
+                ),
+                detail: json!({"nets": open, "before": n0, "after": n1, "kept": keep}),
+            });
+        }
     }
     // 3d. starved thermal reliefs (kicad-cli: fewer than 2 spokes): a short stub track from the
     // pad into its zone's fill counts as a spoke
