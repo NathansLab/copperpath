@@ -36,4 +36,8 @@ fn status_of_the_demo_suggests_the_next_commands() {
             .any(|n| n.contains("autoroute") && n.contains("--planes In1.Cu=GND")),
         "{v}"
     );
+    // routing intents from the net names, also in the suggested autoroute
+    let sp = v["suggested_prio"].as_str().unwrap();
+    assert!(sp.contains("+5V=low_r") && sp.contains("CLK=low_l"), "{v}");
+    assert!(next.iter().any(|n| n.contains("--prio '")), "{v}");
 }

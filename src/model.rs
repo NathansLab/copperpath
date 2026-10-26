@@ -143,6 +143,11 @@ pub struct NetPrio {
     /// more (`quiet`, `iso:X`)
     pub iso: f64,
     pub first: bool,
+    /// target single-ended impedance (Ohm) on the outer layers: the track width comes from the
+    /// stackup (`z:50`); 0 = none
+    pub z: f64,
+    /// copper layers the net's tracks may use (`outer`: F.Cu and B.Cu; vias still pass)
+    pub layers: u8,
 }
 
 impl Default for NetPrio {
@@ -153,6 +158,8 @@ impl Default for NetPrio {
             dir: 1.0,
             width: 1.0,
             iso: 0.0,
+            z: 0.0,
+            layers: 0x3f,
             first: false,
         }
     }
@@ -195,6 +202,7 @@ impl NetPrio {
                 "quiet" => p.iso = p.iso.max(0.5),
                 "wide" => p.width *= 1.5,
                 "first" => p.first = true,
+                "outer" => p.layers &= 1 | 1 << (NL - 1),
                 _ => {
                     let (k, v) = t
                         .split_once(':')
@@ -202,6 +210,15 @@ impl NetPrio {
                     let x: f64 = v
                         .parse()
                         .map_err(|_| format!("net priority '{t}': expected a number"))?;
+                    if k == "z" {
+                        if !(10.0..=200.0).contains(&x) {
+                            return Err(format!(
+                                "net priority '{t}': impedance out of range 10..200 Ohm"
+                            ));
+                        }
+                        p.z = x;
+                        continue;
+                    }
                     if !(0.0..=100.0).contains(&x) {
                         return Err(format!("net priority '{t}': out of range 0..100"));
                     }
@@ -552,7 +569,9 @@ impl<'a> Model<'a> {
                 } else {
                     cfg.signal_layers
                 };
-                class_layer_mask(&cfg.class_layers, cls).unwrap_or(0x3f) & b.cu_mask & sig
+                // routing intent `outer`: tracks on the outer layers only
+                let pl = cfg.prio(&b.nets[i], cls).layers;
+                class_layer_mask(&cfg.class_layers, cls).unwrap_or(0x3f) & b.cu_mask & sig & pl
             })
             .collect();
         let fill_idx: Vec<PolyIndex> = {
@@ -711,6 +730,36 @@ pub struct Pin {
     pub at: P,
     pub layers: u8,
     pub comp: usize, // connectivity component id within the net
+}
+
+/// routing intents suggested from net names (for agents: `status` proposes them): supply rails
+/// `low_r`, clocks `low_l`, RF lines `z:50+outer`, sensitive analog nets `quiet`, USB data
+/// lines `few_vias`. Conservative patterns on the upper-cased name; the first match wins.
+pub fn suggest_intent(name: &str) -> Option<&'static str> {
+    let u = name.rsplit('/').next().unwrap_or(name).to_uppercase();
+    let has = |pats: &[&str]| pats.iter().any(|p| u.contains(p));
+    let rail = {
+        // +5V, 3V3, 1V8, 12V, VCC, VDD, VIN, VBUS, VBAT, PWR
+        let b = u.trim_start_matches('+').as_bytes();
+        let volt = b.first().is_some_and(|c| c.is_ascii_digit())
+            && b.contains(&b'V')
+            && b.iter()
+                .all(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'.');
+        volt || has(&["VCC", "VDD", "VIN", "VBUS", "VBAT", "PWR", "VSYS"])
+    };
+    if rail && !has(&["SENSE", "FB", "EN", "ADC", "MON", "DET"]) {
+        Some("low_r")
+    } else if has(&["CLK", "SCK", "XTAL", "OSC"]) {
+        Some("low_l")
+    } else if has(&["RF", "ANT"]) && !has(&["REF"]) {
+        Some("z:50+outer")
+    } else if has(&["USB_D", "USB_DP", "USB_DM", "D+", "D-"]) {
+        Some("few_vias")
+    } else if has(&["ADC", "AIN", "SENSE", "VREF", "AREF"]) {
+        Some("quiet")
+    } else {
+        None
+    }
 }
 
 /// layer mask of a net class from `class_layers`: the most specific matching pattern wins (most
@@ -1038,6 +1087,19 @@ pub fn mst_connections(pins: &[Pin]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intents_suggested_from_net_names() {
+        assert_eq!(suggest_intent("+5V"), Some("low_r"));
+        assert_eq!(suggest_intent("/power/3V3"), Some("low_r"));
+        assert_eq!(suggest_intent("VBUS_SENSE"), Some("quiet"));
+        assert_eq!(suggest_intent("I2S_BCLK"), Some("low_l"));
+        assert_eq!(suggest_intent("RF_OUT"), Some("z:50+outer"));
+        assert_eq!(suggest_intent("VREF"), Some("quiet"));
+        assert_eq!(suggest_intent("USB_D+"), Some("few_vias"));
+        assert_eq!(suggest_intent("GPIO12"), None);
+        assert_eq!(suggest_intent("Net-(R1-Pad2)"), None);
+    }
 
     #[test]
     fn net_class_names_carry_intents() {

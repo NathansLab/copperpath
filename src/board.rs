@@ -277,6 +277,20 @@ pub struct Board {
     pub mask: Vec<(Shape, u8)>,
     /// board setup solder mask expansion of pads (`pad_to_mask_clearance`)
     pub mask_margin: f64,
+    /// board stackup from the top (`setup` / `stackup`): empty when the board has none
+    pub stackup: Vec<StackLayer>,
+}
+
+/// one layer of the board stackup
+#[derive(Debug, Clone, Default)]
+pub struct StackLayer {
+    /// "F.Cu", "dielectric 1", "F.Mask", ...
+    pub name: String,
+    /// "copper", "core", "prepreg", "Top Solder Mask", ...
+    pub typ: String,
+    /// mm
+    pub thickness: f64,
+    pub epsilon_r: Option<f64>,
 }
 
 impl Board {
@@ -889,6 +903,20 @@ pub fn parse_board(text: String) -> Result<Board, String> {
             }
             "setup" => {
                 b.mask_margin = it.valf("pad_to_mask_clearance").unwrap_or(0.0);
+                for st in it.children("stackup") {
+                    for l in st.children("layer") {
+                        b.stackup.push(StackLayer {
+                            name: l.arg(0).unwrap_or("").to_string(),
+                            typ: l
+                                .child("type")
+                                .and_then(|t| t.arg(0))
+                                .unwrap_or("")
+                                .to_string(),
+                            thickness: l.valf("thickness").unwrap_or(0.0),
+                            epsilon_r: l.valf("epsilon_r"),
+                        });
+                    }
+                }
             }
             "footprint" => {
                 let (x, y, r) = it.xy("at").unwrap_or((0.0, 0.0, 0.0));

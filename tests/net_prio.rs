@@ -118,3 +118,53 @@ fn quiet_reduces_coupled_length() {
     }
     assert!(coupled[1] < 0.5 * coupled[0], "{coupled:?}");
 }
+
+/// `z:50`: the track width comes from the stackup (demo: 4 layers, default 0.2 mm prepreg),
+/// `netinfo` reports the microstrip impedance; DRC-clean
+#[test]
+fn impedance_intent_sets_the_width() {
+    let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("net_prio_z");
+    std::fs::create_dir_all(&d).unwrap();
+    let out = d.join("z.kicad_pcb");
+    let out = out.to_str().unwrap();
+    let pro = DEMO.replace("kicad_pcb", "kicad_pro");
+    let dru = DEMO.replace("kicad_pcb", "kicad_dru");
+    let r = cp(&["route", "--pcb", DEMO, "--prio", "CLK=z:50", "--out", out]);
+    assert_eq!(r["opens"], 0, "{r}");
+    let drc = cp(&["drc", "--pcb", out, "--pro", &pro, "--dru", &dru]);
+    assert_eq!(drc["violations"], 0, "{drc}");
+    let info = cp(&["netinfo", "--pcb", out, "--pro", &pro]);
+    let z = net(&info, "CLK")["z0_ohm"].as_f64().unwrap();
+    assert!((z - 50.0).abs() < 1.0, "{z}");
+    // length skew of a group of nets
+    let g = cp(&["netinfo", "--pcb", out, "--pro", &pro, "--match", "PWM_.*"]);
+    let g = &g["groups"][0];
+    assert_eq!(g["nets"], 2, "{g}");
+    let skew = g["max_mm"].as_f64().unwrap() - g["min_mm"].as_f64().unwrap();
+    assert!((g["skew_mm"].as_f64().unwrap() - skew).abs() < 0.01, "{g}");
+    let o = Command::new(env!("CARGO_BIN_EXE_copperpath"))
+        .args(["route", "--pcb", DEMO, "--prio", "CLK=z:500", "--out", out])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&o.stderr).contains("out of range"));
+}
+
+/// `outer`: the net's tracks stay on F.Cu/B.Cu (on the demo ADC1 otherwise uses In1.Cu)
+#[test]
+fn outer_intent_keeps_tracks_off_inner_layers() {
+    let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("net_prio_outer");
+    std::fs::create_dir_all(&d).unwrap();
+    let out = d.join("outer.kicad_pcb");
+    let out = out.to_str().unwrap();
+    let r = cp(&["route", "--pcb", DEMO, "--prio", "ADC1=outer", "--out", out]);
+    assert_eq!(r["opens"], 0, "{r}");
+    let text = std::fs::read_to_string(out).unwrap();
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for l in ["In1.Cu", "In2.Cu"] {
+        assert!(
+            !flat.contains(&format!("(layer \"{l}\") (net \"ADC1\")")),
+            "ADC1 on {l}"
+        );
+    }
+    assert!(flat.contains("(net \"ADC1\")"));
+}

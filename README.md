@@ -66,7 +66,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `place --zones zones.json [--init keep\|schematic\|both] [--moves N] [--starts K] [--out DIR]` | Parallel simulated-annealing placement of the movable parts inside zones (see `examples/zones.json`). Writes `place.json`; apply it to a copy with `scripts/apply_place.py`. |
 | `thermals --out OUT` | Refills the zones natively and gives every starved thermal pad (fewer than 2 resolved spokes, counted as kicad-cli 10 does: spokes into isolated islands only count when nothing else does, a track from the pad into the fill counts) a short legal stub track into its zone's fill, preferring fill connected to other items. `--json`: starved pads and stubs added. |
 | `ripup --nets PATS [--region BOX] [--locked] --out OUT` | Removes the unlocked tracks and vias of the matching nets (with `--locked` the locked ones too), optionally only those touching a region; `--json` lists what was removed per net. With `route --nets` an agent redoes single nets in well under a second. |
-| `status [--refill-zones]` | One-call overview for agents, in milliseconds: copper stack, net classes, zones with their selection key, plane nets and candidates, opens per net, native DRC by type, and the next commands to run (`--json`: `next`). |
+| `status [--refill-zones]` | One-call overview for agents, in milliseconds: copper stack, net classes, zones with their selection key, plane nets and candidates, opens per net, native DRC by type, routing intents suggested from the net names (`suggested_prio`: supply rails `low_r`, clocks `low_l`, RF `z:50+outer`, analog `quiet`), and the next commands to run (`--json`: `next`). |
 | `netinfo [--nets] [--cu-um 35]` | Length, vias, track width and estimated DC resistance (mΩ) and inductance (nH) per net, in milliseconds. See [Routing intents](#routing-intents-per-net---prio). |
 | `drc [--refill-zones] [--out report.json]` | Native copper DRC with KiCad's rule names in milliseconds. See [Native DRC](#native-drc-drc). |
 | `opens [--region] [--nets] [--max-islands 50]` | Unconnected connections per net, counted from all copper including saved zone fills (no 499-item cap as in kicad-cli). Nets named in `--nets` are counted even if they are plane nets. `--json` lists the islands of each open net (pads per copper component, largest first). |
@@ -249,9 +249,13 @@ nets marked `first` are routed before the others:
 | `wide` | 1.5x the class width | moderate current |
 | `quiet` | cells within 0.5 mm beyond the clearance of other nets' copper (fixed and routed) cost more | sensitive analog, clocks next to aggressors |
 | `first` | routed before the other nets | the nets that matter most |
+| `outer` | tracks only on F.Cu and B.Cu (vias still pass the inner layers) | with `z:` so the width holds everywhere, nets to probe or rework |
+| `z:OHM` | track width for that single-ended impedance on the outer layers, from the board stackup (microstrip, Hammerstad-Jensen; without a stackup: FR4 4.5, 35 µm, 0.2 mm prepreg on multilayer boards, 1.51 mm on two layers) | RF, USB/LVDS lines, clocks: `RF_OUT=z:50` |
 | `via:X` `bend:X` `dir:X` `width:X` `iso:X` | the multipliers themselves, `iso` the soft spacing in mm | fine tuning |
 
-`netinfo` also reports `coupled_mm`, the track length running closer than `--near` (0.5 mm, edge
+`netinfo --match 'D[0-7];A[0-9]+'` adds the length skew per group of nets (shortest, longest,
+`skew_mm`) for buses that need length matching. `netinfo` reports `z0_ohm`, the microstrip impedance of a net's narrowest outer-layer track
+(demo, `CLK=z:50`: 0.341 mm, 50.0 Ω). `netinfo` also reports `coupled_mm`, the track length running closer than `--near` (0.5 mm, edge
 to edge) to another net's copper on the same layer: on the demo, `CLK=quiet` cuts it from 11.2 to
 0.1 mm at the same length.
 

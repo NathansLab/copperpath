@@ -2070,11 +2070,24 @@ fn cmd_status(a: &Args) -> CmdResult {
         .filter(|p| p.candidate)
         .map(|p| p.net.as_str())
         .collect();
+    // routing intents from net names for routed nets without one (planes and pours excluded)
+    let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
+    let pour: std::collections::HashSet<usize> = b.zones.iter().map(|z| z.net).collect();
+    let suggested: Vec<String> = (1..b.nets.len())
+        .filter(|&i| m.routable[i] && !pour.contains(&i))
+        .filter(|&i| c.cfg.prio(&b.nets[i], &c.rules.class_of(i).name) == model::NetPrio::default())
+        .filter_map(|i| model::suggest_intent(&b.nets[i]).map(|p| format!("{}={p}", b.nets[i])))
+        .take(16)
+        .collect();
+    let suggested = suggested.join(",");
     if opens > 0 {
         let mut s =
             format!("copperpath autoroute --pcb {pcb} --out routed.kicad_pcb --drc native --json");
         if let (Some(l), Some(n)) = (inner_free.first(), cand.first()) {
             s += &format!(" --planes {l}={n}");
+        }
+        if !suggested.is_empty() {
+            s += &format!(" --prio '{suggested}'");
         }
         next.push(s);
     }
@@ -2122,7 +2135,7 @@ fn cmd_status(a: &Args) -> CmdResult {
         "planes": planes.iter().filter(|p| p.plane || p.pour || p.candidate).collect::<Vec<_>>(),
         "opens": opens,
         "open_nets": per.iter().map(|(n, k, _)| json!({"net": n, "opens": k})).collect::<Vec<_>>(),
-        "drc": by, "next": next, "s": check::round2(dt),
+        "drc": by, "suggested_prio": suggested, "next": next, "s": check::round2(dt),
     }))
 }
 
@@ -2145,16 +2158,49 @@ fn cmd_netinfo(a: &Args) -> CmdResult {
     });
     let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
     elec::coupling(&m, a.f("near", 0.5), &mut v);
-    if !a.json() {
-        println!("net\tlength_mm\tvias\twidth_mm\tR_mOhm\tL_nH\tcoupled_mm");
-        for e in &v {
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                e.net, e.length_mm, e.vias, e.width_min_mm, e.r_mohm, e.l_nh, e.coupled_mm
-            );
+    // --match 'D[0-7];A[0-9]+': length skew per group of nets (full-name regexes, ';' between
+    // groups): what a bus needs for length matching
+    let mut groups = Vec::new();
+    if let Some(spec) = a.get("match") {
+        for pat in spec.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+            let re = regex::Regex::new(&format!("^(?:{pat})$"))
+                .map_err(|e| format!("--match {pat}: {e}"))?;
+            let g: Vec<&elec::NetElec> = v.iter().filter(|e| re.is_match(&e.net)).collect();
+            let (Some(lo), Some(hi)) = (
+                g.iter().min_by(|x, y| x.length_mm.total_cmp(&y.length_mm)),
+                g.iter().max_by(|x, y| x.length_mm.total_cmp(&y.length_mm)),
+            ) else {
+                groups.push(json!({"match": pat, "nets": 0}));
+                continue;
+            };
+            groups.push(json!({
+                "match": pat, "nets": g.len(),
+                "shortest": lo.net, "min_mm": lo.length_mm,
+                "longest": hi.net, "max_mm": hi.length_mm,
+                "skew_mm": check::round2(hi.length_mm - lo.length_mm),
+            }));
         }
     }
-    Ok(json!({"nets": v}))
+    if !a.json() {
+        println!("net\tlength_mm\tvias\twidth_mm\tR_mOhm\tL_nH\tcoupled_mm\tz0_ohm");
+        for e in &v {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                e.net,
+                e.length_mm,
+                e.vias,
+                e.width_min_mm,
+                e.r_mohm,
+                e.l_nh,
+                e.coupled_mm,
+                e.z0_ohm.map_or("-".into(), |z| z.to_string())
+            );
+        }
+        for g in &groups {
+            println!("group {g}");
+        }
+    }
+    Ok(json!({"nets": v, "groups": groups}))
 }
 
 /// native copper DRC with KiCad's rule names (see `drc.rs`); `-o` writes a KiCad-style JSON

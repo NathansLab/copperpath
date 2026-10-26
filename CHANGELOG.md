@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `netinfo --match 'D[0-7];A[0-9]+'`: length skew per group of nets (shortest, longest,
+  `skew_mm`); the text output shows `z0_ohm`.
+- `status`: `suggested_prio`, routing intents from net names (supply rails `low_r`, clocks
+  `low_l`, RF lines `z:50+outer`, USB data `few_vias`, analog `quiet`), also appended to the
+  suggested `autoroute` command.
+- Routing intent `z:OHM`: the track width for a single-ended impedance on the outer layers,
+  computed from the board stackup (microstrip; FR4 defaults without one); `netinfo` reports
+  `z0_ohm` per net. Intent `outer`: the net's tracks stay on the outer layers.
 - `thermals`: a short stub track for every starved thermal pad (fewer than 2 spokes), and an
   `autoroute` stage that runs it after the pours (`--no-thermals`); sizif128: kicad-cli
   `starved_thermal` 17 -> 7.
