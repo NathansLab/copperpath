@@ -2020,25 +2020,34 @@ fn cmd_tune(a: &Args) -> CmdResult {
                 .filter(|t| t.net == net && !t.locked && !t.uuid.is_empty())
                 .collect();
             tracks.sort_by(|x, y| (y.b - y.a).len().total_cmp(&(x.b - x.a).len()));
-            for t in tracks {
-                if remaining <= tol {
-                    break;
-                }
-                let gap = a.f("gap", c.rules.class_of(net).clearance.max(t.w));
-                // what one track can take at the largest amplitude
-                let pitch = 2.0 * (t.w + gap);
-                let usable = (t.b - t.a).len() - 2.0 * (t.w + gap);
-                let cap = (usable / pitch).floor().max(0.0) * 2.0 * amax;
-                let part = remaining.min(cap);
-                if part <= tol {
-                    continue;
-                }
-                if let Some(segs) = tune::meander(&m, t, part, gap, amax, &placed) {
-                    removed.push(t.uuid.clone());
-                    placed.extend(segs.iter().map(|s| (net, s.clone())));
-                    add.entry(net).or_default().segs.extend(segs);
-                    remaining -= part;
-                    meanders += 1;
+            // --amax first; when the tracks are too short for the target, taller bumps on the
+            // tracks still free (2x, 3x)
+            let mut used = vec![false; tracks.len()];
+            for am in [amax, 2.0 * amax, 3.0 * amax] {
+                for (ti, t) in tracks.iter().enumerate() {
+                    if remaining <= tol {
+                        break;
+                    }
+                    if used[ti] {
+                        continue;
+                    }
+                    let gap = a.f("gap", c.rules.class_of(net).clearance.max(t.w));
+                    // what one track can take at this amplitude
+                    let pitch = 2.0 * (t.w + gap);
+                    let usable = (t.b - t.a).len() - 2.0 * (t.w + gap);
+                    let cap = (usable / pitch).floor().max(0.0) * 2.0 * am;
+                    let part = remaining.min(cap);
+                    if part <= tol {
+                        continue;
+                    }
+                    if let Some(segs) = tune::meander(&m, t, part, gap, am, &placed) {
+                        used[ti] = true;
+                        removed.push(t.uuid.clone());
+                        placed.extend(segs.iter().map(|s| (net, s.clone())));
+                        add.entry(net).or_default().segs.extend(segs);
+                        remaining -= part;
+                        meanders += 1;
+                    }
                 }
             }
         }
