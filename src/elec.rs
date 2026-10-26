@@ -54,6 +54,76 @@ pub struct NetElec {
     /// same layer, and the smallest such gap (mm); filled by [`coupling`]
     pub coupled_mm: f64,
     pub gap_min_mm: Option<f64>,
+    /// microstrip impedance (Ohm) of the narrowest track on an outer layer (see
+    /// [`outer_dielectric`]); None without outer-layer tracks
+    pub z0_ohm: Option<f64>,
+}
+
+/// the dielectric under the outer copper layer: (height h, epsilon_r, copper thickness t), mm.
+/// From the board stackup when it has one, else FR4 (epsilon_r 4.5, 35 um copper) with 1.51 mm
+/// (two layers) or 0.2 mm (prepreg of a multilayer board) to the next copper.
+pub fn outer_dielectric(b: &Board) -> (f64, f64, f64) {
+    let top = b.stackup.iter().position(|l| l.typ == "copper");
+    if let Some(i) = top {
+        let t = b.stackup[i].thickness.max(0.005);
+        if let Some(d) = b.stackup[i + 1..]
+            .iter()
+            .take_while(|l| l.typ != "copper")
+            .find(|l| l.thickness > 0.0)
+        {
+            let h: f64 = b.stackup[i + 1..]
+                .iter()
+                .take_while(|l| l.typ != "copper")
+                .map(|l| l.thickness)
+                .sum();
+            return (h, d.epsilon_r.unwrap_or(4.5), t);
+        }
+    }
+    let h = if b.cu_mask.count_ones() > 2 {
+        0.2
+    } else {
+        1.51
+    };
+    (h, 4.5, 0.035)
+}
+
+/// characteristic impedance (Ohm) of a surface microstrip of width w over a plane at height h,
+/// copper thickness t (mm), dielectric epsilon_r (Hammerstad-Jensen with the thickness
+/// correction of the width, dw = t/pi (1 + ln(2h/t)); within a few percent of the usual
+/// calculators)
+pub fn z_microstrip(w: f64, h: f64, t: f64, er: f64) -> f64 {
+    let w = w + t / std::f64::consts::PI * (1.0 + (2.0 * h / t).ln());
+    let u = w / h;
+    let a = if u < 1.0 {
+        0.04 * (1.0 - u).powi(2)
+    } else {
+        0.0
+    };
+    let eeff = (er + 1.0) / 2.0 + (er - 1.0) / 2.0 * ((1.0 + 12.0 / u).powf(-0.5) + a);
+    if u <= 1.0 {
+        60.0 / eeff.sqrt() * (8.0 / u + u / 4.0).ln()
+    } else {
+        120.0 * std::f64::consts::PI / (eeff.sqrt() * (u + 1.393 + 0.667 * (u + 1.444).ln()))
+    }
+}
+
+/// track width (mm) for impedance `z` on the outer layers of board `b`; None outside 0.02..10 mm
+pub fn width_for_z(b: &Board, z: f64) -> Option<f64> {
+    let (h, er, t) = outer_dielectric(b);
+    let (mut lo, mut hi) = (0.02f64, 10.0f64);
+    if z_microstrip(lo, h, t, er) < z || z_microstrip(hi, h, t, er) > z {
+        return None;
+    }
+    // impedance falls with width
+    for _ in 0..60 {
+        let m = 0.5 * (lo + hi);
+        if z_microstrip(m, h, t, er) > z {
+            lo = m;
+        } else {
+            hi = m;
+        }
+    }
+    Some(0.5 * (lo + hi))
 }
 
 /// partial self-inductance of a flat conductor (Grover), nH; l, w, t in mm
@@ -84,7 +154,11 @@ pub fn nets(b: &Board, st: &Stack, sel: &dyn Fn(usize) -> bool) -> Vec<NetElec> 
     let mut wmin = vec![f64::INFINITY; n];
     let mut wmax = vec![0.0f64; n];
     let mut lv = vec![0.0f64; n];
+    let mut wout = vec![f64::INFINITY; n];
     for t in &b.tracks {
+        if crate::board::is_outer(t.layer) {
+            wout[t.net] = wout[t.net].min(t.w);
+        }
         let l = (t.b - t.a).len();
         len[t.net] += l;
         r[t.net] += RHO * l / (t.w.max(1e-6) * st.cu);
@@ -114,6 +188,10 @@ pub fn nets(b: &Board, st: &Stack, sel: &dyn Fn(usize) -> bool) -> Vec<NetElec> 
                 l_nh: r3(l_flat(len[i], w.max(0.01), st.cu) + lv[i]),
                 coupled_mm: 0.0,
                 gap_min_mm: None,
+                z0_ohm: wout[i].is_finite().then(|| {
+                    let (h, er, t) = outer_dielectric(b);
+                    (z_microstrip(wout[i], h, t, er) * 10.0).round() / 10.0
+                }),
             }
         })
         .collect();
@@ -188,6 +266,18 @@ pub fn coupling(m: &Model, near: f64, rows: &mut [NetElec]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn microstrip_against_reference_values() {
+        // 50 Ohm on 0.2 mm prepreg (epsilon_r 4.4, 35 um): calculators give about 0.33-0.36 mm
+        let z = z_microstrip(0.34, 0.2, 0.035, 4.4);
+        assert!((z - 50.0).abs() < 3.0, "{z}");
+        // 1.6 mm two-layer FR4: 50 Ohm needs about 2.9-3.1 mm
+        let z = z_microstrip(3.0, 1.51, 0.035, 4.5);
+        assert!((z - 50.0).abs() < 3.0, "{z}");
+        // wider is lower
+        assert!(z_microstrip(0.2, 0.2, 0.035, 4.4) > z_microstrip(0.4, 0.2, 0.035, 4.4));
+    }
 
     #[test]
     fn textbook_values() {

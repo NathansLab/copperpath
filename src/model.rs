@@ -143,6 +143,9 @@ pub struct NetPrio {
     /// more (`quiet`, `iso:X`)
     pub iso: f64,
     pub first: bool,
+    /// target single-ended impedance (Ohm) on the outer layers: the track width comes from the
+    /// stackup (`z:50`); 0 = none
+    pub z: f64,
 }
 
 impl Default for NetPrio {
@@ -153,6 +156,7 @@ impl Default for NetPrio {
             dir: 1.0,
             width: 1.0,
             iso: 0.0,
+            z: 0.0,
             first: false,
         }
     }
@@ -202,6 +206,15 @@ impl NetPrio {
                     let x: f64 = v
                         .parse()
                         .map_err(|_| format!("net priority '{t}': expected a number"))?;
+                    if k == "z" {
+                        if !(10.0..=200.0).contains(&x) {
+                            return Err(format!(
+                                "net priority '{t}': impedance out of range 10..200 Ohm"
+                            ));
+                        }
+                        p.z = x;
+                        continue;
+                    }
                     if !(0.0..=100.0).contains(&x) {
                         return Err(format!("net priority '{t}': out of range 0..100"));
                     }

@@ -877,6 +877,12 @@ impl<'a> Router<'a> {
             // routing intent: a wider track (capped at 5 mm), never narrower than the class
             let prio = m.cfg.prio(&m.b.nets[net], &m.r.class_of(net).name);
             let w = (w * prio.width).clamp(w.min(wmin), w.max(5.0));
+            // controlled impedance: the width from the stackup replaces the class width (still
+            // within the board minimum and 5 mm)
+            let w = match (prio.z > 0.0).then(|| crate::elec::width_for_z(m.b, prio.z)) {
+                Some(Some(zw)) => zw.clamp(wmin, 5.0),
+                _ => w,
+            };
             jobs.push(NetJob {
                 net,
                 pins: ps,
