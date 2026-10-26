@@ -16,3 +16,7 @@ machine (GitHub runners: 4 cores); compare rows from the same machine.
 
 "fully routed" counts the boards that end with 0 unconnected items; "unconnected" and "new DRC"
 are sums over all boards.
+
+| release | date | commit | command | fully routed | unconnected | new DRC | vias | route time s | machine |
+|---|---|---|---|---|---|---|---|---|---|
+| main fe329e3 | 2026-10-25 | `fe329e3e` | autoroute | 1/8 | 152 | 25 | 1131 | 406 | 4 cores Intel(R) Xeon(R) Processor @ 2.10GHz |

@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- README benchmark section: PCBench results table, renders of the routed boards and a DRC time
+  chart (`scripts/readme_figures.py`); first row in `docs/benchmark.md`.
 - `ripup --nets PATS [--region] [--locked]`: remove the copper of nets (agents redo single nets
   with `route --nets`).
 - Routing intent `quiet` / `iso:X`: soft extra spacing to other nets' copper (fixed and routed),

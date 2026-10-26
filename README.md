@@ -577,6 +577,44 @@ the output files are unchanged, and without the flag no event is written.
 - `done`: always the last event, also on errors (`"ok":false,"error":"…"`). `v` is the schema
   version; `stopped` is `null`, `time-limit`, `signal` or `cancel` as in `--json`.
 
+## Benchmark (PCBench)
+
+`scripts/bench_pcbench.py` routes eight MIT-licensed boards from the PCBench set that Freerouting
+benchmarks with, end to end and without manual steps: download (pinned commit, sha256), keep the
+board's own net classes (track widths, clearances, vias) and setup minimums, strip all tracks and
+vias, then one `copperpath autoroute --time 120` (planes, fan-out, signals, pours) and a sign-off
+with `kicad-cli pcb drc --refill-zones`. Result of the current main (4 cores, 2026-10-25):
+
+| board | layers | nets | unconnected before → after | new DRC (KiCad) | route s | vias (human) | length mm (human) |
+|---|---|---|---|---|---|---|---|
+| fan_controller | 2 | 31 | 77 → 1 | starved_thermal 1, track_dangling 1 | 4.2 | 34 (23) | 590 (534) |
+| LVDS2TMDS | 2 | 29 | 39 → 0 | 0 | 0.7 | 10 (13) | 272 (274) |
+| sizif128 | 2 | 28 | 272 → 32 | starved_thermal 15, via_dangling 2 | 146 | 221 (203) | 6183 (8329) |
+| rxadc_14 | 4 | 47 | 78 → 11 | solder_mask_bridge 3 | 9.6 | 78 (31) | 476 (447) |
+| icehat | 4 | 59 | 104 → 10 | track_dangling 1 | 51 | 61 (41) | 937 (1251) |
+| rf_siggen | 4 | 57 | 153 → 16 | track_dangling 1 | 18 | 175 (369) | 998 (1108) |
+| a123_bcm | 4 | 139 | n/a → 4 ¹ | starved_thermal 1 ¹ | 6.3 | 64 (88) | 809 (1065) |
+| prog_rig | 4 | 287 | 499 → 83 | track_dangling 1 | 170 | 488 (332) | 7623 (12796) |
+
+¹ kicad-cli's zone refill on a123_bcm did not finish within 600 s; the numbers are from
+`copperpath drc --refill-zones` (0.55 s).
+
+The history per release lives in [docs/benchmark.md](docs/benchmark.md); the `Benchmark`
+workflow adds a row for every release tag. Routed boards (`render --refill-zones --fills
+--opens`, white lines are the remaining open connections):
+
+| | |
+|---|---|
+| ![LVDS2TMDS](docs/img/bench_LVDS2TMDS.png) | ![icehat](docs/img/bench_icehat.png) |
+| ![rf_siggen](docs/img/bench_rf_siggen.png) | ![rxadc_14](docs/img/bench_rxadc_14.png) |
+| ![fan_controller](docs/img/bench_fan_controller.png) | ![a123_bcm](docs/img/bench_a123_bcm.png) |
+
+DRC time on the routed boards with the saved fills, best of three: the native `drc` gives the
+same violations as kicad-cli in 7-74 ms instead of 0.65-1.4 s
+(`scripts/readme_figures.py` regenerates figures and chart from a benchmark run).
+
+![DRC time per board, kicad-cli against copperpath drc](docs/img/drc_time.svg)
+
 ## Comparison with Freerouting
 
 Freerouting is the established open-source autorouter for KiCad (via Specctra DSN). An informal
@@ -623,6 +661,7 @@ same placed input):
 |---|---|---|
 | `scripts/make_demo.py [OUT_DIR]` | KiCad 10 Python (`pcbnew`), KiCad footprint library | regenerate the demo board |
 | `scripts/apply_place.py IN place.json OUT` | KiCad 10 Python (`pcbnew`) | apply a `place` result to a copy |
+| `scripts/readme_figures.py --work bench_work` | Python 3, kicad-cli | README renders of the routed benchmark boards and the DRC time chart |
 | `scripts/make_stress.py OUT.kicad_pcb [--parts 800] [--layers 6]` | Python 3 | synthetic stress board (SOIC-8 clusters with 0603 passives, GND/+3V3 zones) for benchmarks |
 | `scripts/plot_route.py OUT.png x0,y0,x1,y1 TITLE=B.kicad_pcb ...` | Python 3, matplotlib | side-by-side copper plots |
 | `scripts/drc_compare.py base.json new.json` | Python 3 | diff two kicad-cli DRC reports |
