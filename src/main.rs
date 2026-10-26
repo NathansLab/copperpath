@@ -4243,8 +4243,16 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
     eprintln!(
         "[autoroute] {opens_in} -> {opens_final} opens in {total:.1} s (budget {budget:.0} s) -> {out}"
     );
+    // what to run next: why the rest is open (with the fixing command per connection) and the
+    // board check
+    let mut next: Vec<String> = Vec::new();
+    if opens_final > 0 {
+        next.push(format!("copperpath explain --pcb {out} --json"));
+    }
+    next.push(format!("copperpath drc --pcb {out} --json"));
     Ok(json!({
         "out": out,
+        "next": next,
         "opens_before": opens_in,
         "opens": opens_final,
         "open_nets": open_final,
