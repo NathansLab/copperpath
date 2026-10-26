@@ -238,6 +238,16 @@ def history(path, run):
     open(path, "w").write("\n".join(lines))
 
 
+def native_drc(cp, pcb):
+    """copperpath's own DRC (releases with `drc`): (unconnected, types), or (-1, {})"""
+    r = subprocess.run([cp, "drc", "--refill-zones", "--json", "--pcb", pcb], capture_output=True, text=True)
+    try:
+        d = json.loads(r.stdout)
+        return d["unconnected"], d["by_type"]
+    except (ValueError, KeyError):
+        return -1, {}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--time", type=float, default=300)
@@ -269,7 +279,15 @@ def main():
         # the routed copy gets the project file, else kicad-cli checks it with default rules
         shutil.copy(pcb.replace(".kicad_pcb", ".kicad_pro"), out.replace(".kicad_pcb", ".kicad_pro"))
         t0 = time.time()
-        unc, types = drc(a.kicad_cli, out, out.replace(".kicad_pcb", "_drc.json"))
+        tool = "kicad-cli"
+        if unc0 >= 0:
+            unc, types = drc(a.kicad_cli, out, out.replace(".kicad_pcb", "_drc.json"))
+        else:
+            # kicad-cli did not finish on the input (zone refill of a large board): the native
+            # DRC of the version under test checks both boards instead of another 600 s wait
+            tool = "native"
+            unc0, types_in = native_drc(a.copperpath, pcb)
+            unc, types = native_drc(a.copperpath, out)
         t_drc = time.time() - t0
         new = {k: v - types_in.get(k, 0) for k, v in types.items() if v > types_in.get(k, 0)}
         vias, ln = copper(open(out, encoding="utf-8").read())
@@ -277,7 +295,7 @@ def main():
         rows.append({
             "board": short, "layers": meta["board"]["layers"], "nets": meta["board"]["nets"],
             "unconnected_in": unc0, "unconnected": unc, "new_drc": new, "s": round(dt, 1),
-            "kicad_drc_s": round(t_drc, 2), "vias": vias, "length_mm": round(ln),
+            "kicad_drc_s": round(t_drc, 2), "drc_tool": tool, "vias": vias, "length_mm": round(ln),
             "ref_vias": ref["vias"], "ref_length_mm": round(ref["track_length_mm"]),
         })
         print(json.dumps(rows[-1]), flush=True)
@@ -298,6 +316,8 @@ def main():
                     f.write(f"| {r['board']} | | | failed | | {r['s']} | | | |\n")
                     continue
                 nd = ", ".join(f"{k} {v}" for k, v in sorted(r["new_drc"].items())) or "0"
+                if r.get("drc_tool") == "native":
+                    nd += " (native DRC: kicad-cli timed out)"
                 f.write(f"| {r['board']} | {r['layers']} | {r['nets']} | {r['unconnected_in']} → {r['unconnected']} | {nd} | {r['s']} | {r['kicad_drc_s']} | {r['vias']} ({r['ref_vias']}) | {r['length_mm']} ({r['ref_length_mm']}) |\n")
 
 

@@ -141,6 +141,10 @@ All notable changes to this project are documented here. The format follows
   parallel, so the autoroute quality gate and repeated runs check an unchanged input once.
 
 ### Fixed
+- Routed copper: a track end on the middle of another track of the net (T-junction) splits
+  that track there; kicad-cli counted such ends as `track_dangling` (icehat, rf_siggen).
+- `scripts/bench_pcbench.py`: when kicad-cli times out on the input board (a123_bcm zone
+  refill), both boards are checked with the native DRC instead of a second 600 s wait.
 - `autoroute`: the signal routing leaves a fifth of the budget to the pour nets, and the pour
   stage runs even when the signals overran the budget (PCBench sizif128 at 120 s: the GND pour
   stage was skipped, 32 -> 16 unconnected).
