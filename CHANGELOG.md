@@ -160,6 +160,9 @@ All notable changes to this project are documented here. The format follows
   parallel, so the autoroute quality gate and repeated runs check an unchanged input once.
 
 ### Fixed
+- `autoroute`, `fanout`, `stitch`, `plane fill/create/adjust` copy the project and rules files
+  next to their output, like `route`: commands run on the output (`drc`, `status`, `explain`)
+  used KiCad's default net class otherwise (icehat: 190 false clearance violations).
 - Routed copper: a track end on the middle of another track of the net (T-junction) splits
   that track there; kicad-cli counted such ends as `track_dangling` (icehat, rf_siggen).
 - `scripts/bench_pcbench.py`: when kicad-cli times out on the input board (a123_bcm zone

@@ -1843,6 +1843,7 @@ fn cmd_fanout(a: &Args) -> CmdResult {
     routed.insert(net, r.copper);
     droute::write_copper(&base_text(a, &c)?, &c.board.nets, &routed, &out)
         .map_err(|e| format!("{out}: {e}"))?;
+    copy_project(&c, &out)?;
     eprintln!("[fanout] -> {out}");
     Ok(json!({
         "out": out, "net": net_name, "via": [via_d, drill],
@@ -1922,6 +1923,7 @@ fn cmd_stitch(a: &Args) -> CmdResult {
         },
     );
     droute::write_copper(&text, &c.board.nets, &routed, &out).map_err(|e| format!("{out}: {e}"))?;
+    copy_project(&c, &out)?;
     eprintln!("[stitch] {} vias -> {out}", r.vias.len());
     Ok(json!({
         "out": out, "net": net_name, "via": [via_d, drill],
@@ -1986,6 +1988,19 @@ fn cmd_ripup(a: &Args) -> CmdResult {
         "out": out, "removed": n,
         "nets": per.iter().map(|(k, (t, v))| json!({"net": k, "tracks": t, "vias": v})).collect::<Vec<_>>(),
     }))
+}
+
+/// copy the input's project and rules files next to a written board (`OUT.kicad_pro`,
+/// `OUT.kicad_dru`), so later commands on it (and KiCad) use the board's net classes; never
+/// onto the input itself
+fn copy_project(c: &Ctx, out: &str) -> Result<(), String> {
+    for (src, ext) in [(&c.pro, "kicad_pro"), (&c.dru, "kicad_dru")] {
+        let dst = out.replace(".kicad_pcb", &format!(".{ext}"));
+        if std::path::Path::new(src).is_file() && *src != dst && dst != out {
+            std::fs::copy(src, &dst).map_err(|e| format!("{src}: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// length matching: `tune --match REGEX [--target MM] [--gap MM] [--amax 1] [--tol 0.05]
@@ -2939,6 +2954,7 @@ fn cmd_plane(a: &Args) -> CmdResult {
                 &fill_params(a),
             );
             write_file(&out, &plane::write_fills(&c.board.text, &c.board))?;
+            copy_project(&c, &out)?;
             eprintln!(
                 "[plane] {k} fill polygons in {:.2} s -> {out}",
                 t.elapsed().as_secs_f64()
@@ -3221,6 +3237,7 @@ fn plane_outline(a: &Args, sub: &str) -> CmdResult {
     board::parse_board(text.clone())
         .map_err(|e| format!("internal: written board does not parse: {e}"))?;
     write_file(&out, &text)?;
+    copy_project(&c, &out)?;
     eprintln!(
         "[plane] {sub} in {:.2} s -> {out}",
         t.elapsed().as_secs_f64()
@@ -4100,6 +4117,7 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
         opens_all(a, &chosen, &c)?
     };
     std::fs::copy(&chosen, &out).map_err(|e| format!("{out}: {e}"))?;
+    copy_project(&c, &out)?;
     stages.push(Stage {
         name: "gate",
         out: chosen.clone(),
