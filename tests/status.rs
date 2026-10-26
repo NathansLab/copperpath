@@ -38,6 +38,6 @@ fn status_of_the_demo_suggests_the_next_commands() {
     );
     // routing intents from the net names, also in the suggested autoroute
     let sp = v["suggested_prio"].as_str().unwrap();
-    assert!(sp.contains("+5V=low_r") && sp.contains("CLK=low_l"), "{v}");
+    assert!(sp.contains("+5V=wide") && sp.contains("CLK=low_l"), "{v}");
     assert!(next.iter().any(|n| n.contains("--prio '")), "{v}");
 }

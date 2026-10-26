@@ -14,7 +14,7 @@ All notable changes to this project are documented here. The format follows
   pairs for nets without polarity in the name: `--pairs 'POS=NEG'`, config / project `pairs`.
 - `netinfo --match 'D[0-7];A[0-9]+'`: length skew per group of nets (shortest, longest,
   `skew_mm`); the text output shows `z0_ohm`.
-- `status`: `suggested_prio`, routing intents from net names (supply rails `low_r`, clocks
+- `status`: `suggested_prio`, routing intents from net names (supply rails `wide`, clocks
   `low_l`, RF lines `z:50+outer`, USB data `few_vias`, analog `quiet`), also appended to the
   suggested `autoroute` command.
 - Routing intent `z:OHM`: the track width for a single-ended impedance on the outer layers,

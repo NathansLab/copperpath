@@ -67,7 +67,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `tune --match REGEX [--target MM] [--gap MM] [--amax 1] --out OUT` | Length matching: accordion meanders on straight tracks bring every matching net to the target length (default: the longest of them); each bump adds twice its amplitude, the last one the remainder, so the target is met exactly; every new segment keeps the clearances to other nets' copper, holes, rule areas and the board edge. `--json`: length before/after and meanders per net. |
 | `thermals --out OUT` | Refills the zones natively and gives every starved thermal pad (fewer than 2 resolved spokes, counted as kicad-cli 10 does: spokes into isolated islands only count when nothing else does, a track from the pad into the fill counts) a short legal stub track into its zone's fill, preferring fill connected to other items. `--json`: starved pads and stubs added. |
 | `ripup --nets PATS [--region BOX] [--locked] --out OUT` | Removes the unlocked tracks and vias of the matching nets (with `--locked` the locked ones too), optionally only those touching a region; `--json` lists what was removed per net. With `route --nets` an agent redoes single nets in well under a second. |
-| `status [--refill-zones]` | One-call overview for agents, in milliseconds: copper stack, net classes, zones with their selection key, plane nets and candidates, opens per net, native DRC by type, routing intents suggested from the net names (`suggested_prio`: supply rails `low_r`, clocks `low_l`, RF `z:50+outer`, analog `quiet`), and the next commands to run (`--json`: `next`). |
+| `status [--refill-zones]` | One-call overview for agents, in milliseconds: copper stack, net classes, zones with their selection key, plane nets and candidates, opens per net, native DRC by type, routing intents suggested from the net names (`suggested_prio`: supply rails `wide`, clocks `low_l`, RF `z:50+outer`, analog `quiet`), and the next commands to run (`--json`: `next`). |
 | `netinfo [--nets] [--cu-um 35]` | Length, vias, track width and estimated DC resistance (mΩ) and inductance (nH) per net, in milliseconds. See [Routing intents](#routing-intents-per-net---prio). |
 | `drc [--refill-zones] [--out report.json]` | Native copper DRC with KiCad's rule names in milliseconds. See [Native DRC](#native-drc-drc). |
 | `opens [--region] [--nets] [--max-islands 50]` | Unconnected connections per net, counted from all copper including saved zone fills (no 499-item cap as in kicad-cli). Nets named in `--nets` are counted even if they are plane nets. `--json` lists the islands of each open net (pads per copper component, largest first). |
@@ -243,11 +243,11 @@ nets marked `first` are routed before the others:
 
 | profile | effect | use for |
 |---|---|---|
-| `low_r` | twice the class width (pads keep the neck-down), vias cost 2x, first | supply rails, high current |
+| `low_r` | twice the class width (pads keep the neck-down), vias cost 2x, first | high current; costs completion on dense boards (icehat, `--time 10`: 26 instead of 18 open), where `wide` is the gentler choice |
 | `low_l` | vias cost 3x, bends and the wrong layer direction cheap (direct path), first | clocks, gate drives, decoupling loops |
 | `short` | bends and the wrong layer direction cheap | sense lines, short analog paths |
 | `few_vias` | vias cost 4x | signals that should stay on one layer |
-| `wide` | 1.5x the class width | moderate current |
+| `wide` | 1.5x the class width | supply rails, moderate current (what `status` suggests for rails) |
 | `quiet` | cells within 0.5 mm beyond the clearance of other nets' copper (fixed and routed) cost more | sensitive analog, clocks next to aggressors |
 | `first` | routed before the other nets | the nets that matter most |
 | `pair` | differential pair: the negative net (`_N`, `-`, `DM`) follows the positive one (`_P`, `+`, `DP`, routed first) at the class `diff_pair_gap` (else the clearance), both at `diff_pair_width` if set; the follower skips the pull-tight | USB, LVDS, MIPI: `USB_D*=pair` |
