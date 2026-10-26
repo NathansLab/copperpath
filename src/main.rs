@@ -2158,16 +2158,49 @@ fn cmd_netinfo(a: &Args) -> CmdResult {
     });
     let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
     elec::coupling(&m, a.f("near", 0.5), &mut v);
-    if !a.json() {
-        println!("net\tlength_mm\tvias\twidth_mm\tR_mOhm\tL_nH\tcoupled_mm");
-        for e in &v {
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                e.net, e.length_mm, e.vias, e.width_min_mm, e.r_mohm, e.l_nh, e.coupled_mm
-            );
+    // --match 'D[0-7];A[0-9]+': length skew per group of nets (full-name regexes, ';' between
+    // groups): what a bus needs for length matching
+    let mut groups = Vec::new();
+    if let Some(spec) = a.get("match") {
+        for pat in spec.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+            let re = regex::Regex::new(&format!("^(?:{pat})$"))
+                .map_err(|e| format!("--match {pat}: {e}"))?;
+            let g: Vec<&elec::NetElec> = v.iter().filter(|e| re.is_match(&e.net)).collect();
+            let (Some(lo), Some(hi)) = (
+                g.iter().min_by(|x, y| x.length_mm.total_cmp(&y.length_mm)),
+                g.iter().max_by(|x, y| x.length_mm.total_cmp(&y.length_mm)),
+            ) else {
+                groups.push(json!({"match": pat, "nets": 0}));
+                continue;
+            };
+            groups.push(json!({
+                "match": pat, "nets": g.len(),
+                "shortest": lo.net, "min_mm": lo.length_mm,
+                "longest": hi.net, "max_mm": hi.length_mm,
+                "skew_mm": check::round2(hi.length_mm - lo.length_mm),
+            }));
         }
     }
-    Ok(json!({"nets": v}))
+    if !a.json() {
+        println!("net\tlength_mm\tvias\twidth_mm\tR_mOhm\tL_nH\tcoupled_mm\tz0_ohm");
+        for e in &v {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                e.net,
+                e.length_mm,
+                e.vias,
+                e.width_min_mm,
+                e.r_mohm,
+                e.l_nh,
+                e.coupled_mm,
+                e.z0_ohm.map_or("-".into(), |z| z.to_string())
+            );
+        }
+        for g in &groups {
+            println!("group {g}");
+        }
+    }
+    Ok(json!({"nets": v, "groups": groups}))
 }
 
 /// native copper DRC with KiCad's rule names (see `drc.rs`); `-o` writes a KiCad-style JSON

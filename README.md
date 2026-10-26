@@ -253,7 +253,8 @@ nets marked `first` are routed before the others:
 | `z:OHM` | track width for that single-ended impedance on the outer layers, from the board stackup (microstrip, Hammerstad-Jensen; without a stackup: FR4 4.5, 35 µm, 0.2 mm prepreg on multilayer boards, 1.51 mm on two layers) | RF, USB/LVDS lines, clocks: `RF_OUT=z:50` |
 | `via:X` `bend:X` `dir:X` `width:X` `iso:X` | the multipliers themselves, `iso` the soft spacing in mm | fine tuning |
 
-`netinfo` reports `z0_ohm`, the microstrip impedance of a net's narrowest outer-layer track
+`netinfo --match 'D[0-7];A[0-9]+'` adds the length skew per group of nets (shortest, longest,
+`skew_mm`) for buses that need length matching. `netinfo` reports `z0_ohm`, the microstrip impedance of a net's narrowest outer-layer track
 (demo, `CLK=z:50`: 0.341 mm, 50.0 Ω). `netinfo` also reports `coupled_mm`, the track length running closer than `--near` (0.5 mm, edge
 to edge) to another net's copper on the same layer: on the demo, `CLK=quiet` cuts it from 11.2 to
 0.1 mm at the same length.

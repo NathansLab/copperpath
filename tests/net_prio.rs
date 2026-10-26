@@ -136,6 +136,12 @@ fn impedance_intent_sets_the_width() {
     let info = cp(&["netinfo", "--pcb", out, "--pro", &pro]);
     let z = net(&info, "CLK")["z0_ohm"].as_f64().unwrap();
     assert!((z - 50.0).abs() < 1.0, "{z}");
+    // length skew of a group of nets
+    let g = cp(&["netinfo", "--pcb", out, "--pro", &pro, "--match", "PWM_.*"]);
+    let g = &g["groups"][0];
+    assert_eq!(g["nets"], 2, "{g}");
+    let skew = g["max_mm"].as_f64().unwrap() - g["min_mm"].as_f64().unwrap();
+    assert!((g["skew_mm"].as_f64().unwrap() - skew).abs() < 0.01, "{g}");
     let o = Command::new(env!("CARGO_BIN_EXE_copperpath"))
         .args(["route", "--pcb", DEMO, "--prio", "CLK=z:500", "--out", out])
         .output()

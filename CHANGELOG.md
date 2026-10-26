@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `netinfo --match 'D[0-7];A[0-9]+'`: length skew per group of nets (shortest, longest,
+  `skew_mm`); the text output shows `z0_ohm`.
 - `status`: `suggested_prio`, routing intents from net names (supply rails `low_r`, clocks
   `low_l`, RF lines `z:50+outer`, USB data `few_vias`, analog `quiet`), also appended to the
   suggested `autoroute` command.
