@@ -146,6 +146,8 @@ pub struct NetPrio {
     /// target single-ended impedance (Ohm) on the outer layers: the track width comes from the
     /// stackup (`z:50`); 0 = none
     pub z: f64,
+    /// copper layers the net's tracks may use (`outer`: F.Cu and B.Cu; vias still pass)
+    pub layers: u8,
 }
 
 impl Default for NetPrio {
@@ -157,6 +159,7 @@ impl Default for NetPrio {
             width: 1.0,
             iso: 0.0,
             z: 0.0,
+            layers: 0x3f,
             first: false,
         }
     }
@@ -199,6 +202,7 @@ impl NetPrio {
                 "quiet" => p.iso = p.iso.max(0.5),
                 "wide" => p.width *= 1.5,
                 "first" => p.first = true,
+                "outer" => p.layers &= 1 | 1 << (NL - 1),
                 _ => {
                     let (k, v) = t
                         .split_once(':')
@@ -565,7 +569,9 @@ impl<'a> Model<'a> {
                 } else {
                     cfg.signal_layers
                 };
-                class_layer_mask(&cfg.class_layers, cls).unwrap_or(0x3f) & b.cu_mask & sig
+                // routing intent `outer`: tracks on the outer layers only
+                let pl = cfg.prio(&b.nets[i], cls).layers;
+                class_layer_mask(&cfg.class_layers, cls).unwrap_or(0x3f) & b.cu_mask & sig & pl
             })
             .collect();
         let fill_idx: Vec<PolyIndex> = {

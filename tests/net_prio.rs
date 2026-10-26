@@ -142,3 +142,23 @@ fn impedance_intent_sets_the_width() {
         .unwrap();
     assert!(String::from_utf8_lossy(&o.stderr).contains("out of range"));
 }
+
+/// `outer`: the net's tracks stay on F.Cu/B.Cu (on the demo ADC1 otherwise uses In1.Cu)
+#[test]
+fn outer_intent_keeps_tracks_off_inner_layers() {
+    let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("net_prio_outer");
+    std::fs::create_dir_all(&d).unwrap();
+    let out = d.join("outer.kicad_pcb");
+    let out = out.to_str().unwrap();
+    let r = cp(&["route", "--pcb", DEMO, "--prio", "ADC1=outer", "--out", out]);
+    assert_eq!(r["opens"], 0, "{r}");
+    let text = std::fs::read_to_string(out).unwrap();
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for l in ["In1.Cu", "In2.Cu"] {
+        assert!(
+            !flat.contains(&format!("(layer \"{l}\") (net \"ADC1\")")),
+            "ADC1 on {l}"
+        );
+    }
+    assert!(flat.contains("(net \"ADC1\")"));
+}

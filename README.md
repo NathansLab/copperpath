@@ -249,6 +249,7 @@ nets marked `first` are routed before the others:
 | `wide` | 1.5x the class width | moderate current |
 | `quiet` | cells within 0.5 mm beyond the clearance of other nets' copper (fixed and routed) cost more | sensitive analog, clocks next to aggressors |
 | `first` | routed before the other nets | the nets that matter most |
+| `outer` | tracks only on F.Cu and B.Cu (vias still pass the inner layers) | with `z:` so the width holds everywhere, nets to probe or rework |
 | `z:OHM` | track width for that single-ended impedance on the outer layers, from the board stackup (microstrip, Hammerstad-Jensen; without a stackup: FR4 4.5, 35 µm, 0.2 mm prepreg on multilayer boards, 1.51 mm on two layers) | RF, USB/LVDS lines, clocks: `RF_OUT=z:50` |
 | `via:X` `bend:X` `dir:X` `width:X` `iso:X` | the multipliers themselves, `iso` the soft spacing in mm | fine tuning |
 

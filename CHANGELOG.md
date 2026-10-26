@@ -8,7 +8,7 @@ All notable changes to this project are documented here. The format follows
 ### Added
 - Routing intent `z:OHM`: the track width for a single-ended impedance on the outer layers,
   computed from the board stackup (microstrip; FR4 defaults without one); `netinfo` reports
-  `z0_ohm` per net.
+  `z0_ohm` per net. Intent `outer`: the net's tracks stay on the outer layers.
 - `thermals`: a short stub track for every starved thermal pad (fewer than 2 spokes), and an
   `autoroute` stage that runs it after the pours (`--no-thermals`); sizif128: kicad-cli
   `starved_thermal` 17 -> 7.
