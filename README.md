@@ -532,7 +532,7 @@ session with every command and its result: [docs/agent-session.md](docs/agent-se
 | route | `autoroute --out r.kicad_pcb --drc native --time 10 --json` (`--prio` with the suggested intents) | 10 s, more for dense boards (chart above) |
 | check | `drc --pcb r.kicad_pcb --json`, `netinfo --json` (`--match 'D[0-7]'` for bus skew, `z0_ohm`) | 10-40 ms |
 | polish | `thermals --out r2.kicad_pcb` (stubs for starved thermal reliefs; `autoroute` runs it), `tune --match 'D[0-7]'` (length matching) | 0.1-1 s |
-| why open | `explain --net N --json` (reason, blockers, ROI image) | 20 ms |
+| why open | `explain --net N --json` (reason, blockers, ROI image, `next`: the command that fixes it) | 20 ms |
 | fix | `ripup --nets N`, then `route --nets N` (with `--prio` if needed), or `nudge` | 0.1-3 s |
 | see | `render --opens --out r.png` | 30 ms |
 

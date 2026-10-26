@@ -3318,12 +3318,37 @@ fn cmd_explain(a: &Args) -> CmdResult {
     if let (Some(p), None) = (&pad, net) {
         return Err(format!("--pad {p} needs --net"));
     }
-    let ex = explain_board(
+    let mut ex = explain_board(
         a,
         &c,
         &|n| n != 0 && net.is_none_or(|k| k == n),
         pad.as_deref(),
     )?;
+    // the command that addresses each reason (agents run it as is)
+    let pcb = &c.pcb;
+    for e in ex.as_array_mut().into_iter().flatten() {
+        let n = e["net"].as_str().unwrap_or_default().to_string();
+        let roi = e["roi"]
+            .as_array()
+            .map(|r| {
+                r.iter()
+                    .filter_map(|x| x.as_f64())
+                    .map(|x| format!("{x:.1}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        let next = match e["kind"].as_str() {
+            Some("routed-copper") | Some("congestion") => format!(
+                "copperpath route --pcb {pcb} --nets '{n}' --reroute-blockers --out fixed.kicad_pcb --json"
+            ),
+            _ if !roi.is_empty() => format!(
+                "copperpath nudge --pcb {pcb} --region {roi} --auto --auto-dist 3 --auto-max 4 --out nudged.kicad_pcb --json"
+            ),
+            _ => continue,
+        };
+        e["next"] = json!(next);
+    }
     Ok(json!({"open": ex.as_array().map(|v| v.len()), "explain": ex}))
 }
 

@@ -80,6 +80,7 @@ fn explain_kinds() {
     assert!((at[0].as_f64().unwrap() - 20.0).abs() < 0.6, "{e}");
     assert!(e["reason"].as_str().unwrap().contains("SIG"), "{e}");
     assert!(std::path::Path::new(e["img"].as_str().unwrap()).is_file());
+    assert!(e["next"].as_str().unwrap().contains("nudge"), "{e}");
 
     // route --explain: the open connection comes with its reason
     let pcb = board(&dir, "gap2", "gap");
@@ -98,4 +99,7 @@ fn explain_kinds() {
     let e = explain(&board(&dir, "unlocked", "unlocked"), &[]);
     assert_eq!(e["kind"], "routed-copper", "{e}");
     assert_eq!(e["rip_nets"][0], "SIG", "{e}");
+    // the command that fixes it
+    let next = e["next"].as_str().unwrap();
+    assert!(next.contains("--nets 'A' --reroute-blockers"), "{e}");
 }
