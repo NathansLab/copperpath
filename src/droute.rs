@@ -341,6 +341,9 @@ pub struct NetJob {
     /// the components to connect (sorted): those of the pins, plus copper-only ones with
     /// [`DParams::copper_comps`]
     pub comps: Vec<usize>,
+    /// differential pair follower: (job of the positive net, centre distance mm); cells off the
+    /// line at that distance from the partner's routed tracks cost more
+    pub pair: Option<(usize, f64)>,
 }
 
 /// existing copper of a pin component that can start or end a connection
@@ -374,6 +377,9 @@ struct NetMaps {
 
 /// extra cost per cell inside the `iso` spacing of another net's copper
 const ISO_COST: f32 = 1.5;
+
+/// extra cost per cell of a pair follower off the line next to its partner
+const PAIR_COST: f32 = 2.0;
 
 /// job windows above this many nodes (cells x layers) get a reachability flood before the search
 const FLOOD_MIN_NODES: usize = 4_000_000;
@@ -448,6 +454,9 @@ struct Owners {
     /// routing intent `iso`: map cells (layer-major) closer than the extra spacing to fixed or
     /// routed copper of other nets; built on the first search that needs it
     iso: std::sync::OnceLock<Vec<bool>>,
+    /// differential pair follower: map cells (layer-major) on the line at the pair distance from
+    /// the partner's routed tracks; None without a routed partner
+    rail: Option<Vec<bool>>,
 }
 
 pub struct DResult {
@@ -894,7 +903,37 @@ impl<'a> Router<'a> {
                 prio,
                 copper: cu,
                 comps: comps.clone(),
+                pair: None,
             });
+        }
+        // differential pairs (`pair` intent): the negative net follows the positive one at the
+        // class pair gap (else the clearance); both take the class pair width if set; the
+        // positive net is routed first
+        let by_net: HashMap<usize, usize> =
+            jobs.iter().enumerate().map(|(k, j)| (j.net, k)).collect();
+        for k in 0..jobs.len() {
+            let net = jobs[k].net;
+            // an explicit pair (--pairs) needs no intent; a pair by name needs `pair`
+            let Some((other, positive, explicit)) = m.cfg.partner(&m.b.nets[net]) else {
+                continue;
+            };
+            if !explicit && !jobs[k].prio.pair {
+                continue;
+            }
+            let Some(&lk) = m.b.net_id.get(&other).and_then(|on| by_net.get(on)) else {
+                continue;
+            };
+            let c = m.r.class_of(net);
+            if let Some(dw) = c.dp_width {
+                jobs[k].hw = (dw / 2.0).max(jobs[k].hn);
+            }
+            if positive {
+                jobs[k].prio.first = true;
+                continue;
+            }
+            let gap = c.dp_gap.unwrap_or_else(|| m.r.clr(net, jobs[lk].net, true));
+            let pitch = gap + jobs[k].hw + jobs[lk].hw;
+            jobs[k].pair = Some((lk, pitch));
         }
         let gs = match fixed {
             Some(f) => f.gs,
@@ -1109,6 +1148,7 @@ impl<'a> Router<'a> {
             v: vec![0u16; n],
             cost: std::sync::OnceLock::new(),
             iso: std::sync::OnceLock::new(),
+            rail: None,
         };
         let mut lt = per_layer();
         let mut ltn = per_layer();
@@ -1164,6 +1204,28 @@ impl<'a> Router<'a> {
                     (cm + v.d / 2.0 + job.vr + mg).max(hh),
                     id,
                 );
+            }
+        }
+        // pair follower: the line at the pair distance from the partner's routed tracks (a band
+        // one cell wide on each side)
+        if let Some((lk, pitch)) = job.pair {
+            let rn = &routed[lk];
+            if !rn.segs.is_empty() {
+                let tol = 1.5 * self.p.res;
+                let mut band = vec![0u8; NL * n];
+                for s in &rn.segs {
+                    let sh = Shape::Capsule {
+                        a: s.a,
+                        b: s.b,
+                        r: 0.0,
+                    };
+                    let base = s.l * n;
+                    g.stamp(&sh, pitch + tol, |x, y| band[base + g.idx(x, y)] |= 1);
+                    g.stamp(&sh, (pitch - tol).max(0.0), |x, y| {
+                        band[base + g.idx(x, y)] |= 2
+                    });
+                }
+                o.rail = Some(band.iter().map(|&b| b == 1).collect());
             }
         }
         o
@@ -2627,10 +2689,15 @@ impl<'a> Router<'a> {
             &[]
         };
         let iso_at = |l: usize, w: usize| -> f32 {
-            if !isom.is_empty() && isom[l * mn + w] {
+            let iso = if !isom.is_empty() && isom[l * mn + w] {
                 ISO_COST
             } else {
                 0.0
+            };
+            // pair follower: off the line next to the partner costs extra
+            match &o.rail {
+                Some(r) if !r[l * mn + w] => iso + PAIR_COST,
+                _ => iso,
             }
         };
         let cc: &[f32] = match nego {
@@ -3059,9 +3126,12 @@ impl<'a> Router<'a> {
         };
         let mut cs = clean::CleanStats::default();
         let nr = runs.len();
+        // a pair follower keeps its path next to the partner: the pull-tight would straighten it
+        // away (the leader is cleaned before the follower routes)
+        let clean = self.p.clean && job.pair.is_none();
         // via slide: a stub run that goes straight to a via slightly off its axis moves the via
         // onto the axis (exactly checked: via rules, own vias hole-to-hole, both runs)
-        if self.p.clean {
+        if clean {
             let hh = self.m.r.min_hole_to_hole + job.dr * 2.0;
             let vr = job.vr + self.p.margin;
             let via_ok = |q: P| {
@@ -3098,7 +3168,7 @@ impl<'a> Router<'a> {
             if r.pts.len() < 2 {
                 continue;
             }
-            if self.p.clean {
+            if clean {
                 clean::clean_run(r, &cx, &mut cs);
             } else {
                 r.merge();

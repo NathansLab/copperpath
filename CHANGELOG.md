@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `tune --match REGEX [--target MM]`: length matching with accordion meanders (exact target,
+  clearance-checked); demo PWM_A/PWM_B/ADC1/ADC2 skew 4.97 -> 0 mm, DRC clean.
+- Routing intent `pair`: differential pairs by name (`_P`/`_N`, `+`/`-`, `DP`/`DM`); the
+  negative net follows the positive one at the class `diff_pair_gap` (else the clearance), at
+  `diff_pair_width` if set. `status` suggests it for nets whose partner exists. Explicit
+  pairs for nets without polarity in the name: `--pairs 'POS=NEG'`, config / project `pairs`.
 - `netinfo --match 'D[0-7];A[0-9]+'`: length skew per group of nets (shortest, longest,
   `skew_mm`); the text output shows `z0_ohm`.
 - `status`: `suggested_prio`, routing intents from net names (supply rails `low_r`, clocks
@@ -132,6 +138,11 @@ All notable changes to this project are documented here. The format follows
   (all nets of a 6-layer board with 217 fills in about 1 s; per-net opens equal KiCad's DRC).
 
 ### Changed
+- `fanout --native-fill` fills only the zones of its net (prog_rig autoroute fanout stage
+  14 -> 3 s, same result).
+- `autoroute` honours small budgets: the route stage, each pour round and the gate reserve
+  scale with `--time` (at most the former 10 s / 5 s floors); `--time 10` on rf_siggen took
+  15.5 s, now 9 s.
 - `autoroute`: plane-net pads that the plane fill and the fanout leave open (e.g. dense
   through-hole pins the plane cannot reach) are routed in the pour stage with tracks on the
   signal layers; prog_rig: 110 -> 25 opens at the same budget.

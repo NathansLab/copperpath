@@ -122,6 +122,9 @@ pub struct BoardCfg {
     /// copper layers for the tracks of signal nets (not plane nets); vias pass every layer
     /// (`--signal-layers`; autoroute keeps signals off inner plane layers)
     pub signal_layers: u8,
+    /// explicit differential pairs (positive, negative): routed like the `pair` intent, for nets
+    /// whose names do not mark the polarity (`--pairs`, config / project `pairs`)
+    pub pairs: Vec<(String, String)>,
 }
 
 /// Routing intent of a net: multipliers on the router's costs and the track width, and whether
@@ -148,6 +151,9 @@ pub struct NetPrio {
     pub z: f64,
     /// copper layers the net's tracks may use (`outer`: F.Cu and B.Cu; vias still pass)
     pub layers: u8,
+    /// differential pair (`pair`): the negative net follows the positive one at the pair gap
+    /// (partner by name, see [`pair_partner`])
+    pub pair: bool,
 }
 
 impl Default for NetPrio {
@@ -160,6 +166,7 @@ impl Default for NetPrio {
             iso: 0.0,
             z: 0.0,
             layers: 0x3f,
+            pair: false,
             first: false,
         }
     }
@@ -203,6 +210,7 @@ impl NetPrio {
                 "wide" => p.width *= 1.5,
                 "first" => p.first = true,
                 "outer" => p.layers &= 1 | 1 << (NL - 1),
+                "pair" => p.pair = true,
                 _ => {
                     let (k, v) = t
                         .split_once(':')
@@ -238,6 +246,41 @@ impl NetPrio {
 }
 
 impl BoardCfg {
+    /// `--pairs 'POS=NEG;POS2=NEG2'`
+    pub fn add_pairs(&mut self, spec: &str) -> Result<(), String> {
+        for t in spec.split(';').map(str::trim).filter(|t| !t.is_empty()) {
+            let (p, n) = t
+                .split_once('=')
+                .ok_or(format!("--pairs '{t}': expected POSITIVE=NEGATIVE"))?;
+            self.pairs
+                .push((p.trim().to_string(), n.trim().to_string()));
+        }
+        Ok(())
+    }
+
+    /// `"pairs": [["POS", "NEG"], ...]` of a config or the project's `copperpath` block
+    pub fn add_pairs_json(&mut self, v: &Value) {
+        for pr in v.as_array().into_iter().flatten() {
+            if let (Some(p), Some(n)) = (pr[0].as_str(), pr[1].as_str()) {
+                self.pairs.push((p.to_string(), n.to_string()));
+            }
+        }
+    }
+
+    /// differential pair partner of net `name`: an explicit pair first, else by name (see
+    /// [`pair_partner`]); (partner, this net is the positive one, explicit)
+    pub fn partner(&self, name: &str) -> Option<(String, bool, bool)> {
+        for (p, n) in &self.pairs {
+            if p == name {
+                return Some((n.clone(), true, true));
+            }
+            if n == name {
+                return Some((p.clone(), false, true));
+            }
+        }
+        pair_partner(name).map(|(o, pos)| (o, pos, false))
+    }
+
     /// routing intent of net `name` in net class `class`: the first entry whose wildcard matches
     /// the net name, or the class name for entries written `class:PATTERN` (default: neutral)
     pub fn prio(&self, name: &str, class: &str) -> NetPrio {
@@ -307,6 +350,7 @@ impl Default for BoardCfg {
             yield_pours: Vec::new(),
             net_prio: Vec::new(),
             signal_layers: 0x3f,
+            pairs: Vec::new(),
         }
     }
 }
@@ -362,6 +406,7 @@ pub fn parse_cfg(j: &Value, board: Option<&str>) -> Result<BoardCfg, String> {
     c.via_keepout_refs = strs(&b["via_keepout_refs"]);
     c.add_prio_json(&b["net_prio"])
         .map_err(|e| format!("config: {e}"))?;
+    c.add_pairs_json(&b["pairs"]);
     if let Some(cl) = b["class_layers"].as_object() {
         for (k, v) in cl {
             c.class_layers.push((k.clone(), layer_mask(&strs(v))));
@@ -732,6 +777,35 @@ pub struct Pin {
     pub comp: usize, // connectivity component id within the net
 }
 
+/// differential pair partner of a net by name: the trailing polarity marker swapped (`_P`/`_N`,
+/// `+`/`-`, `DP`/`DM`, `P`/`N` after a digit or separator). Returns (partner name, this net is
+/// the positive one).
+pub fn pair_partner(name: &str) -> Option<(String, bool)> {
+    let swaps: [(&str, &str); 6] = [
+        ("_P", "_N"),
+        ("+", "-"),
+        ("DP", "DM"),
+        ("_DP", "_DN"),
+        ("P", "N"),
+        ("_T", "_C"),
+    ];
+    for (pos, neg) in swaps {
+        for (from, to, positive) in [(pos, neg, true), (neg, pos, false)] {
+            if let Some(stem) = name.strip_suffix(from) {
+                // a bare P/N only after a digit or separator (CLK_P, D0P; not VCCP or GPIO_N)
+                if from.len() == 1
+                    && from.chars().all(|c| c.is_ascii_alphabetic())
+                    && !stem.ends_with(|c: char| c.is_ascii_digit() || c == '_' || c == '.')
+                {
+                    continue;
+                }
+                return Some((format!("{stem}{to}"), positive));
+            }
+        }
+    }
+    None
+}
+
 /// routing intents suggested from net names (for agents: `status` proposes them): supply rails
 /// `low_r`, clocks `low_l`, RF lines `z:50+outer`, sensitive analog nets `quiet`, USB data
 /// lines `few_vias`. Conservative patterns on the upper-cased name; the first match wins.
@@ -1087,6 +1161,19 @@ pub fn mst_connections(pins: &[Pin]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn differential_partners_by_name() {
+        assert_eq!(pair_partner("USB_D+"), Some(("USB_D-".into(), true)));
+        assert_eq!(
+            pair_partner("LVDS_CLK_N"),
+            Some(("LVDS_CLK_P".into(), false))
+        );
+        assert_eq!(pair_partner("USB_DP"), Some(("USB_DM".into(), true)));
+        assert_eq!(pair_partner("D0P"), Some(("D0N".into(), true)));
+        assert_eq!(pair_partner("VCCP"), None);
+        assert_eq!(pair_partner("GND"), None);
+    }
 
     #[test]
     fn intents_suggested_from_net_names() {
