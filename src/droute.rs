@@ -1811,6 +1811,10 @@ impl<'a> Router<'a> {
             }
         }
         stats.exact_dropped = bad.len();
+        // T-junctions become end points (what is written; the delta lists the same segments)
+        for rn in routed.iter_mut() {
+            rn.segs = split_tees(&rn.segs);
+        }
         DResult {
             stats,
             routed: (0..nj)
@@ -3503,6 +3507,47 @@ pub fn pcb_text(text: &str, nets: &[String], res: &DResult) -> Result<String, St
     copper_text(text, nets, &res.routed)
 }
 
+/// segments with every T-junction made an end point: a segment whose interior holds an end of
+/// another segment on its layer, more than half a width from its ends, is split there
+/// (kicad-cli counts a track end in the middle of another track as dangling)
+pub fn split_tees(segs: &[RSeg]) -> Vec<RSeg> {
+    const TOL: f64 = 1e-4;
+    let ends: Vec<(P, usize)> = segs.iter().flat_map(|s| [(s.a, s.l), (s.b, s.l)]).collect();
+    let mut out = Vec::with_capacity(segs.len());
+    for s in segs {
+        let d = s.b - s.a;
+        let len = d.len();
+        // interior points of this segment that are ends of others, ordered along it
+        // (position along the segment, the other segment's end exactly)
+        let mut cut: Vec<(f64, P)> = ends
+            .iter()
+            .filter(|(q, l)| *l == s.l && len > 2.0 * TOL && dist_seg(*q, s.a, s.b) <= TOL)
+            .map(|(q, _)| ((*q - s.a).dot(d) / len, *q))
+            // a junction within half a width of an end already meets that end (no slivers)
+            .filter(|&(t, _)| t > (s.w / 2.0).max(TOL) && t < len - (s.w / 2.0).max(TOL))
+            .collect();
+        cut.sort_by(|x, y| x.0.total_cmp(&y.0));
+        cut.dedup_by(|x, y| (x.0 - y.0).abs() <= TOL);
+        let mut a = s.a;
+        for (_, q) in cut {
+            out.push(RSeg {
+                a,
+                b: q,
+                l: s.l,
+                w: s.w,
+            });
+            a = q;
+        }
+        out.push(RSeg {
+            a,
+            b: s.b,
+            l: s.l,
+            w: s.w,
+        });
+    }
+    out
+}
+
 /// the board text with new copper per net (unlocked) appended
 pub fn copper_text(
     text: &str,
@@ -3520,9 +3565,10 @@ pub fn copper_text(
     let mut keys: Vec<&usize> = routed.keys().collect();
     keys.sort();
     for &net in keys {
+        let segs = split_tees(&routed[&net].segs);
         let rn = &routed[&net];
         let name = format.expression(&nets[net])?;
-        for s in &rn.segs {
+        for s in &segs {
             add += &format!(
                 "\t(segment\n\t\t(start {:.6} {:.6})\n\t\t(end {:.6} {:.6})\n\t\t(width {})\n\t\t(layer \"{}\")\n\t\t(net {})\n\t\t(uuid \"{}\")\n\t)\n",
                 s.a.x, s.a.y, s.b.x, s.b.y, s.w, CU[s.l], name, uuid(&mut seed)
@@ -3546,6 +3592,26 @@ pub fn copper_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn t_junction_becomes_an_end_point() {
+        let seg = |a: (f64, f64), b: (f64, f64)| RSeg {
+            a: P { x: a.0, y: a.1 },
+            b: P { x: b.0, y: b.1 },
+            l: 0,
+            w: 0.2,
+        };
+        // a branch ends on the middle of a straight run: the run is split there
+        let out = split_tees(&[seg((0.0, 0.0), (4.0, 0.0)), seg((1.5, 0.0), (1.5, 2.0))]);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().any(|s| s.a.x == 0.0 && s.b.x == 1.5));
+        assert!(out
+            .iter()
+            .any(|s| s.a.x == 1.5 && s.b.x == 4.0 && s.b.y == 0.0));
+        // ends meeting at end points are left alone
+        let out = split_tees(&[seg((0.0, 0.0), (1.0, 0.0)), seg((1.0, 0.0), (1.0, 1.0))]);
+        assert_eq!(out.len(), 2);
+    }
 
     #[test]
     fn collinear_overlaps_merge() {
