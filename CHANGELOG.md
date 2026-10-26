@@ -6,6 +6,25 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Net class names carry routing intents: `Power [low_r]` or a class named `quiet` applies that
+  profile to its nets (after `--prio`, config and project block).
+- README benchmark section: PCBench results table, renders of the routed boards and a DRC time
+  chart (`scripts/readme_figures.py`); first row in `docs/benchmark.md`.
+- `ripup --nets PATS [--region] [--locked]`: remove the copper of nets (agents redo single nets
+  with `route --nets`).
+- Routing intent `quiet` / `iso:X`: soft extra spacing to other nets' copper (fixed and routed),
+  e.g. for sensitive analog nets; `netinfo` reports `coupled_mm` and `gap_min_mm` per net
+  (demo: CLK coupled length 11.2 -> 0.1 mm with `CLK=quiet`).
+- `route --signal-layers F.Cu,B.Cu`: tracks of signal nets only on these layers (vias pass all).
+- `fanout --plane-only`: only the plane zones' fills join pads.
+- `drc --refill-zones` reports `starved_thermal` (a thermal-relief pad with one spoke; none is
+  unconnected, as in kicad-cli). The native filler keeps a spoke whose tip meets a spoke of a
+  neighbouring pad of the net (pads closer than twice the relief gap, as KiCad joins them).
+- `status`: one-call board overview for agents (stack, classes, zones, plane candidates, opens,
+  native DRC, suggested next commands) in milliseconds.
+- `Benchmark` workflow: the PCBench benchmark on every release tag and by hand for any commit or
+  tag; results attached to the release and added to `docs/benchmark.md` by pull request.
+- CI runs the KiCad plugin's Python tests.
 - Routing intents per net class (`class:PATTERN` keys) and from the project file
   (`.kicad_pro` block `"copperpath": {"net_prio": ...}`, next to the net classes).
 - `route --res auto`: 0.1 mm grid when the rules and pad pitches allow it (2.6-4x faster on
@@ -109,6 +128,21 @@ All notable changes to this project are documented here. The format follows
   parallel, so the autoroute quality gate and repeated runs check an unchanged input once.
 
 ### Fixed
+- `autoroute`: the signal routing leaves a fifth of the budget to the pour nets, and the pour
+  stage runs even when the signals overran the budget (PCBench sizif128 at 120 s: the GND pour
+  stage was skipped, 32 -> 16 unconnected).
+- Dangling copper (`track_dangling` / `via_dangling` in KiCad): collinear overlapping segments of
+  a net are merged before writing (a pad exit stub lying on a run had a free end in the middle
+  of the other track); `--reroute-blockers` rips all unlocked copper of a ripped net, not only
+  the pieces on the corridor, and never rips plane nets (their fanout vias stayed half removed).
+  PCBench: new dangling items after autoroute 6 -> 1 (rf_siggen), 5 -> 1 (icehat).
+- `route`: a segment that fails the exact clearance check no longer drops its whole net; only
+  the failing segments and what dangles from them are removed (PCBench rf_siggen: two pour nets
+  kept 53 of 82 segments instead of none).
+- `autoroute`: the plane fanout ignores outer pours of the net (`fanout --plane-only`), so every
+  pad reaches the plane itself; signal tracks stay off inner plane layers (`--signal-layers`).
+  PCBench, unconnected items after autoroute (kicad-cli): rf_siggen 30 -> 14, icehat 16 -> 11,
+  rxadc_14 11 -> 14, fan_controller 0 -> 1, LVDS2TMDS 0.
 - `autoroute` / `fanout` / `stitch`: unnamed zones (boards from KiCad 5) are selected by the key
   `NET@LAYER` (e.g. `GND@In1.Cu`). `autoroute` skipped the plane fanout on such boards, so no pad
   reached its inner plane (PCBench rxadc_14: 29 -> 11 unconnected, 1 new KiCad DRC item).

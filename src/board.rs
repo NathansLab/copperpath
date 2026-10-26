@@ -232,6 +232,9 @@ pub struct Zone {
     pub fp: Option<String>,
     /// saved zone fill (`filled_polygon`): (copper layer index, polygon); empty if never filled
     pub fills: Vec<(usize, Vec<P>)>,
+    /// spokes per thermal-relief pad of a native fill: (layer, footprint, pad, spokes kept);
+    /// empty for saved fills
+    pub spokes: Vec<(usize, usize, usize, u8)>,
 }
 
 impl Zone {
@@ -636,6 +639,7 @@ fn parse_zone(z: &List, b: &mut Board, fp: Option<&str>, fp_at: Option<(P, f64)>
             .and_then(|f| f.valf("thermal_bridge_width"))
             .unwrap_or(0.5),
         fp: fp.map(|s| s.to_string()),
+        spokes: Vec::new(),
         fills: z
             .children("filled_polygon")
             .filter_map(|fp| {

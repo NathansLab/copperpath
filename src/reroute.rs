@@ -49,9 +49,10 @@ pub struct Blocking {
     pub blocked_cells: usize,
 }
 
-/// is this board track/via rippable for `net`: unlocked copper of another net
-fn soft_net(locked: bool, n: usize, net: usize) -> bool {
-    !locked && n != 0 && n != net
+/// is this board track/via rippable for `net`: unlocked copper of another net that is not a
+/// plane net (its fanout tracks and vias stay)
+fn soft_net(m: &Model, locked: bool, n: usize, net: usize) -> bool {
+    !locked && n != 0 && n != net && !m.cfg.plane_nets.contains(&m.b.nets[n])
 }
 
 /// cheapest corridor between two copper components of `net` inside `region` with unlocked
@@ -116,7 +117,7 @@ pub fn find_blockers(m: &Model, net: usize, region: BBox, p: &BlockerParams) -> 
         .cloned()
         .collect();
     let is_soft =
-        |o: &Obj| matches!(o.kind, Kind::Track | Kind::Via) && soft_net(o.locked, o.net, net);
+        |o: &Obj| matches!(o.kind, Kind::Track | Kind::Via) && soft_net(m, o.locked, o.net, net);
     let objs_fixed: Vec<Obj> = objs_all.iter().filter(|o| !is_soft(o)).cloned().collect();
     // neck-down width: the corridor search should not miss what the router could do
     let (w, _) = m.r.track_width(net);
@@ -288,7 +289,7 @@ pub fn find_blockers(m: &Model, net: usize, region: BBox, p: &BlockerParams) -> 
     };
     for (lay, q, r) in &probes {
         for t in &m.b.tracks {
-            if !soft_net(t.locked, t.net, net) || lay.is_some_and(|l| l != t.layer) {
+            if !soft_net(m, t.locked, t.net, net) || lay.is_some_and(|l| l != t.layer) {
                 continue;
             }
             let c = m.r.clr(net, t.net, crate::board::is_outer(t.layer));
@@ -297,7 +298,7 @@ pub fn find_blockers(m: &Model, net: usize, region: BBox, p: &BlockerParams) -> 
             }
         }
         for v in &m.b.vias {
-            if !soft_net(v.locked, v.net, net) {
+            if !soft_net(m, v.locked, v.net, net) {
                 continue;
             }
             let c = layers
@@ -316,9 +317,30 @@ pub fn find_blockers(m: &Model, net: usize, region: BBox, p: &BlockerParams) -> 
         }
     }
     nets.truncate(p.max_nets);
+    // a ripped net loses all its unlocked copper, not only the pieces on the corridor: it is
+    // routed again as a whole, and leftover pieces would dangle
     let uuids = nets
         .iter()
-        .flat_map(|n| by_net.get(n).cloned().unwrap_or_default())
+        .flat_map(|&n| {
+            let mut v = by_net.get(&n).cloned().unwrap_or_default();
+            let rest =
+                m.b.tracks
+                    .iter()
+                    .filter(|t| t.net == n && !t.locked)
+                    .map(|t| &t.uuid)
+                    .chain(
+                        m.b.vias
+                            .iter()
+                            .filter(|x| x.net == n && !x.locked)
+                            .map(|x| &x.uuid),
+                    );
+            for u in rest {
+                if !u.is_empty() && !v.contains(u) {
+                    v.push(u.clone());
+                }
+            }
+            v
+        })
         .collect();
     Some(Blocking {
         nets,

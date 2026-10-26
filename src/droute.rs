@@ -213,6 +213,73 @@ pub struct RNet {
 type Found = (Vec<(usize, usize)>, usize);
 type NetRouteResult = (RNet, usize, Vec<(usize, usize, bool)>, Vec<usize>);
 
+/// merge collinear overlapping segments of one net (same layer); returns how many were removed.
+/// A segment ending on a pad centre (`centres`) is kept unless the other one ends there too (the
+/// pad exit stays a track end at the pad centre).
+fn merge_collinear(segs: &mut Vec<RSeg>, centres: &[P]) -> usize {
+    const TOL: f64 = 1e-4;
+    let on_line = |q: P, s: &RSeg| {
+        let d = s.b - s.a;
+        let l = d.len();
+        l > 1e-9 && ((q.x - s.a.x) * d.y - (q.y - s.a.y) * d.x).abs() / l <= TOL
+    };
+    // position of q along s in [0, 1] (with tolerance)
+    let t = |q: P, s: &RSeg| {
+        let d = s.b - s.a;
+        ((q.x - s.a.x) * d.x + (q.y - s.a.y) * d.y) / (d.x * d.x + d.y * d.y)
+    };
+    let mut removed = 0;
+    'outer: loop {
+        for i in 0..segs.len() {
+            for j in 0..segs.len() {
+                if i == j || segs[i].l != segs[j].l {
+                    continue;
+                }
+                let (a, b) = (segs[i].clone(), segs[j].clone());
+                if (a.b - a.a).len() < 1e-9 || !on_line(a.a, &b) || !on_line(a.b, &b) {
+                    continue;
+                }
+                let at_centre = |q: P| centres.iter().any(|c| (*c - q).len() < 2e-3);
+                let ends_b = |q: P| (q - b.a).len() < 2e-3 || (q - b.b).len() < 2e-3;
+                if [a.a, a.b].iter().any(|&q| at_centre(q) && !ends_b(q)) {
+                    continue;
+                }
+                let lb = (b.b - b.a).len();
+                let eps = TOL / lb.max(1e-9);
+                let (ta, tb) = (t(a.a, &b), t(a.b, &b));
+                let inside = |x: f64| x >= -eps && x <= 1.0 + eps;
+                let strictly = |x: f64| x > eps && x < 1.0 - eps;
+                // a covered by b (not just meeting it at one end point)
+                let covered = inside(ta)
+                    && inside(tb)
+                    && (strictly(ta) || strictly(tb) || (ta - tb).abs() > 1.0 - 2.0 * eps);
+                if covered && a.w <= b.w + 1e-9 {
+                    segs.remove(i);
+                    removed += 1;
+                    continue 'outer;
+                }
+                // partial overlap of equal width: b grows to the union (segments that only meet
+                // end to end stay as they are)
+                if (a.w - b.w).abs() < 1e-9 && (strictly(ta) || strictly(tb)) {
+                    let lo = ta.min(tb).min(0.0);
+                    let hi = ta.max(tb).max(1.0);
+                    let at = |x: f64| P {
+                        x: b.a.x + (b.b.x - b.a.x) * x,
+                        y: b.a.y + (b.b.y - b.a.y) * x,
+                    };
+                    segs[j].a = at(lo);
+                    segs[j].b = at(hi);
+                    segs.remove(i);
+                    removed += 1;
+                    continue 'outer;
+                }
+            }
+        }
+        break;
+    }
+    removed
+}
+
 /// per-thread A* buffers, kept between searches; only the nodes a search wrote are reset
 #[derive(Default)]
 struct Scratch {
@@ -300,6 +367,36 @@ struct NetMaps {
     neck: Vec<bool>,
     /// layer bits of the net's own pads (pins that have exit stubs) per window cell
     own: Vec<u8>,
+    /// layers with at least one free cell (wide or narrow): the only layers the net's copper,
+    /// and so its owner maps, can use
+    lmask: u8,
+}
+
+/// extra cost per cell inside the `iso` spacing of another net's copper
+const ISO_COST: f32 = 1.5;
+
+/// square dilation of a mask by r cells (Chebyshev distance), two separable passes with prefix
+/// sums: O(cells) for any r
+fn dilate(m: &[bool], nx: usize, ny: usize, r: usize) -> Vec<bool> {
+    let run = |get: &dyn Fn(usize) -> bool, n: usize, out: &mut dyn FnMut(usize, bool)| {
+        let mut pre = vec![0u32; n + 1];
+        for i in 0..n {
+            pre[i + 1] = pre[i] + get(i) as u32;
+        }
+        for i in 0..n {
+            let (a, b) = (i.saturating_sub(r), (i + r + 1).min(n));
+            out(i, pre[b] > pre[a]);
+        }
+    };
+    let mut h = vec![false; m.len()];
+    for y in 0..ny {
+        run(&|x| m[y * nx + x], nx, &mut |x, v| h[y * nx + x] = v);
+    }
+    let mut out = vec![false; m.len()];
+    for x in 0..nx {
+        run(&|y| h[y * nx + x], ny, &mut |y, v| out[y * nx + x] = v);
+    }
+    out
 }
 
 /// pad exit stub: pad centre c -> e along the pad axis u, e projected from the grid cell g
@@ -345,6 +442,9 @@ struct Owners {
     /// negotiated cell cost per (layer, map cell), INFINITY = blocked; built on the first
     /// negotiated search (an Owners serves one route_net call, so one negotiation state)
     cost: std::sync::OnceLock<Vec<f32>>,
+    /// routing intent `iso`: map cells (layer-major) closer than the extra spacing to fixed or
+    /// routed copper of other nets; built on the first search that needs it
+    iso: std::sync::OnceLock<Vec<bool>>,
 }
 
 pub struct DResult {
@@ -418,6 +518,8 @@ pub fn install_stop_handler() {
 
 #[derive(Default, Debug, Clone)]
 pub struct AesStats {
+    /// collinear overlapping segments merged before writing
+    pub merged: usize,
     pub pins: usize,
     pub pins_no_stub: Vec<String>,
     pub stubs_used: usize,
@@ -896,6 +998,9 @@ impl<'a> Router<'a> {
                         g.stamp(&s, p.neck, |x, y| neck[g.idx(x, y)] = true);
                     }
                 }
+                let lmask = (0..NL)
+                    .filter(|&l| t[l].contains(&R_FREE) || tn[l].contains(&R_FREE))
+                    .fold(0u8, |m, l| m | 1 << l);
                 let mut mp = NetMaps {
                     g,
                     ox,
@@ -905,6 +1010,7 @@ impl<'a> Router<'a> {
                     v,
                     neck,
                     own: vec![0u8; g.n()],
+                    lmask,
                 };
                 let stubs = if p.stubs {
                     make_stubs(m, &ck, &gs, j, &mp, &p)
@@ -981,14 +1087,22 @@ impl<'a> Router<'a> {
         let n = g.n();
         let wb = g.bbox().inflate(3.0);
         let job = &self.jobs[k];
+        // layers the net cannot use get no owner map (never read: their own map is blocked)
+        let lm = self.maps[k].lmask;
+        let per_layer = || -> Vec<Vec<u16>> {
+            (0..NL)
+                .map(|l| vec![0u16; if lm & (1 << l) != 0 { n } else { 0 }])
+                .collect()
+        };
         let mut o = Owners {
-            t: vec![vec![0u16; n]; NL],
-            tn: vec![vec![0u16; n]; NL],
+            t: per_layer(),
+            tn: per_layer(),
             v: vec![0u16; n],
             cost: std::sync::OnceLock::new(),
+            iso: std::sync::OnceLock::new(),
         };
-        let mut lt = vec![vec![0u16; n]; NL];
-        let mut ltn = vec![vec![0u16; n]; NL];
+        let mut lt = per_layer();
+        let mut ltn = per_layer();
         let mut lv = vec![0u16; n];
         let mg = self.p.margin;
         for (j, rn) in routed.iter().enumerate() {
@@ -1007,8 +1121,10 @@ impl<'a> Router<'a> {
                     continue;
                 }
                 let c = self.m.r.clr(job.net, oj.net, is_outer(s.l)).max(0.0);
-                Self::stamp_owner(g, &mut o.t[s.l], &mut lt[s.l], &sh, c + job.hw + mg, id);
-                Self::stamp_owner(g, &mut o.tn[s.l], &mut ltn[s.l], &sh, c + job.hn + mg, id);
+                if lm & (1 << s.l) != 0 {
+                    Self::stamp_owner(g, &mut o.t[s.l], &mut lt[s.l], &sh, c + job.hw + mg, id);
+                    Self::stamp_owner(g, &mut o.tn[s.l], &mut ltn[s.l], &sh, c + job.hn + mg, id);
+                }
                 // a new via also keeps the hole clearance from this track
                 let cv = (c + job.vr).max(job.dr + self.m.r.min_hole_clearance);
                 Self::stamp_owner(g, &mut o.v, &mut lv, &sh, cv + mg, id);
@@ -1024,6 +1140,9 @@ impl<'a> Router<'a> {
                 for l in 0..NL {
                     let c = self.m.r.clr(job.net, oj.net, is_outer(l)).max(0.0).max(ch);
                     cm = cm.max(c);
+                    if lm & (1 << l) == 0 {
+                        continue;
+                    }
                     Self::stamp_owner(g, &mut o.t[l], &mut lt[l], &sh, c + job.hw + mg, id);
                     Self::stamp_owner(g, &mut o.tn[l], &mut ltn[l], &sh, c + job.hn + mg, id);
                 }
@@ -1095,11 +1214,9 @@ impl<'a> Router<'a> {
         if l >= NL {
             return o.v[w] > 0;
         }
-        if wide {
-            o.t[l][w] > 0
-        } else {
-            o.tn[l][w] > 0
-        }
+        // layers without an owner map (the net cannot use them) have no conflicts
+        let m = if wide { &o.t[l] } else { &o.tn[l] };
+        m.get(w).is_some_and(|&c| c > 0)
     }
 
     /// negotiated congestion on the detailed grid (PathFinder): every net is routed with foreign
@@ -1598,20 +1715,35 @@ impl<'a> Router<'a> {
                 }
             }
         }
+        // collinear segments on top of each other (pad exit stubs over a run of the same net)
+        // become one: a covered segment is dropped, an overlapping one of the same width merged;
+        // an end lying on the middle of another track would dangle in KiCad
+        for (k, rn) in routed.iter_mut().enumerate() {
+            let centres: Vec<P> = self.jobs[k]
+                .pins
+                .iter()
+                .map(|pn| {
+                    let f = &self.m.b.fps[pn.fp];
+                    f.pad_world(&f.pads[pn.pad]).0
+                })
+                .collect();
+            stats.merged += merge_collinear(&mut rn.segs, &centres);
+        }
         // exact verification of all routed copper (fixed objects + other nets)
-        let fails: Vec<(usize, String)> = (0..nj)
+        let fails: Vec<(usize, usize, String)> = (0..nj)
             .into_par_iter()
             .flat_map(|k| {
                 let fr = self.foreign(k, &routed);
                 let job = &self.jobs[k];
                 let mut out = Vec::new();
-                for sg in &routed[k].segs {
+                for (si, sg) in routed[k].segs.iter().enumerate() {
                     let hw = sg.w / 2.0 - EXACT_TOL;
                     if !ck.seg_ok_fixed(job.net, sg.a, sg.b, hw, sg.l)
                         || !ck.seg_ok_foreign(job.net, sg.a, sg.b, hw, sg.l, &fr)
                     {
                         out.push((
                             k,
+                            si,
                             format!(
                                 "{} {} ({:.3},{:.3})-({:.3},{:.3}) w {}",
                                 self.m.b.nets[job.net],
@@ -1630,22 +1762,32 @@ impl<'a> Router<'a> {
             .collect();
         stats.exact_fail = fails.len();
         if dbg {
-            for (_, f) in &fails {
+            for (_, _, f) in &fails {
                 eprintln!("[dbg] exact check fails: {f}");
             }
         }
-        // never write copper that fails the exact check: such a net is dropped (left open)
+        // never write copper that fails the exact check: the failing segments are removed, then
+        // whatever dangles from them; the rest of the net stays (its other connections hold)
         let mut failed = failed;
         let mut why = why;
-        let mut bad: Vec<usize> = fails.iter().map(|(k, _)| *k).collect();
+        let mut bad: Vec<usize> = fails.iter().map(|(k, _, _)| *k).collect();
         bad.sort();
         bad.dedup();
         for &k in &bad {
+            let segs: Vec<usize> = fails
+                .iter()
+                .filter(|(kk, _, _)| *kk == k)
+                .map(|(_, si, _)| *si)
+                .collect();
+            let before = routed[k].segs.len();
+            self.prune_failed(k, &mut routed[k], &segs);
             eprintln!(
-                "[route] {}: routed copper fails the exact clearance check, net dropped (left open)",
-                self.m.b.nets[self.jobs[k].net]
+                "[route] {}: {} segment(s) fail the exact clearance check; removed with what dangled ({} of {} segments kept, connection left open)",
+                self.m.b.nets[self.jobs[k].net],
+                segs.len(),
+                routed[k].segs.len(),
+                before
             );
-            routed[k] = RNet::default();
             if !failed.iter().any(|(n, _)| *n == self.jobs[k].net) {
                 failed.push((self.jobs[k].net, 1));
                 why.push("exact-check");
@@ -1737,7 +1879,8 @@ impl<'a> Router<'a> {
             let mut ok = true;
             for &ci in &s.cells {
                 let Some(w) = self.wi(k, ci) else { continue };
-                let own = if s.wide { o.t[s.l][w] } else { o.tn[s.l][w] };
+                let m = if s.wide { &o.t[s.l] } else { &o.tn[s.l] };
+                let own = m.get(w).copied().unwrap_or(0);
                 match nego {
                     Some((pres, hist)) => c += pres * own as f32 + hist[s.l][ci],
                     None => {
@@ -2133,6 +2276,88 @@ impl<'a> Router<'a> {
         )
     }
 
+    /// remove the segments `bad` of a routed net, then every segment with an end that touches no
+    /// other segment, via, pad of the net or existing copper of its pins, and every via with fewer
+    /// than two attachments (no dangling copper is written)
+    fn prune_failed(&self, k: usize, rn: &mut RNet, bad: &[usize]) {
+        let job = &self.jobs[k];
+        let mut keep: Vec<bool> = (0..rn.segs.len()).map(|i| !bad.contains(&i)).collect();
+        let mut vkeep = vec![true; rn.vias.len()];
+        let pads: Vec<(u8, Shape)> = job
+            .pins
+            .iter()
+            .flat_map(|pn| {
+                let f = &self.m.b.fps[pn.fp];
+                f.pad_shapes(&f.pads[pn.pad])
+                    .into_iter()
+                    .map(move |sh| (pn.layers, sh))
+            })
+            .collect();
+        let fixed = |q: P, l: usize| {
+            pads.iter()
+                .any(|(ls, sh)| ls & (1 << l) != 0 && sh.dist(q) <= 1e-6)
+                || job
+                    .copper
+                    .iter()
+                    .any(|sd| sd.layers & (1 << l) != 0 && sd.shape.dist(q) <= 1e-6)
+        };
+        loop {
+            let mut changed = false;
+            for i in 0..rn.segs.len() {
+                if !keep[i] {
+                    continue;
+                }
+                let s = &rn.segs[i];
+                let anchored =
+                    |q: P| {
+                        fixed(q, s.l)
+                            || rn.segs.iter().enumerate().any(|(j, t)| {
+                                j != i
+                                    && keep[j]
+                                    && t.l == s.l
+                                    && dist_seg(q, t.a, t.b) <= t.w.max(s.w) / 2.0 + 1e-6
+                            })
+                            || rn.vias.iter().enumerate().any(|(v, via)| {
+                                vkeep[v] && (q - via.at).len() <= via.d / 2.0 + 1e-6
+                            })
+                    };
+                if !(anchored(s.a) && anchored(s.b)) {
+                    keep[i] = false;
+                    changed = true;
+                }
+            }
+            for (v, via) in rn.vias.iter().enumerate() {
+                if !vkeep[v] {
+                    continue;
+                }
+                let segs = rn
+                    .segs
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, t)| keep[*j] && dist_seg(via.at, t.a, t.b) <= via.d / 2.0 + 1e-6)
+                    .count();
+                let fx = (0..NL).filter(|&l| fixed(via.at, l)).count().min(1);
+                if segs + fx < 2 {
+                    vkeep[v] = false;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut i = 0;
+        rn.segs.retain(|_| {
+            i += 1;
+            keep[i - 1]
+        });
+        let mut v = 0;
+        rn.vias.retain(|_| {
+            v += 1;
+            vkeep[v - 1]
+        });
+    }
+
     /// [`Self::astar_win_in`] with this thread's search buffers (reused across searches, so a
     /// search costs the nodes it touches, not the size of its window)
     #[allow(clippy::too_many_arguments)]
@@ -2257,6 +2482,34 @@ impl<'a> Router<'a> {
         // negotiated cost of every cell of the net's map, computed once per route_net call: one
         // load per neighbour instead of seven
         let mn = mp.g.n();
+        // routing intent iso: cells within the extra spacing of blocked or other nets' cells
+        let piso = self.jobs[k].prio.iso;
+        let isom: &[bool] = if piso > 0.0 {
+            o.iso.get_or_init(|| {
+                let r = (piso / self.p.res).round().max(1.0) as usize;
+                let (nx, ny) = (mp.g.nx, mp.g.ny);
+                let mut out = vec![false; NL * mn];
+                for l in 0..NL {
+                    let occ: Vec<bool> = (0..mn)
+                        .map(|w| mp.t[l][w] != R_FREE || o.t[l][w] > 0)
+                        .collect();
+                    let near = dilate(&occ, nx, ny, r);
+                    for w in 0..mn {
+                        out[l * mn + w] = near[w] && !occ[w];
+                    }
+                }
+                out
+            })
+        } else {
+            &[]
+        };
+        let iso_at = |l: usize, w: usize| -> f32 {
+            if !isom.is_empty() && isom[l * mn + w] {
+                ISO_COST
+            } else {
+                0.0
+            }
+        };
         let cc: &[f32] = match nego {
             Some((pres, hist)) => o.cost.get_or_init(|| {
                 let mut cc = vec![f32::INFINITY; NL * mn];
@@ -2282,7 +2535,7 @@ impl<'a> Router<'a> {
                             } else {
                                 f32::INFINITY
                             };
-                            cc[l * mn + w] = cw.min(cn) + hist[l][row + mx] + own;
+                            cc[l * mn + w] = cw.min(cn) + hist[l][row + mx] + own + iso_at(l, w);
                         }
                     }
                 }
@@ -2298,6 +2551,7 @@ impl<'a> Router<'a> {
                 }
                 None => {
                     let own = if mp.own[w] & (1 << l) != 0 { opc } else { 0.0 };
+                    let own = own + iso_at(l, w);
                     if mp.t[l][w] == R_FREE && o.t[l][w] == 0 {
                         (true, own)
                     } else if mp.neck[w] && mp.tn[l][w] == R_FREE && o.tn[l][w] == 0 {
@@ -3174,6 +3428,30 @@ fn copper_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collinear_overlaps_merge() {
+        let s = |ax, ay, bx, by| RSeg {
+            a: p(ax, ay),
+            b: p(bx, by),
+            l: 0,
+            w: 0.2,
+        };
+        // a stub lying on a run: dropped
+        let mut v = vec![s(0.0, 0.0, 10.0, 0.0), s(3.0, 0.0, 4.0, 0.0)];
+        assert_eq!(merge_collinear(&mut v, &[]), 1);
+        assert_eq!(v.len(), 1);
+        // partial overlap: one segment over the union
+        let mut v = vec![s(0.0, 0.0, 5.0, 0.0), s(4.0, 0.0, 8.0, 0.0)];
+        assert_eq!(merge_collinear(&mut v, &[]), 1);
+        assert!((v[0].b - v[0].a).len() > 7.99);
+        // end to end: unchanged
+        let mut v = vec![s(0.0, 0.0, 5.0, 0.0), s(5.0, 0.0, 8.0, 0.0)];
+        assert_eq!(merge_collinear(&mut v, &[]), 0);
+        // a pad exit ending on a pad centre stays
+        let mut v = vec![s(0.0, 0.0, 10.0, 0.0), s(3.0, 0.0, 4.0, 0.0)];
+        assert_eq!(merge_collinear(&mut v, &[p(3.0, 0.0)]), 0);
+    }
 
     #[test]
     fn qheap_pops_in_ascending_order() {

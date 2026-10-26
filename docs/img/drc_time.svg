@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="456" viewBox="0 0 720 456" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12">
+<style>svg{--bg:#fcfcfb;--t1:#0b0b0b;--t2:#52514e;--grid:#e4e3df;--s1:#2a78d6;--s2:#eb6834}@media (prefers-color-scheme: dark){svg{--bg:#1a1a19;--t1:#f0efec;--t2:#c3c2b7;--grid:#3a3936;--s1:#3987e5;--s2:#d95926}}text{fill:var(--t1)}.m{fill:var(--t2)}</style>
+<rect width="720" height="456" rx="6" fill="var(--bg)"/>
+<text x="16" y="22" font-size="14" font-weight="600">DRC time per routed board (s, lower is better)</text>
+<rect x="16" y="32" width="10" height="10" rx="2" fill="var(--s2)"/>
+<text x="31" y="41" class="m">kicad-cli pcb drc</text>
+<rect x="206" y="32" width="10" height="10" rx="2" fill="var(--s1)"/>
+<text x="221" y="41" class="m">copperpath drc (native)</text>
+<line x1="120.0" y1="50" x2="120.0" y2="428" stroke="var(--grid)"/>
+<text x="120.0" y="444" text-anchor="middle" class="m">0.0</text>
+<line x1="252.5" y1="50" x2="252.5" y2="428" stroke="var(--grid)"/>
+<text x="252.5" y="444" text-anchor="middle" class="m">0.3</text>
+<line x1="385.0" y1="50" x2="385.0" y2="428" stroke="var(--grid)"/>
+<text x="385.0" y="444" text-anchor="middle" class="m">0.7</text>
+<line x1="517.5" y1="50" x2="517.5" y2="428" stroke="var(--grid)"/>
+<text x="517.5" y="444" text-anchor="middle" class="m">1.0</text>
+<line x1="650.0" y1="50" x2="650.0" y2="428" stroke="var(--grid)"/>
+<text x="650.0" y="444" text-anchor="middle" class="m">1.4</text>
+<text x="112" y="72" text-anchor="end">fan_controller</text>
+<rect x="120" y="54" width="275.0" height="14" rx="3" fill="var(--s2)"><title>fan_controller: 0.724 s</title></rect>
+<text x="401.0" y="65" class="m">0.72 s</text>
+<rect x="120" y="70" width="4.5" height="14" rx="3" fill="var(--s1)"><title>fan_controller: 0.012 s</title></rect>
+<text x="130.5" y="81" class="m">12 ms</text>
+<text x="112" y="118" text-anchor="end">LVDS2TMDS</text>
+<rect x="120" y="100" width="246.0" height="14" rx="3" fill="var(--s2)"><title>LVDS2TMDS: 0.648 s</title></rect>
+<text x="372.0" y="111" class="m">0.65 s</text>
+<rect x="120" y="116" width="2.5" height="14" rx="3" fill="var(--s1)"><title>LVDS2TMDS: 0.007 s</title></rect>
+<text x="128.5" y="127" class="m">7 ms</text>
+<text x="112" y="164" text-anchor="end">sizif128</text>
+<rect x="120" y="146" width="343.2" height="14" rx="3" fill="var(--s2)"><title>sizif128: 0.904 s</title></rect>
+<text x="469.2" y="157" class="m">0.90 s</text>
+<rect x="120" y="162" width="12.1" height="14" rx="3" fill="var(--s1)"><title>sizif128: 0.032 s</title></rect>
+<text x="138.1" y="173" class="m">32 ms</text>
+<text x="112" y="210" text-anchor="end">rxadc_14</text>
+<rect x="120" y="192" width="265.0" height="14" rx="3" fill="var(--s2)"><title>rxadc_14: 0.698 s</title></rect>
+<text x="391.0" y="203" class="m">0.70 s</text>
+<rect x="120" y="208" width="3.7" height="14" rx="3" fill="var(--s1)"><title>rxadc_14: 0.010 s</title></rect>
+<text x="129.7" y="219" class="m">10 ms</text>
+<text x="112" y="256" text-anchor="end">icehat</text>
+<rect x="120" y="238" width="286.7" height="14" rx="3" fill="var(--s2)"><title>icehat: 0.755 s</title></rect>
+<text x="412.7" y="249" class="m">0.76 s</text>
+<rect x="120" y="254" width="4.4" height="14" rx="3" fill="var(--s1)"><title>icehat: 0.011 s</title></rect>
+<text x="130.4" y="265" class="m">11 ms</text>
+<text x="112" y="302" text-anchor="end">rf_siggen</text>
+<rect x="120" y="284" width="328.3" height="14" rx="3" fill="var(--s2)"><title>rf_siggen: 0.865 s</title></rect>
+<text x="454.3" y="295" class="m">0.86 s</text>
+<rect x="120" y="300" width="8.2" height="14" rx="3" fill="var(--s1)"><title>rf_siggen: 0.022 s</title></rect>
+<text x="134.2" y="311" class="m">22 ms</text>
+<text x="112" y="348" text-anchor="end">a123_bcm</text>
+<rect x="120" y="330" width="323.3" height="14" rx="3" fill="var(--s2)"><title>a123_bcm: 0.852 s</title></rect>
+<text x="449.3" y="341" class="m">0.85 s</text>
+<rect x="120" y="346" width="7.2" height="14" rx="3" fill="var(--s1)"><title>a123_bcm: 0.019 s</title></rect>
+<text x="133.2" y="357" class="m">19 ms</text>
+<text x="112" y="394" text-anchor="end">prog_rig</text>
+<rect x="120" y="376" width="530.0" height="14" rx="3" fill="var(--s2)"><title>prog_rig: 1.396 s</title></rect>
+<text x="656.0" y="387" class="m">1.40 s</text>
+<rect x="120" y="392" width="28.1" height="14" rx="3" fill="var(--s1)"><title>prog_rig: 0.074 s</title></rect>
+<text x="154.1" y="403" class="m">74 ms</text>
+</svg>

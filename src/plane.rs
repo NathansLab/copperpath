@@ -421,6 +421,8 @@ pub struct ZoneFill {
     pub own: Vec<bool>,
     /// cells of vias / plated holes of the own net
     pub vias: Vec<bool>,
+    /// thermal-relief pads of the zone's net on this layer: ((footprint, pad), spokes kept)
+    pub spokes: Vec<((usize, usize), u8)>,
 }
 
 #[derive(Debug, Clone)]
@@ -444,8 +446,8 @@ fn r3(v: f64) -> f64 {
 }
 
 /// an own pad with a thermal relief: centre, angle (deg), half size, gap, spoke width, spoke
-/// angle (deg)
-type Thermal = (P, f64, (f64, f64), f64, f64, f64);
+/// angle (deg), (footprint, pad)
+type Thermal = (P, f64, (f64, f64), f64, f64, f64, (usize, usize));
 
 /// native fill of zone `zi` on copper layer `l`
 pub fn fill_zone(m: &Model, zi: usize, l: usize, fp: &FillParams) -> ZoneFill {
@@ -556,6 +558,7 @@ pub fn fill_zone(m: &Model, zi: usize, l: usize, fp: &FillParams) -> ZoneFill {
                                 gap,
                                 w.max(2.0 * rt),
                                 pd.spoke_angle,
+                                (fi, pad),
                             ));
                         }
                     }
@@ -610,7 +613,9 @@ pub fn fill_zone(m: &Model, zi: usize, l: usize, fp: &FillParams) -> ZoneFill {
     // thermal spokes (KiCad: four, along the pad axes, 45 degrees for round pads): a spoke is
     // kept when it is clear of foreign copper and its end reaches the fill
     let mut spokes: Vec<Shape> = Vec::new();
-    for &(c, a, (hx, hy), gap, w, sa) in &thermals {
+    // candidate spokes: (pad index, spoke, tip, clear of foreign copper)
+    let mut cands: Vec<(usize, Shape, Shape, bool)> = Vec::new();
+    for (ti, &(c, a, (hx, hy), gap, w, sa, _)) in thermals.iter().enumerate() {
         // spokes leave along the pad axes rotated by the spoke angle (90 = along the axes)
         let diag = (sa - 90.0).abs() > 1e-6;
         for k in 0..4 {
@@ -636,15 +641,36 @@ pub fn fill_zone(m: &Model, zi: usize, l: usize, fp: &FillParams) -> ZoneFill {
                 b: e,
                 r: w / 2.0,
             };
-            let (mut clear, mut reach) = (true, false);
-            let tip = Shape::circle(e, w / 2.0);
+            let mut clear = true;
             gs.stamp(&sp, 0.0, |x, y| clear &= !bad[gs.idx(x, y)]);
-            gs.stamp(&tip, 0.0, |x, y| reach |= fill[gs.idx(x, y)]);
-            if clear && reach {
-                spokes.push(sp);
-            }
+            cands.push((ti, sp, Shape::circle(e, w / 2.0), clear));
         }
     }
+    // a clear spoke is kept when its tip reaches the fill or a clear spoke of another pad of the
+    // net (two pads closer than twice the relief gap: KiCad joins their spokes)
+    let mut owner = vec![u32::MAX; n];
+    for (ti, sp, _, clear) in &cands {
+        if *clear {
+            gs.stamp(sp, 0.0, |x, y| owner[gs.idx(x, y)] = *ti as u32);
+        }
+    }
+    let mut kept = vec![0u8; thermals.len()];
+    for (ti, sp, tip, clear) in &cands {
+        if !*clear {
+            continue;
+        }
+        let mut reach = false;
+        gs.stamp(tip, 0.0, |x, y| {
+            let i = gs.idx(x, y);
+            reach |= fill[i] || (owner[i] != u32::MAX && owner[i] != *ti as u32);
+        });
+        if reach {
+            spokes.push(sp.clone());
+            kept[*ti] += 1;
+        }
+    }
+    let spoke_count: Vec<((usize, usize), u8)> =
+        thermals.iter().zip(&kept).map(|(t, &k)| (t.6, k)).collect();
     for sp in &spokes {
         gs.stamp(sp, 0.0, |x, y| {
             let i = gs.idx(x, y);
@@ -700,6 +726,7 @@ pub fn fill_zone(m: &Model, zi: usize, l: usize, fp: &FillParams) -> ZoneFill {
         outline_cells,
         own,
         vias,
+        spokes: spoke_count,
     }
 }
 
@@ -826,19 +853,24 @@ pub fn fill_board(
     sel: &dyn Fn(usize) -> bool,
     fp: &FillParams,
 ) -> usize {
-    let polys: Vec<(usize, usize, Vec<Vec<P>>)> = {
+    type Filled = (usize, usize, Vec<Vec<P>>, Vec<((usize, usize), u8)>);
+    let polys: Vec<Filled> = {
         let m = Model::new(b, r, cfg.clone(), model::CopperMode::All);
         fill_zones(&m, sel, fp)
             .par_iter()
-            .map(|f| (f.zone, f.layer, f.polygons(true)))
+            .map(|f| (f.zone, f.layer, f.polygons(true), f.spokes.clone()))
             .collect()
     };
     let mut cleared = std::collections::HashSet::new();
     let mut k = 0;
-    for (zi, l, ps) in polys {
+    for (zi, l, ps, sp) in polys {
         if cleared.insert(zi) {
             b.zones[zi].fills.clear();
+            b.zones[zi].spokes.clear();
         }
+        b.zones[zi]
+            .spokes
+            .extend(sp.into_iter().map(|(id, n)| (l, id.0, id.1, n)));
         for pl in ps {
             b.zones[zi].fills.push((l, pl));
             k += 1;

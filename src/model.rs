@@ -119,14 +119,18 @@ pub struct BoardCfg {
     pub yield_pours: Vec<String>,
     /// routing intent per net (net wildcard, profile); the first match wins
     pub net_prio: Vec<(String, NetPrio)>,
+    /// copper layers for the tracks of signal nets (not plane nets); vias pass every layer
+    /// (`--signal-layers`; autoroute keeps signals off inner plane layers)
+    pub signal_layers: u8,
 }
 
 /// Routing intent of a net: multipliers on the router's costs and the track width, and whether
 /// the net is routed before the others. Profiles (combine with `+`):
 /// `low_r` (low resistance: twice the width, vias cost twice, first), `low_l` (low inductance:
 /// short and direct, vias cost three times, first), `short` (direct path: wrong layer direction
-/// and bends cheap), `few_vias` (vias cost four times), `wide` (1.5 times the width), `first`,
-/// and numbers `via:X`, `bend:X`, `dir:X`, `width:X`.
+/// and bends cheap), `few_vias` (vias cost four times), `wide` (1.5 times the width), `quiet`
+/// (keeps 0.5 mm more than the clearance from other nets where it can), `first`, and numbers
+/// `via:X`, `bend:X`, `dir:X`, `width:X`, `iso:X` (mm).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NetPrio {
     pub via: f32,
@@ -135,6 +139,9 @@ pub struct NetPrio {
     pub dir: f32,
     /// track width multiplier (the neck-down at pads keeps the class minimum)
     pub width: f64,
+    /// soft extra spacing (mm) to other nets' copper beyond the clearance: cells that close cost
+    /// more (`quiet`, `iso:X`)
+    pub iso: f64,
     pub first: bool,
 }
 
@@ -145,12 +152,26 @@ impl Default for NetPrio {
             bend: 1.0,
             dir: 1.0,
             width: 1.0,
+            iso: 0.0,
             first: false,
         }
     }
 }
 
 impl NetPrio {
+    /// intent carried by a KiCad net class name: the name is a profile spec (`low_l`,
+    /// `quiet+wide`) or ends with one in brackets (`Power [low_r]`); None otherwise
+    pub fn from_class(class: &str) -> Option<NetPrio> {
+        let c = class.trim();
+        let spec = match c.strip_suffix(']').and_then(|h| h.rsplit_once('[')) {
+            Some((_, sp)) => sp,
+            None => c,
+        };
+        NetPrio::parse(spec)
+            .ok()
+            .filter(|_| !spec.trim().is_empty())
+    }
+
     pub fn parse(spec: &str) -> Result<NetPrio, String> {
         let mut p = NetPrio::default();
         for t in spec.split('+').map(str::trim).filter(|t| !t.is_empty()) {
@@ -171,6 +192,7 @@ impl NetPrio {
                     p.dir *= 0.25;
                 }
                 "few_vias" => p.via *= 4.0,
+                "quiet" => p.iso = p.iso.max(0.5),
                 "wide" => p.width *= 1.5,
                 "first" => p.first = true,
                 _ => {
@@ -188,6 +210,7 @@ impl NetPrio {
                         "bend" => p.bend = x as f32,
                         "dir" => p.dir = x as f32,
                         "width" => p.width = x.max(0.1),
+                        "iso" => p.iso = x.min(5.0),
                         _ => return Err(format!("net priority '{t}': unknown key '{k}'")),
                     }
                 }
@@ -208,6 +231,7 @@ impl BoardCfg {
                 None => wild(name, pat),
             })
             .map(|(_, p)| *p)
+            .or_else(|| NetPrio::from_class(class))
             .unwrap_or_default()
     }
 
@@ -265,6 +289,7 @@ impl Default for BoardCfg {
             mh_pattern: "MH*".into(),
             yield_pours: Vec::new(),
             net_prio: Vec::new(),
+            signal_layers: 0x3f,
         }
     }
 }
@@ -522,7 +547,12 @@ impl<'a> Model<'a> {
         let net_layers: Vec<u8> = (0..n)
             .map(|i| {
                 let cls = &r.class_of(i).name;
-                class_layer_mask(&cfg.class_layers, cls).unwrap_or(0x3f) & b.cu_mask
+                let sig = if cfg.plane_nets.contains(&b.nets[i]) {
+                    0x3f
+                } else {
+                    cfg.signal_layers
+                };
+                class_layer_mask(&cfg.class_layers, cls).unwrap_or(0x3f) & b.cu_mask & sig
             })
             .collect();
         let fill_idx: Vec<PolyIndex> = {
@@ -1008,6 +1038,19 @@ pub fn mst_connections(pins: &[Pin]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn net_class_names_carry_intents() {
+        let mut c = BoardCfg::default();
+        assert!(c.prio("VBUS", "Power [low_r]").first);
+        assert_eq!(c.prio("VBUS", "Power [low_r]").width, 2.0);
+        assert_eq!(c.prio("A", "quiet").iso, 0.5);
+        assert_eq!(c.prio("A", "Default"), NetPrio::default());
+        assert_eq!(c.prio("A", "Odd [x]"), NetPrio::default());
+        // an explicit intent wins over the class name
+        c.add_prio("A=few_vias").unwrap();
+        assert_eq!(c.prio("A", "quiet").iso, 0.0);
+    }
 
     fn board(items: &str) -> Board {
         crate::board::parse_board(format!(

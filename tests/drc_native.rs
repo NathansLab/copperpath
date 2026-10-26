@@ -66,6 +66,11 @@ fn copper_violations_by_kicad_type() {
 }
 
 fn thermal_board(name: &str, connect: &str) -> std::path::PathBuf {
+    thermal_board_open(name, connect, false)
+}
+
+/// `open_east`: no stub east of G1, so one spoke reaches the fill (KiCad: starved_thermal)
+fn thermal_board_open(name: &str, connect: &str, open_east: bool) -> std::path::PathBuf {
     // G1's four spokes (axis directions) end on foreign stubs; the corners stay free, so only a
     // solid connection reaches it
     let stub = |x: f64, y: f64, vertical: bool| {
@@ -75,7 +80,11 @@ fn thermal_board(name: &str, connect: &str) -> std::path::PathBuf {
     let body = [
         fp("G1", 10.0, 10.0, "GND"),
         fp("G2", 30.0, 10.0, "GND"),
-        stub(11.2, 10.0, true),
+        if open_east {
+            String::new()
+        } else {
+            stub(11.2, 10.0, true)
+        },
         stub(8.8, 10.0, true),
         stub(10.0, 11.2, false),
         stub(10.0, 8.8, false),
@@ -95,6 +104,17 @@ fn blocked_thermal_spokes_leave_the_pad_unconnected() {
     assert_eq!(v["unconnected"], 1, "{v}");
     let v = run(&["drc", "--refill-zones"], &thermal_board("solid", "yes "));
     assert_eq!(v["unconnected"], 0, "{v}");
+}
+
+#[test]
+fn one_spoke_is_a_starved_thermal() {
+    // as kicad-cli 10: connected through one spoke, below the minimum of 2
+    let v = run(
+        &["drc", "--refill-zones"],
+        &thermal_board_open("starved", "", true),
+    );
+    assert_eq!(v["unconnected"], 0, "{v}");
+    assert_eq!(v["by_type"]["starved_thermal"], 1, "{v}");
 }
 
 #[test]

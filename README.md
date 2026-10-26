@@ -64,6 +64,8 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `route [--region x0,y0,x1,y1] [--nets PATTERNS] --out OUT.kicad_pcb [--delta-json DELTA.json] [--drc]` | Detailed router (below). Routes every routable net whose pads lie in the region (default: whole board). Appends unlocked tracks/vias to a copy and writes `OUT_route.json`; `--delta-json` writes the added/removed items in nm for the KiCad IPC API ([schema](#change-set-for-the-kicad-ipc-api---delta-json)). `--drc` runs `kicad-cli` on input and output and reports the new violations. |
 | `check [--out DIR] [--res 0.25] [--tile 1.0] [--copper locked\|all] [--crop x0,y0,x1,y1 --crop-class C]` | Routability report: via-site maps per net class, region analysis per schematic sheet, what-if ablation (without rule areas, via keepouts, locked copper), global route with congestion per tile and layer, hotspot list. Writes `report.json`, `groute.json`, `congestion.json` and PNG maps. |
 | `place --zones zones.json [--init keep\|schematic\|both] [--moves N] [--starts K] [--out DIR]` | Parallel simulated-annealing placement of the movable parts inside zones (see `examples/zones.json`). Writes `place.json`; apply it to a copy with `scripts/apply_place.py`. |
+| `ripup --nets PATS [--region BOX] [--locked] --out OUT` | Removes the unlocked tracks and vias of the matching nets (with `--locked` the locked ones too), optionally only those touching a region; `--json` lists what was removed per net. With `route --nets` an agent redoes single nets in well under a second. |
+| `status [--refill-zones]` | One-call overview for agents, in milliseconds: copper stack, net classes, zones with their selection key, plane nets and candidates, opens per net, native DRC by type, and the next commands to run (`--json`: `next`). |
 | `netinfo [--nets] [--cu-um 35]` | Length, vias, track width and estimated DC resistance (mΩ) and inductance (nH) per net, in milliseconds. See [Routing intents](#routing-intents-per-net---prio). |
 | `drc [--refill-zones] [--out report.json]` | Native copper DRC with KiCad's rule names in milliseconds. See [Native DRC](#native-drc-drc). |
 | `opens [--region] [--nets] [--max-islands 50]` | Unconnected connections per net, counted from all copper including saved zone fills (no 499-item cap as in kicad-cli). Nets named in `--nets` are counted even if they are plane nets. `--json` lists the islands of each open net (pads per copper component, largest first). |
@@ -192,9 +194,12 @@ Stages (each writes its board to `OUT_stages/`, the input is never modified):
    on an inner layer; they are not routed as signals. Nets with outer pours only (two-layer
    boards) are pour nets, see stage 3c.
 2. **fanout**: every open island of each plane net gets a track + via onto its plane
-   (`fanout --native-fill`; the plane = its zones on inner layers).
+   (`fanout --native-fill --plane-only`; the plane = its zones on inner layers; outer pours of
+   the net do not join pads here, so tracks routed later cannot strand a pad cut off a pour).
 3. **route**: the negotiated router for all other nets with `--time-limit` = the time left minus
-   a reserve, plus `--reroute-blockers` (off with `--no-reroute`).
+   a reserve, plus `--reroute-blockers` (off with `--no-reroute`). Signal tracks stay off inner
+   layers whose plane zones cover at least half the board (`--signal-layers auto`, the default;
+   `all` or a layer list to override); vias still pass through the planes.
    `--second-pass` retries the nets left open with `--job-margin 20 --max-expand 2e7` in the
    time left.
 3c. **pours**: the pour nets are routed after the signals: the zones are filled natively and
@@ -210,7 +215,8 @@ Stages (each writes its board to `OUT_stages/`, the input is never modified):
 `s`, `opens`, `note`, `out` and details (fanout islands, route `open_nets`, DRC deltas). With
 `--explain` / `--explain-img DIR` the open connections of the result are explained (see
 [Explaining failures](#explaining-failures-explain)). Routed copper that fails the exact
-clearance check is never written: such a net is dropped and left open (`aes.exact_dropped`).
+clearance check is never written: the failing segments and whatever then dangles are removed,
+the rest of the net stays, and the connection is left open (`aes.exact_dropped` counts the nets).
 
 Synthetic stress board (`scripts/make_stress.py --parts 800`: 798 footprints, 6 layers, 515
 signal nets, GND/+3V3 zones on In1/In4; 4 cores, 8 GB): 1331 to 174 opens in 75 s (fanout 3 s,
@@ -234,8 +240,13 @@ nets marked `first` are routed before the others:
 | `short` | bends and the wrong layer direction cheap | sense lines, short analog paths |
 | `few_vias` | vias cost 4x | signals that should stay on one layer |
 | `wide` | 1.5x the class width | moderate current |
+| `quiet` | cells within 0.5 mm beyond the clearance of other nets' copper (fixed and routed) cost more | sensitive analog, clocks next to aggressors |
 | `first` | routed before the other nets | the nets that matter most |
-| `via:X` `bend:X` `dir:X` `width:X` | the multipliers themselves | fine tuning |
+| `via:X` `bend:X` `dir:X` `width:X` `iso:X` | the multipliers themselves, `iso` the soft spacing in mm | fine tuning |
+
+`netinfo` also reports `coupled_mm`, the track length running closer than `--near` (0.5 mm, edge
+to edge) to another net's copper on the same layer: on the demo, `CLK=quiet` cuts it from 11.2 to
+0.1 mm at the same length.
 
 Profiles combine with `+` (`CLK=low_l+wide`). A key `class:PATTERN` applies to the nets of the
 matching net classes (`--prio 'class:Power=low_r'`). The intents can live in the KiCad project
@@ -245,7 +256,12 @@ next to its net classes, as a `copperpath` block in the `.kicad_pro` (KiCad keep
 "copperpath": { "net_prio": { "class:Power": "low_r", "CLK*": "low_l", "SW": { "via": 3, "width": 2 } } }
 ```
 
-Order: `--prio` first, then `net_prio` of `--cfg`, then the project block; the first match wins. `netinfo` reports the result per net: length, vias,
+The net class itself can carry the intent: a KiCad net class named after a profile (`quiet`,
+`low_l+wide`) or ending with one in brackets (`Power [low_r]`) gives its nets that intent, so it
+shows up in KiCad's net class list without extra configuration.
+
+Order: `--prio` first, then `net_prio` of `--cfg`, then the project block, then the net class
+name; the first match wins. `netinfo` reports the result per net: length, vias,
 width and rough DC resistance (copper 35 µm, `--cu-um`) and partial inductance (Grover formula
 for the total length plus about 1.3 nH per 1.6 mm via). Demo board, `route` without and with
 `--prio '+5V=low_r,CLK=low_l,ADC1=few_vias'` (both DRC-clean):
@@ -264,7 +280,8 @@ $B drc --pcb routed.kicad_pcb --refill-zones --out report.json --json
 
 The copper checks of `kicad-cli pcb drc`, on copperpath's model: `clearance`, `shorting_items`,
 `tracks_crossing`, `hole_clearance`, `hole_to_hole`, `copper_edge_clearance`, `track_width`,
-`via_diameter`, `annular_width`, `drill_out_of_range` and `unconnected_items`, with KiCad's semantics (net classes, DRU and pad clearances, the 0.0005 mm
+`via_diameter`, `annular_width`, `drill_out_of_range`, `starved_thermal` (with `--refill-zones`) and
+`unconnected_items`, with KiCad's semantics (net classes, DRU and pad clearances, the 0.0005 mm
 epsilon, one collision per net pair, collisions only between nets with pads). `--refill-zones`
 fills the zones natively first (like kicad-cli's flag, with thermal reliefs), otherwise the
 saved fills count. `--out` writes a report in kicad-cli's JSON layout.
@@ -275,15 +292,15 @@ synthetic boards:
 - with the zone fills saved by KiCad: the same violations per type and the same unconnected
   items per net, in 10-40 ms instead of 0.8-0.9 s per board;
 - with `--refill-zones` (native filler, 0.05 mm raster by default, `--fill-res`): the same
-  violations, unconnected items within 1 of kicad-cli's (the filler rasterises necks that are
-  exactly the minimum width), 0.1-1.2 s instead of 1-2 s.
+  copper violations, unconnected items within 1-2 of kicad-cli's and `starved_thermal` within 2
+  (the filler rasterises necks that are exactly the minimum width), 0.1-1.2 s instead of 1-2 s.
 
 `route`, `nudge` and `autoroute` take `--drc native` for their DRC gate: the same comparison
 against the input as `--drc` (kicad-cli), with the input's rules for both boards, in
 milliseconds. Pads with the same number in one footprint count as one terminal (as in KiCad).
 Board setup minimums missing from the project take KiCad's defaults (0.5 mm via, 0.1 mm annular
 ring, 0.3 mm hole), for the router as well. Not covered: silk, courtyard, solder mask, footprint
-library and starved-thermal checks, and copper islands without pads (KiCad counts floating
+library checks, and copper islands without pads (KiCad counts floating
 tracks as unconnected items). Use it as the fast check while iterating and kicad-cli for
 sign-off.
 
@@ -463,6 +480,17 @@ kicad-cli failure), `2` unknown or missing command.
 Common fields: `ok`, `command`, `version`, `threads`, `total_s`, `warnings`. On error:
 `{"ok": false, "command": ..., "error": "...", "version": ...}`.
 
+A short loop for an agent (times on the PCBench icehat board, 4 cores):
+
+| step | command | time |
+|---|---|---|
+| look | `status --json` (opens, DRC, classes, zones, `next` commands) | 14 ms |
+| route | `autoroute --out r.kicad_pcb --drc native --json` (`--prio` for intents) | seconds to minutes |
+| check | `drc --pcb r.kicad_pcb --json`, `netinfo --json` | 10-40 ms |
+| why open | `explain --net N --json` (reason, blockers, ROI image) | 20 ms |
+| fix | `ripup --nets N`, then `route --nets N` (with `--prio` if needed), or `nudge` | 0.1-3 s |
+| see | `render --opens --out r.png` | 30 ms |
+
 `route --json` (also written to `OUT_route.json`):
 
 ```json
@@ -554,6 +582,44 @@ the output files are unchanged, and without the flag no event is written.
 - `done`: always the last event, also on errors (`"ok":false,"error":"…"`). `v` is the schema
   version; `stopped` is `null`, `time-limit`, `signal` or `cancel` as in `--json`.
 
+## Benchmark (PCBench)
+
+`scripts/bench_pcbench.py` routes eight MIT-licensed boards from the PCBench set that Freerouting
+benchmarks with, end to end and without manual steps: download (pinned commit, sha256), keep the
+board's own net classes (track widths, clearances, vias) and setup minimums, strip all tracks and
+vias, then one `copperpath autoroute --time 120` (planes, fan-out, signals, pours) and a sign-off
+with `kicad-cli pcb drc --refill-zones`. Result of the current main (4 cores, 2026-10-25):
+
+| board | layers | nets | unconnected before → after | new DRC (KiCad) | route s | vias (human) | length mm (human) |
+|---|---|---|---|---|---|---|---|
+| fan_controller | 2 | 31 | 77 → 1 | starved_thermal 1, track_dangling 1 | 4.2 | 34 (23) | 590 (534) |
+| LVDS2TMDS | 2 | 29 | 39 → 0 | 0 | 0.7 | 10 (13) | 272 (274) |
+| sizif128 | 2 | 28 | 272 → 32 | starved_thermal 15, via_dangling 2 | 146 | 221 (203) | 6183 (8329) |
+| rxadc_14 | 4 | 47 | 78 → 11 | solder_mask_bridge 3 | 9.6 | 78 (31) | 476 (447) |
+| icehat | 4 | 59 | 104 → 10 | track_dangling 1 | 51 | 61 (41) | 937 (1251) |
+| rf_siggen | 4 | 57 | 153 → 16 | track_dangling 1 | 18 | 175 (369) | 998 (1108) |
+| a123_bcm | 4 | 139 | n/a → 4 ¹ | starved_thermal 1 ¹ | 6.3 | 64 (88) | 809 (1065) |
+| prog_rig | 4 | 287 | 499 → 83 | track_dangling 1 | 170 | 488 (332) | 7623 (12796) |
+
+¹ kicad-cli's zone refill on a123_bcm did not finish within 600 s; the numbers are from
+`copperpath drc --refill-zones` (0.55 s).
+
+The history per release lives in [docs/benchmark.md](docs/benchmark.md); the `Benchmark`
+workflow adds a row for every release tag. Routed boards (`render --refill-zones --fills
+--opens`, white lines are the remaining open connections):
+
+| | |
+|---|---|
+| ![LVDS2TMDS](docs/img/bench_LVDS2TMDS.png) | ![icehat](docs/img/bench_icehat.png) |
+| ![rf_siggen](docs/img/bench_rf_siggen.png) | ![rxadc_14](docs/img/bench_rxadc_14.png) |
+| ![fan_controller](docs/img/bench_fan_controller.png) | ![a123_bcm](docs/img/bench_a123_bcm.png) |
+
+DRC time on the routed boards with the saved fills, best of three: the native `drc` gives the
+same violations as kicad-cli in 7-74 ms instead of 0.65-1.4 s
+(`scripts/readme_figures.py` regenerates figures and chart from a benchmark run).
+
+![DRC time per board, kicad-cli against copperpath drc](docs/img/drc_time.svg)
+
 ## Comparison with Freerouting
 
 Freerouting is the established open-source autorouter for KiCad (via Specctra DSN). An informal
@@ -600,6 +666,7 @@ same placed input):
 |---|---|---|
 | `scripts/make_demo.py [OUT_DIR]` | KiCad 10 Python (`pcbnew`), KiCad footprint library | regenerate the demo board |
 | `scripts/apply_place.py IN place.json OUT` | KiCad 10 Python (`pcbnew`) | apply a `place` result to a copy |
+| `scripts/readme_figures.py --work bench_work` | Python 3, kicad-cli | README renders of the routed benchmark boards and the DRC time chart |
 | `scripts/make_stress.py OUT.kicad_pcb [--parts 800] [--layers 6]` | Python 3 | synthetic stress board (SOIC-8 clusters with 0603 passives, GND/+3V3 zones) for benchmarks |
 | `scripts/plot_route.py OUT.png x0,y0,x1,y1 TITLE=B.kicad_pcb ...` | Python 3, matplotlib | side-by-side copper plots |
 | `scripts/drc_compare.py base.json new.json` | Python 3 | diff two kicad-cli DRC reports |
