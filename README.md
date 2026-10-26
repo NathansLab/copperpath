@@ -502,9 +502,10 @@ A short loop for an agent (times on the PCBench icehat board, 4 cores):
 
 | step | command | time |
 |---|---|---|
-| look | `status --json` (opens, DRC, classes, zones, `next` commands) | 14 ms |
-| route | `autoroute --out r.kicad_pcb --drc native --json` (`--prio` for intents) | seconds to minutes |
-| check | `drc --pcb r.kicad_pcb --json`, `netinfo --json` | 10-40 ms |
+| look | `status --json` (opens, DRC, classes, zones, `suggested_prio`, `next` commands) | 14 ms |
+| route | `autoroute --out r.kicad_pcb --drc native --time 10 --json` (`--prio` with the suggested intents) | 10 s, more for dense boards (chart above) |
+| check | `drc --pcb r.kicad_pcb --json`, `netinfo --json` (`--match 'D[0-7]'` for bus skew, `z0_ohm`) | 10-40 ms |
+| polish | `thermals --out r2.kicad_pcb` (stubs for starved thermal reliefs; `autoroute` runs it) | 0.1-1 s |
 | why open | `explain --net N --json` (reason, blockers, ROI image) | 20 ms |
 | fix | `ripup --nets N`, then `route --nets N` (with `--prio` if needed), or `nudge` | 0.1-3 s |
 | see | `render --opens --out r.png` | 30 ms |
