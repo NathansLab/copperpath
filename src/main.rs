@@ -2070,11 +2070,24 @@ fn cmd_status(a: &Args) -> CmdResult {
         .filter(|p| p.candidate)
         .map(|p| p.net.as_str())
         .collect();
+    // routing intents from net names for routed nets without one (planes and pours excluded)
+    let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
+    let pour: std::collections::HashSet<usize> = b.zones.iter().map(|z| z.net).collect();
+    let suggested: Vec<String> = (1..b.nets.len())
+        .filter(|&i| m.routable[i] && !pour.contains(&i))
+        .filter(|&i| c.cfg.prio(&b.nets[i], &c.rules.class_of(i).name) == model::NetPrio::default())
+        .filter_map(|i| model::suggest_intent(&b.nets[i]).map(|p| format!("{}={p}", b.nets[i])))
+        .take(16)
+        .collect();
+    let suggested = suggested.join(",");
     if opens > 0 {
         let mut s =
             format!("copperpath autoroute --pcb {pcb} --out routed.kicad_pcb --drc native --json");
         if let (Some(l), Some(n)) = (inner_free.first(), cand.first()) {
             s += &format!(" --planes {l}={n}");
+        }
+        if !suggested.is_empty() {
+            s += &format!(" --prio '{suggested}'");
         }
         next.push(s);
     }
@@ -2122,7 +2135,7 @@ fn cmd_status(a: &Args) -> CmdResult {
         "planes": planes.iter().filter(|p| p.plane || p.pour || p.candidate).collect::<Vec<_>>(),
         "opens": opens,
         "open_nets": per.iter().map(|(n, k, _)| json!({"net": n, "opens": k})).collect::<Vec<_>>(),
-        "drc": by, "next": next, "s": check::round2(dt),
+        "drc": by, "suggested_prio": suggested, "next": next, "s": check::round2(dt),
     }))
 }
 

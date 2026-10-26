@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `status`: `suggested_prio`, routing intents from net names (supply rails `low_r`, clocks
+  `low_l`, RF lines `z:50+outer`, USB data `few_vias`, analog `quiet`), also appended to the
+  suggested `autoroute` command.
 - Routing intent `z:OHM`: the track width for a single-ended impedance on the outer layers,
   computed from the board stackup (microstrip; FR4 defaults without one); `netinfo` reports
   `z0_ohm` per net. Intent `outer`: the net's tracks stay on the outer layers.
