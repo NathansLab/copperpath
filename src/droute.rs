@@ -3507,6 +3507,9 @@ pub fn pcb_text(text: &str, nets: &[String], res: &DResult) -> Result<String, St
     copper_text(text, nets, &res.routed)
 }
 
+/// a cut of [`split_tees`]: position along the segment, cut point, optional connector (end, width)
+type Cut = (f64, P, Option<(P, f64)>);
+
 /// segments with every T-junction made an end point: a segment whose interior holds an end of
 /// another segment on its layer, more than half a width from its ends, is split there
 /// (kicad-cli counts a track end in the middle of another track as dangling)
@@ -3537,7 +3540,7 @@ pub fn split_tees(segs: &[RSeg]) -> Vec<RSeg> {
         // along the segment, cut point, the other end when it is off the centre line by up to a
         // quarter width, joined to the cut by a short connector, and its width)
         let off = (s.w / 4.0).max(TOL);
-        let mut cut: Vec<(f64, P, Option<(P, f64)>)> = ends
+        let mut cut: Vec<Cut> = ends
             .iter()
             .filter(|(q, l, _)| *l == s.l && len > 2.0 * TOL && dist_seg(*q, s.a, s.b) <= off)
             .map(|&(q, _, w)| {
