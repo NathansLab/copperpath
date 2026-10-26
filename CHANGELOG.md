@@ -132,6 +132,8 @@ All notable changes to this project are documented here. The format follows
   (all nets of a 6-layer board with 217 fills in about 1 s; per-net opens equal KiCad's DRC).
 
 ### Changed
+- `fanout --native-fill` fills only the zones of its net (prog_rig autoroute fanout stage
+  14 -> 3 s, same result).
 - `autoroute` honours small budgets: the route stage, each pour round and the gate reserve
   scale with `--time` (at most the former 10 s / 5 s floors); `--time 10` on rf_siggen took
   15.5 s, now 9 s.

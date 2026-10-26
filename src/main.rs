@@ -1729,7 +1729,10 @@ fn base_text(a: &Args, c: &Ctx) -> Result<String, String> {
 /// fanout --pcb FILLED --net GND --plane REGEX [--reach 6] [--via D,DRILL] [--width W]
 /// [--margin 0.05] [--min-clr 0] [--islands opens.json] [--base B] --out OUT.kicad_pcb
 fn cmd_fanout(a: &Args) -> CmdResult {
-    let mut c = load_ctx_filled(a)?;
+    // --native-fill fills only the zones of this net: other nets' fills make room for the new
+    // vias when they are refilled (a board-wide fill per plane net cost a second each)
+    let native = a.get("native-fill").or(a.get("refill-zones")).is_some();
+    let mut c = load_ctx(a)?;
     let out = out_path(a, &c, "fanout.kicad_pcb")?;
     let net_name = a.s("net", "GND");
     let net = *c
@@ -1737,6 +1740,17 @@ fn cmd_fanout(a: &Args) -> CmdResult {
         .net_id
         .get(&net_name)
         .ok_or(format!("--net {net_name}: no such net"))?;
+    if native {
+        let t = Instant::now();
+        let own: Vec<bool> = c.board.zones.iter().map(|z| z.net == net).collect();
+        let fp = fill_params(a);
+        let k = plane::fill_board(&mut c.board, &c.rules, &c.cfg, &|zi| own[zi], &fp);
+        eprintln!(
+            "[fill] native fill of {net_name}: {k} polygons at {} mm in {:.2} s",
+            fp.res,
+            t.elapsed().as_secs_f64()
+        );
+    }
     // --plane-only: other fills of the net (outer pours) do not join pads; every pad reaches the
     // plane itself, so later tracks that cut the pour do not strand it
     if a.get("plane-only").is_some() {
