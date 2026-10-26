@@ -267,12 +267,32 @@ fn edge_block(m: &Model, gs: &GridSpec, net: usize, r: f64, map: &mut [u8]) {
             },
         );
     }
-    // outside the outline
+    // outside the outline: per row, the crossings of a ray towards +x with every outline edge
+    // (even-odd over all outlines, the rule of `Board::inside`), so a cell costs no polygon test
     if !m.b.edge.is_empty() {
+        let mut xs: Vec<f64> = Vec::new();
         for iy in 0..gs.ny {
+            let y = gs.center(0, iy).y;
+            xs.clear();
+            for o in &m.b.edge {
+                let n = o.len();
+                for k in 0..n {
+                    let (a, b) = (o[k], o[(k + n - 1) % n]);
+                    if (a.y > y) != (b.y > y) {
+                        xs.push((b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x);
+                    }
+                }
+            }
+            xs.sort_by(|p, q| p.total_cmp(q));
+            // crossings right of the cell centre, counted down as x grows
+            let mut j = 0;
             for ix in 0..gs.nx {
+                let cx = gs.center(ix, iy).x;
+                while j < xs.len() && xs[j] <= cx {
+                    j += 1;
+                }
                 let i = gs.idx(ix, iy);
-                if map[i] == R_FREE && !m.b.inside(gs.center(ix, iy)) {
+                if map[i] == R_FREE && (xs.len() - j) % 2 == 0 {
                     map[i] = K_EDGE;
                 }
             }
