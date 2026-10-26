@@ -31,3 +31,4 @@ pub mod sexpr;
 pub mod sites;
 pub mod stitch;
 pub mod thermal;
+pub mod tune;

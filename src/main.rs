@@ -2,7 +2,7 @@
 
 use copperpath::{
     board, check, delta, drc, droute, elec, explain, fanout, geom, groute, model, nudge, place,
-    plane, progress, render, reroute, rules, sch, sexpr, sites, stitch, thermal,
+    plane, progress, render, reroute, rules, sch, sexpr, sites, stitch, thermal, tune,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -298,6 +298,7 @@ fn main() {
         "status" => cmd_status(&a),
         "ripup" => cmd_ripup(&a),
         "thermals" => cmd_thermals(&a),
+        "tune" => cmd_tune(&a),
         "pads" => cmd_pads(&a),
         "hints" => cmd_hints(&a),
         "netclass" => cmd_netclass(&a),
@@ -1985,6 +1986,84 @@ fn cmd_ripup(a: &Args) -> CmdResult {
         "out": out, "removed": n,
         "nets": per.iter().map(|(k, (t, v))| json!({"net": k, "tracks": t, "vias": v})).collect::<Vec<_>>(),
     }))
+}
+
+/// length matching: `tune --match REGEX [--target MM] [--gap MM] [--amax 1] [--tol 0.05]
+/// --out OUT` adds accordion meanders (see `tune.rs`) to the matching nets until each reaches the
+/// target (default: the longest of them); writes `--out`
+fn cmd_tune(a: &Args) -> CmdResult {
+    let c = load_ctx(a)?;
+    let out = out_path(a, &c, "tuned.kicad_pcb")?;
+    let pat = a.get("match").ok_or("tune: --match REGEX is required")?;
+    let re = regex::Regex::new(&format!("^(?:{pat})$")).map_err(|e| format!("--match: {e}"))?;
+    let b = &c.board;
+    let m = model::Model::new(b, &c.rules, c.cfg.clone(), model::CopperMode::All);
+    let v = elec::nets(b, &stack(a), &|n| re.is_match(&b.nets[n]));
+    if v.is_empty() {
+        return Err(format!("tune: no routed net matches --match {pat}"));
+    }
+    let longest = v.iter().map(|e| e.length_mm).fold(0.0, f64::max);
+    let target = a.f("target", longest);
+    let (tol, amax) = (a.f("tol", 0.05), a.f("amax", 1.0));
+    let mut placed: Vec<(usize, droute::RSeg)> = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
+    let mut add: HashMap<usize, droute::RNet> = HashMap::new();
+    let mut rep = Vec::new();
+    for e in &v {
+        let net = b.net_id[&e.net];
+        let mut remaining = target - e.length_mm;
+        let mut meanders = 0;
+        if remaining > tol {
+            let mut tracks: Vec<&board::Track> = b
+                .tracks
+                .iter()
+                .filter(|t| t.net == net && !t.locked && !t.uuid.is_empty())
+                .collect();
+            tracks.sort_by(|x, y| (y.b - y.a).len().total_cmp(&(x.b - x.a).len()));
+            for t in tracks {
+                if remaining <= tol {
+                    break;
+                }
+                let gap = a.f("gap", c.rules.class_of(net).clearance.max(t.w));
+                // what one track can take at the largest amplitude
+                let pitch = 2.0 * (t.w + gap);
+                let usable = (t.b - t.a).len() - 2.0 * (t.w + gap);
+                let cap = (usable / pitch).floor().max(0.0) * 2.0 * amax;
+                let part = remaining.min(cap);
+                if part <= tol {
+                    continue;
+                }
+                if let Some(segs) = tune::meander(&m, t, part, gap, amax, &placed) {
+                    removed.push(t.uuid.clone());
+                    placed.extend(segs.iter().map(|s| (net, s.clone())));
+                    add.entry(net).or_default().segs.extend(segs);
+                    remaining -= part;
+                    meanders += 1;
+                }
+            }
+        }
+        let after = target - remaining.max(0.0);
+        rep.push(json!({
+            "net": e.net, "before_mm": e.length_mm,
+            "after_mm": check::round2(if meanders > 0 { after } else { e.length_mm }),
+            "meanders": meanders, "short_mm": check::round2((target - after).max(0.0)),
+        }));
+    }
+    let (text, _) = reroute::remove_items(&b.text, &removed);
+    let text = droute::copper_text(&text, &b.nets, &add)?;
+    write_file(&out, &text)?;
+    for (src, ext) in [(&c.pro, "kicad_pro"), (&c.dru, "kicad_dru")] {
+        let dst = out.replace(".kicad_pcb", &format!(".{ext}"));
+        if std::path::Path::new(src).is_file() && *src != dst {
+            std::fs::copy(src, &dst).map_err(|e| format!("{src}: {e}"))?;
+        }
+    }
+    eprintln!(
+        "[tune] {} net(s) to {target:.2} mm, {} meander(s) -> {out}",
+        rep.len(),
+        removed.len()
+    );
+    Ok(json!({"out": out, "target_mm": check::round2(target), "nets": rep}))
 }
 
 /// second connection for starved thermal reliefs: refills the zones natively, then adds a short

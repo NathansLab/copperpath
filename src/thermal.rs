@@ -294,7 +294,7 @@ fn stub_dirs(m: &Model, z: &Zone, lf: &LayerFill, l: usize, fi: usize, pad: usiz
 
 /// clearances of a new track `sh` of net `net` on layer `l`: foreign copper (holes with the hole
 /// clearance), rule areas without tracks, the board edge
-fn legal(m: &Model, net: usize, l: usize, sh: &Shape) -> bool {
+pub fn legal(m: &Model, net: usize, l: usize, sh: &Shape) -> bool {
     let bb = sh.bbox();
     for o in &m.objs {
         let on_layer = o.layers & (1 << l) != 0;

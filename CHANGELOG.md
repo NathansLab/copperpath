@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `tune --match REGEX [--target MM]`: length matching with accordion meanders (exact target,
+  clearance-checked); demo PWM_A/PWM_B/ADC1/ADC2 skew 4.97 -> 0 mm, DRC clean.
 - Routing intent `pair`: differential pairs by name (`_P`/`_N`, `+`/`-`, `DP`/`DM`); the
   negative net follows the positive one at the class `diff_pair_gap` (else the clearance), at
   `diff_pair_width` if set. `status` suggests it for nets whose partner exists. Explicit

@@ -64,6 +64,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `route [--region x0,y0,x1,y1] [--nets PATTERNS] --out OUT.kicad_pcb [--delta-json DELTA.json] [--drc]` | Detailed router (below). Routes every routable net whose pads lie in the region (default: whole board). Appends unlocked tracks/vias to a copy and writes `OUT_route.json`; `--delta-json` writes the added/removed items in nm for the KiCad IPC API ([schema](#change-set-for-the-kicad-ipc-api---delta-json)). `--drc` runs `kicad-cli` on input and output and reports the new violations. |
 | `check [--out DIR] [--res 0.25] [--tile 1.0] [--copper locked\|all] [--crop x0,y0,x1,y1 --crop-class C]` | Routability report: via-site maps per net class, region analysis per schematic sheet, what-if ablation (without rule areas, via keepouts, locked copper), global route with congestion per tile and layer, hotspot list. Writes `report.json`, `groute.json`, `congestion.json` and PNG maps. |
 | `place --zones zones.json [--init keep\|schematic\|both] [--moves N] [--starts K] [--out DIR]` | Parallel simulated-annealing placement of the movable parts inside zones (see `examples/zones.json`). Writes `place.json`; apply it to a copy with `scripts/apply_place.py`. |
+| `tune --match REGEX [--target MM] [--gap MM] [--amax 1] --out OUT` | Length matching: accordion meanders on straight tracks bring every matching net to the target length (default: the longest of them); each bump adds twice its amplitude, the last one the remainder, so the target is met exactly; every new segment keeps the clearances to other nets' copper, holes, rule areas and the board edge. `--json`: length before/after and meanders per net. |
 | `thermals --out OUT` | Refills the zones natively and gives every starved thermal pad (fewer than 2 resolved spokes, counted as kicad-cli 10 does: spokes into isolated islands only count when nothing else does, a track from the pad into the fill counts) a short legal stub track into its zone's fill, preferring fill connected to other items. `--json`: starved pads and stubs added. |
 | `ripup --nets PATS [--region BOX] [--locked] --out OUT` | Removes the unlocked tracks and vias of the matching nets (with `--locked` the locked ones too), optionally only those touching a region; `--json` lists what was removed per net. With `route --nets` an agent redoes single nets in well under a second. |
 | `status [--refill-zones]` | One-call overview for agents, in milliseconds: copper stack, net classes, zones with their selection key, plane nets and candidates, opens per net, native DRC by type, routing intents suggested from the net names (`suggested_prio`: supply rails `low_r`, clocks `low_l`, RF `z:50+outer`, analog `quiet`), and the next commands to run (`--json`: `next`). |
@@ -262,6 +263,11 @@ A differential pair without and with `pair` (`USB_D*=pair`; `netinfo --near 0.4`
 within 0.4 mm of USB_D+ for 1.7 mm without, 28 mm of its 34 mm with the intent; DRC clean):
 
 ![USB pair routed without (left) and with the pair intent (right)](docs/img/pair_demo.png)
+
+`tune --match 'PWM_.*|ADC[12]'` then matches such a group to its longest net (demo: skew
+4.97 mm -> 0, DRC clean; left before, right after):
+
+![demo nets before and after length tuning with tune](docs/img/tune_demo.png)
 
 `netinfo --match 'D[0-7];A[0-9]+'` adds the length skew per group of nets (shortest, longest,
 `skew_mm`) for buses that need length matching. `netinfo` reports `z0_ohm`, the microstrip impedance of a net's narrowest outer-layer track
@@ -515,7 +521,7 @@ A short loop for an agent (times on the PCBench icehat board, 4 cores):
 | look | `status --json` (opens, DRC, classes, zones, `suggested_prio`, `next` commands) | 14 ms |
 | route | `autoroute --out r.kicad_pcb --drc native --time 10 --json` (`--prio` with the suggested intents) | 10 s, more for dense boards (chart above) |
 | check | `drc --pcb r.kicad_pcb --json`, `netinfo --json` (`--match 'D[0-7]'` for bus skew, `z0_ohm`) | 10-40 ms |
-| polish | `thermals --out r2.kicad_pcb` (stubs for starved thermal reliefs; `autoroute` runs it) | 0.1-1 s |
+| polish | `thermals --out r2.kicad_pcb` (stubs for starved thermal reliefs; `autoroute` runs it), `tune --match 'D[0-7]'` (length matching) | 0.1-1 s |
 | why open | `explain --net N --json` (reason, blockers, ROI image) | 20 ms |
 | fix | `ripup --nets N`, then `route --nets N` (with `--prio` if needed), or `nudge` | 0.1-3 s |
 | see | `render --opens --out r.png` | 30 ms |
