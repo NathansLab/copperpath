@@ -618,7 +618,10 @@ with `kicad-cli pcb drc --refill-zones`. Result of the current main (4 cores, 20
 ¹ kicad-cli's zone refill on a123_bcm does not finish within 600 s; the benchmark then checks
 both boards with `copperpath drc --refill-zones` (about 1 s).
 
-The history per release lives in [docs/benchmark.md](docs/benchmark.md); the `Benchmark`
+![Connections left open per board, previous run against the current main](docs/img/progress.svg)
+
+(a123_bcm has no earlier value: kicad-cli timed out on it before the benchmark fell back to the
+native DRC.) The history per release lives in [docs/benchmark.md](docs/benchmark.md); the `Benchmark`
 workflow adds a row for every release tag. Routed boards (`render --refill-zones --fills
 --opens`, white lines are the remaining open connections):
 
