@@ -242,34 +242,12 @@ pub fn check(m: &Model) -> Vec<Violation> {
     out.extend(hits.into_iter().map(|(_, v)| v));
     // thermal reliefs of a native fill with fewer spokes than KiCad's default minimum (2); a pad
     // with no spoke is not starved but unconnected (as in kicad-cli)
+    // spokes resolved as kicad-cli 10 counts them (see thermal.rs)
     for z in &m.b.zones {
-        for &(l, fi, pad, n) in &z.spokes {
-            if n == 0 || n >= MIN_SPOKES {
-                continue;
-            }
+        for (l, fi, pad, n, ignored) in crate::thermal::starved(m, z) {
             let f = &m.b.fps[fi];
             let (c, _) = f.pad_world(&f.pads[pad]);
-            // a track of the net that leaves the pad on this layer counts as a spoke (kicad-cli)
-            let shapes = f.pad_shapes(&f.pads[pad]);
-            let tracks = m
-                .objs
-                .iter()
-                .filter(|o| {
-                    matches!(o.kind, Kind::Track) && o.net == z.net && o.layers & (1 << l) != 0
-                })
-                .filter(|o| match &o.shape {
-                    Shape::Capsule { a, b, .. } => {
-                        shapes.iter().any(|ps| shape_dist(ps, &o.shape) <= 0.0)
-                            && !shapes
-                                .iter()
-                                .any(|ps| ps.dist(*a) <= 0.0 && ps.dist(*b) <= 0.0)
-                    }
-                    _ => false,
-                })
-                .count();
-            if n as usize + tracks >= MIN_SPOKES as usize {
-                continue;
-            }
+            let _ = ignored;
             let zone = if z.name.is_empty() {
                 format!("Zone [{}]", m.b.nets[z.net])
             } else {

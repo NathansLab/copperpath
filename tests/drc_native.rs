@@ -160,3 +160,24 @@ fn class_clearance_below_the_old_default_is_legal() {
     let v = run(&["drc"], &pcb);
     assert_eq!(v["violations"], 0, "{v}");
 }
+
+#[test]
+fn thermals_adds_a_stub_to_a_starved_pad() {
+    // the one-spoke pad gets a stub track into the fill: no starved thermal, nothing new
+    let pcb = thermal_board_open("starved_fix", "", true);
+    let out = pcb.with_file_name("starved_fix_out.kicad_pcb");
+    let o = Command::new(env!("CARGO_BIN_EXE_copperpath"))
+        .args(["thermals", "--json", "--pcb"])
+        .arg(&pcb)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["starved"], 1, "{v}");
+    assert_eq!(v["stubs"], 1, "{v}");
+    let v = run(&["drc", "--refill-zones"], &out);
+    assert_eq!(v["violations"], 0, "{v}");
+    assert_eq!(v["unconnected"], 0, "{v}");
+}

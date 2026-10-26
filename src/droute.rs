@@ -3386,7 +3386,7 @@ pub fn pcb_text(text: &str, nets: &[String], res: &DResult) -> Result<String, St
 }
 
 /// the board text with new copper per net (unlocked) appended
-fn copper_text(
+pub fn copper_text(
     text: &str,
     nets: &[String],
     routed: &HashMap<usize, RNet>,

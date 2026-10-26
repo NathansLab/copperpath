@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `thermals`: a short stub track for every starved thermal pad (fewer than 2 spokes), and an
+  `autoroute` stage that runs it after the pours (`--no-thermals`); sizif128: kicad-cli
+  `starved_thermal` 17 -> 7.
+- Native DRC: `starved_thermal` counts spokes as kicad-cli 10 (per fill polygon, island spokes
+  ignored while the pad has another connection, tracks only when they end in the fill).
 - Net class names carry routing intents: `Power [low_r]` or a class named `quiet` applies that
   profile to its nets (after `--prio`, config and project block).
 - README benchmark section: PCBench results table, renders of the routed boards and a DRC time
