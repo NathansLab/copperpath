@@ -20,3 +20,4 @@ are sums over all boards.
 | release | date | commit | command | fully routed | unconnected | new DRC | vias | route time s | machine |
 |---|---|---|---|---|---|---|---|---|---|
 | main fe329e3 | 2026-10-25 | `fe329e3e` | autoroute | 1/8 | 152 | 25 | 1131 | 406 | 4 cores Intel(R) Xeon(R) Processor @ 2.10GHz |
+| main aa40784 | 2026-10-26 | `aa407842` | autoroute | 2/8 | 77 | 8 | 1206 | 360 | 4 cores Intel(R) Xeon(R) Processor @ 2.10GHz |
