@@ -3512,30 +3512,64 @@ pub fn pcb_text(text: &str, nets: &[String], res: &DResult) -> Result<String, St
 /// (kicad-cli counts a track end in the middle of another track as dangling)
 pub fn split_tees(segs: &[RSeg]) -> Vec<RSeg> {
     const TOL: f64 = 1e-4;
-    let ends: Vec<(P, usize)> = segs.iter().flat_map(|s| [(s.a, s.l), (s.b, s.l)]).collect();
+    // exact duplicates (either direction) are written once
+    let mut uniq: Vec<RSeg> = Vec::with_capacity(segs.len());
+    for s in segs {
+        let dup = uniq.iter().any(|u| {
+            u.l == s.l
+                && ((u.a - s.a).len() <= TOL && (u.b - s.b).len() <= TOL
+                    || (u.a - s.b).len() <= TOL && (u.b - s.a).len() <= TOL)
+        });
+        if !dup {
+            uniq.push(s.clone());
+        }
+    }
+    let segs = &uniq;
+    let ends: Vec<(P, usize, f64)> = segs
+        .iter()
+        .flat_map(|s| [(s.a, s.l, s.w), (s.b, s.l, s.w)])
+        .collect();
     let mut out = Vec::with_capacity(segs.len());
     for s in segs {
         let d = s.b - s.a;
         let len = d.len();
-        // interior points of this segment that are ends of others, ordered along it
-        // (position along the segment, the other segment's end exactly)
-        let mut cut: Vec<(f64, P)> = ends
+        // interior points of this segment that are ends of others, ordered along it: (position
+        // along the segment, cut point, the other end when it is off the centre line by up to a
+        // quarter width, joined to the cut by a short connector, and its width)
+        let off = (s.w / 4.0).max(TOL);
+        let mut cut: Vec<(f64, P, Option<(P, f64)>)> = ends
             .iter()
-            .filter(|(q, l)| *l == s.l && len > 2.0 * TOL && dist_seg(*q, s.a, s.b) <= TOL)
-            .map(|(q, _)| ((*q - s.a).dot(d) / len, *q))
+            .filter(|(q, l, _)| *l == s.l && len > 2.0 * TOL && dist_seg(*q, s.a, s.b) <= off)
+            .map(|&(q, _, w)| {
+                let t = (q - s.a).dot(d) / len;
+                let on = s.a + d * (t / len);
+                if (q - on).len() <= TOL {
+                    (t, q, None)
+                } else {
+                    (t, on, Some((q, w.min(s.w))))
+                }
+            })
             // a junction within half a width of an end already meets that end (no slivers)
-            .filter(|&(t, _)| t > (s.w / 2.0).max(TOL) && t < len - (s.w / 2.0).max(TOL))
+            .filter(|&(t, _, _)| t > (s.w / 2.0).max(TOL) && t < len - (s.w / 2.0).max(TOL))
             .collect();
         cut.sort_by(|x, y| x.0.total_cmp(&y.0));
         cut.dedup_by(|x, y| (x.0 - y.0).abs() <= TOL);
         let mut a = s.a;
-        for (_, q) in cut {
+        for (_, q, conn) in cut {
             out.push(RSeg {
                 a,
                 b: q,
                 l: s.l,
                 w: s.w,
             });
+            if let Some((e, w)) = conn {
+                out.push(RSeg {
+                    a: q,
+                    b: e,
+                    l: s.l,
+                    w,
+                });
+            }
             a = q;
         }
         out.push(RSeg {
@@ -3611,6 +3645,15 @@ mod tests {
         // ends meeting at end points are left alone
         let out = split_tees(&[seg((0.0, 0.0), (1.0, 0.0)), seg((1.0, 0.0), (1.0, 1.0))]);
         assert_eq!(out.len(), 2);
+        // an end slightly off the centre line: split at its projection plus a connector
+        let out = split_tees(&[seg((0.0, 0.0), (4.0, 0.0)), seg((2.0, 0.03), (2.0, 2.0))]);
+        assert_eq!(out.len(), 4);
+        assert!(out
+            .iter()
+            .any(|s| s.a.x == 2.0 && s.a.y == 0.0 && s.b.y == 0.03));
+        // exact duplicates are written once
+        let out = split_tees(&[seg((0.0, 0.0), (1.0, 0.0)), seg((1.0, 0.0), (0.0, 0.0))]);
+        assert_eq!(out.len(), 1);
     }
 
     #[test]
