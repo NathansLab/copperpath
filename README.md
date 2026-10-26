@@ -218,6 +218,10 @@ Stages (each writes its board to `OUT_stages/`, the input is never modified):
    ripped); new tracks can cut another pour, so fill and route repeat up to 3 times. Plane
    nets with pads the plane and the fanout could not join (dense through-hole pins between
    which the plane cannot pour) are routed here too, on the signal layers.
+3e. **polish**: when a quarter of the budget is left (small boards finish early), the nets
+   still open get a rip-up-and-reroute round on the filled board (up to 20 targets); the result
+   is kept only when the board has fewer opens (rf_siggen 16 -> 14, rxadc_14 5 -> 4; off with
+   `--no-polish`).
 3d. **thermals**: pads whose thermal relief resolves to fewer than 2 spokes (`starved_thermal`
    in kicad-cli) get a short stub track from the pad centre into connected fill of their zone,
    which kicad-cli counts as a spoke (`thermals`; off with `--no-thermals`). On the routed
