@@ -5,11 +5,20 @@ written in Rust (parallel with rayon). It reads the board, the net classes (`.ki
 custom rules (`.kicad_dru`) directly, routes signal nets with exact clearance checks and writes the
 result back as ordinary KiCad tracks and vias.
 
-**Status: research prototype.** Tested on KiCad 10 boards (4 and 6 copper layers). HV/power pours
-and plane nets are not routed. Expect rough edges; see [Limitations](#limitations) and
-[ROADMAP.md](ROADMAP.md).
+**Status: research prototype.** Tested on KiCad 10 boards (2, 4 and 6 copper layers). Expect
+rough edges; see [Limitations](#limitations) and [ROADMAP.md](ROADMAP.md).
 
 ![Demo board before and after routing](docs/demo_before_after.png)
+
+At a glance (every command takes `--json`; times on 4 cores):
+
+| | |
+|---|---|
+| **One-shot routing** | `autoroute`: planes, fanout, signals, pours, thermal fixes and a DRC gate in one call; 2 of 8 PCBench boards fully routed, the others with 1-11 % of their connections left open ([benchmark](#benchmark-pcbench)) |
+| **Routing intents per net** | `low_r`, `wide`, `low_l`, `short`, `few_vias`, `quiet`, `first`, `outer`, `z:OHM` (impedance width from the stackup), `pair` (differential pairs); from `--prio`, the project file or the net class name ([intents](#routing-intents-per-net---prio)) |
+| **Length matching** | `tune --match 'D[0-7]'`: exact-length accordion meanders, clearance-checked |
+| **Native DRC** | the copper checks of `kicad-cli pcb drc` with KiCad's semantics in 7-105 ms instead of 0.7-1.8 s ([DRC](#native-drc-drc)) |
+| **For agents** | `status` (overview, suggested intents, next commands) in milliseconds, `explain` (why a net is open), `ripup` + `route --nets` (redo a net in about a second), `netinfo` (R, L, Z0, coupling, bus skew); [a recorded session](docs/agent-session.md) |
 
 ## Numbered net compatibility
 
