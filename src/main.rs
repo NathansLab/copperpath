@@ -3453,6 +3453,8 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
     let mut stages: Vec<Stage> = Vec::new();
     let mut cur = c.pcb.clone();
     let (opens_in, _) = opens_all(a, &cur, &c)?;
+    // opens of the board file last counted (a later count of the same file reuses it)
+    let mut last_opens: Option<(String, (usize, Vec<Value>))> = None;
     eprintln!("[autoroute] input: {opens_in} opens, budget {budget:.0} s");
 
     // 1. planes: zones from --planes L=NET (unless the net already has a zone on L)
@@ -3787,7 +3789,8 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
     // e.g. dense through-hole pins) are routed here too, with tracks on the signal layers
     let mut late = pour_nets.clone();
     if !plane_nets.is_empty() {
-        let (_, per) = opens_all(a, &cur, &c)?;
+        let (n, per) = opens_all(a, &cur, &c)?;
+        last_opens = Some((cur.clone(), (n, per.clone())));
         for n in &per {
             if let Some(x) = n["net"].as_str() {
                 if plane_nets.iter().any(|p| p == x) && !late.iter().any(|l| l == x) {
@@ -3836,6 +3839,7 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
                 Ok(v) => {
                     cur = o;
                     let (left_open, per) = opens_all(a, &cur, &c)?;
+                    last_opens = Some((cur.clone(), (left_open, per.clone())));
                     let pour_open = per
                         .iter()
                         .filter(|n| {
@@ -3953,7 +3957,11 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
     // 5. quality gate: opens with native fills, KiCad DRC against the input (optional); the best
     // stage without new DRC errors is written
     let t = Instant::now();
-    let (opens_out, open_nets) = opens_all(a, &cur, &c)?;
+    // the last pour round counted this very board already
+    let (opens_out, open_nets) = match last_opens.take() {
+        Some((p, r)) if p == cur => r,
+        _ => opens_all(a, &cur, &c)?,
+    };
     let mut chosen = cur.clone();
     let mut gate = json!({"drc": "skipped (use --drc with kicad-cli)"});
     if a.get("drc").is_some() {
