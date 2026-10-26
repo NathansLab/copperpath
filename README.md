@@ -602,23 +602,26 @@ the output files are unchanged, and without the flag no event is written.
 benchmarks with, end to end and without manual steps: download (pinned commit, sha256), keep the
 board's own net classes (track widths, clearances, vias) and setup minimums, strip all tracks and
 vias, then one `copperpath autoroute --time 120` (planes, fan-out, signals, pours) and a sign-off
-with `kicad-cli pcb drc --refill-zones`. Result of the current main (4 cores, 2026-10-25):
+with `kicad-cli pcb drc --refill-zones`. Result of the current main (4 cores, 2026-10-26):
 
 | board | layers | nets | unconnected before → after | new DRC (KiCad) | route s | vias (human) | length mm (human) |
 |---|---|---|---|---|---|---|---|
-| fan_controller | 2 | 31 | 77 → 1 | starved_thermal 1, track_dangling 1 | 4.2 | 34 (23) | 590 (534) |
-| LVDS2TMDS | 2 | 29 | 39 → 0 | 0 | 0.7 | 10 (13) | 272 (274) |
-| sizif128 | 2 | 28 | 272 → 32 | starved_thermal 15, via_dangling 2 | 146 | 221 (203) | 6183 (8329) |
-| rxadc_14 | 4 | 47 | 78 → 11 | solder_mask_bridge 3 | 9.6 | 78 (31) | 476 (447) |
-| icehat | 4 | 59 | 104 → 10 | track_dangling 1 | 51 | 61 (41) | 937 (1251) |
-| rf_siggen | 4 | 57 | 153 → 16 | track_dangling 1 | 18 | 175 (369) | 998 (1108) |
-| a123_bcm | 4 | 139 | n/a → 4 ¹ | starved_thermal 1 ¹ | 6.3 | 64 (88) | 809 (1065) |
-| prog_rig | 4 | 287 | 499 → 83 | track_dangling 1 | 170 | 488 (332) | 7623 (12796) |
+| fan_controller | 2 | 31 | 77 → **0** | 0 | 4.5 | 34 (23) | 593 (534) |
+| LVDS2TMDS | 2 | 29 | 39 → **0** | 0 | 0.7 | 10 (13) | 274 (274) |
+| sizif128 | 2 | 28 | 272 → 16 | starved_thermal 4 | 115 | 243 (203) | 6518 (8329) |
+| rxadc_14 | 4 | 47 | 78 → 5 | solder_mask_bridge 3 | 9.5 | 78 (31) | 493 (447) |
+| icehat | 4 | 59 | 104 → 10 | 0 | 52 | 61 (41) | 970 (1251) |
+| rf_siggen | 4 | 57 | 153 → 16 | 0 | 15 | 175 (369) | 998 (1108) |
+| a123_bcm | 4 | 139 | 92 → 1 ¹ | 0 ¹ | 6.4 | 66 (88) | 829 (1065) |
+| prog_rig | 4 | 287 | 499 → 29 | 0 | 154 | 539 (332) | 9250 (12796) |
 
-¹ kicad-cli's zone refill on a123_bcm did not finish within 600 s; the numbers are from
-`copperpath drc --refill-zones` (0.55 s).
+¹ kicad-cli's zone refill on a123_bcm does not finish within 600 s; the benchmark then checks
+both boards with `copperpath drc --refill-zones` (about 1 s).
 
-The history per release lives in [docs/benchmark.md](docs/benchmark.md); the `Benchmark`
+![Connections left open per board, previous run against the current main](docs/img/progress.svg)
+
+(a123_bcm has no earlier value: kicad-cli timed out on it before the benchmark fell back to the
+native DRC.) The history per release lives in [docs/benchmark.md](docs/benchmark.md); the `Benchmark`
 workflow adds a row for every release tag. Routed boards (`render --refill-zones --fills
 --opens`, white lines are the remaining open connections):
 
@@ -629,7 +632,7 @@ workflow adds a row for every release tag. Routed boards (`render --refill-zones
 | ![fan_controller](docs/img/bench_fan_controller.png) | ![a123_bcm](docs/img/bench_a123_bcm.png) |
 
 DRC time on the routed boards with the saved fills, best of three: the native `drc` gives the
-same violations as kicad-cli in 7-74 ms instead of 0.65-1.4 s
+same violations as kicad-cli in 7-105 ms instead of 0.65-1.8 s
 (`scripts/readme_figures.py` regenerates figures and chart from a benchmark run).
 
 ![DRC time per board, kicad-cli against copperpath drc](docs/img/drc_time.svg)
