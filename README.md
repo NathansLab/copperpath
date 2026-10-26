@@ -64,6 +64,7 @@ All commands take `--pcb BOARD.kicad_pcb`. Common options:
 | `route [--region x0,y0,x1,y1] [--nets PATTERNS] --out OUT.kicad_pcb [--delta-json DELTA.json] [--drc]` | Detailed router (below). Routes every routable net whose pads lie in the region (default: whole board). Appends unlocked tracks/vias to a copy and writes `OUT_route.json`; `--delta-json` writes the added/removed items in nm for the KiCad IPC API ([schema](#change-set-for-the-kicad-ipc-api---delta-json)). `--drc` runs `kicad-cli` on input and output and reports the new violations. |
 | `check [--out DIR] [--res 0.25] [--tile 1.0] [--copper locked\|all] [--crop x0,y0,x1,y1 --crop-class C]` | Routability report: via-site maps per net class, region analysis per schematic sheet, what-if ablation (without rule areas, via keepouts, locked copper), global route with congestion per tile and layer, hotspot list. Writes `report.json`, `groute.json`, `congestion.json` and PNG maps. |
 | `place --zones zones.json [--init keep\|schematic\|both] [--moves N] [--starts K] [--out DIR]` | Parallel simulated-annealing placement of the movable parts inside zones (see `examples/zones.json`). Writes `place.json`; apply it to a copy with `scripts/apply_place.py`. |
+| `thermals --out OUT` | Refills the zones natively and gives every starved thermal pad (fewer than 2 resolved spokes, counted as kicad-cli 10 does: spokes into isolated islands only count when nothing else does, a track from the pad into the fill counts) a short legal stub track into its zone's fill, preferring fill connected to other items. `--json`: starved pads and stubs added. |
 | `ripup --nets PATS [--region BOX] [--locked] --out OUT` | Removes the unlocked tracks and vias of the matching nets (with `--locked` the locked ones too), optionally only those touching a region; `--json` lists what was removed per net. With `route --nets` an agent redoes single nets in well under a second. |
 | `status [--refill-zones]` | One-call overview for agents, in milliseconds: copper stack, net classes, zones with their selection key, plane nets and candidates, opens per net, native DRC by type, and the next commands to run (`--json`: `next`). |
 | `netinfo [--nets] [--cu-um 35]` | Length, vias, track width and estimated DC resistance (mΩ) and inductance (nH) per net, in milliseconds. See [Routing intents](#routing-intents-per-net---prio). |
@@ -204,7 +205,13 @@ Stages (each writes its board to `OUT_stages/`, the input is never modified):
    time left.
 3c. **pours**: the pour nets are routed after the signals: the zones are filled natively and
    the router only joins what the fill leaves apart, starting on the fill (no signal is
-   ripped); new tracks can cut another pour, so fill and route repeat up to 3 times.
+   ripped); new tracks can cut another pour, so fill and route repeat up to 3 times. Plane
+   nets with pads the plane and the fanout could not join (dense through-hole pins between
+   which the plane cannot pour) are routed here too, on the signal layers.
+3d. **thermals**: pads whose thermal relief resolves to fewer than 2 spokes (`starved_thermal`
+   in kicad-cli) get a short stub track from the pad centre into connected fill of their zone,
+   which kicad-cli counts as a spoke (`thermals`; off with `--no-thermals`). On the routed
+   sizif128 board: kicad-cli `starved_thermal` 17 -> 7, no new violations.
 4. **stitch**: stitching vias for outer pours of the plane nets onto their inner planes
    (`--stitch-grid G` adds a grid; off with `--no-stitch`).
 5. **gate**: opens of every net counted with native fills; with `--drc` KiCad DRC of the result
@@ -272,6 +279,11 @@ for the total length plus about 1.3 nH per 1.6 mm via). Demo board, `route` with
 | CLK (`low_l`) | 22.1 mm, 2 vias, 27.1 nH | 22.4 mm, **0 vias, 24.9 nH** |
 | ADC1 (`few_vias`) | 17.8 mm, 3 vias | 18.4 mm, **0 vias** |
 
+![demo board without (left) and with routing intents (right): +5V twice as wide, CLK on one layer, ADC1 without vias](docs/img/prio_demo.png)
+
+Left without, right with `--prio '+5V=low_r,CLK=low_l,ADC1=few_vias'` (`render --nets
+'\+5V|CLK|ADC1' --labels`: only these nets' copper, F.Cu red, B.Cu blue).
+
 ## Native DRC (`drc`)
 
 ```bash
@@ -280,7 +292,9 @@ $B drc --pcb routed.kicad_pcb --refill-zones --out report.json --json
 
 The copper checks of `kicad-cli pcb drc`, on copperpath's model: `clearance`, `shorting_items`,
 `tracks_crossing`, `hole_clearance`, `hole_to_hole`, `copper_edge_clearance`, `track_width`,
-`via_diameter`, `annular_width`, `drill_out_of_range`, `starved_thermal` (with `--refill-zones`) and
+`via_diameter`, `annular_width`, `drill_out_of_range`, `starved_thermal` (with `--refill-zones`, resolved as kicad-cli 10: spokes per fill polygon,
+spokes into single-connection islands ignored while the pad has another spoke or a track into
+the fill) and
 `unconnected_items`, with KiCad's semantics (net classes, DRU and pad clearances, the 0.0005 mm
 epsilon, one collision per net pair, collisions only between nets with pads). `--refill-zones`
 fills the zones natively first (like kicad-cli's flag, with thermal reliefs), otherwise the

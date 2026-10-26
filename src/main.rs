@@ -2,7 +2,7 @@
 
 use copperpath::{
     board, check, delta, drc, droute, elec, explain, fanout, geom, groute, model, nudge, place,
-    plane, progress, render, reroute, rules, sch, sexpr, sites, stitch,
+    plane, progress, render, reroute, rules, sch, sexpr, sites, stitch, thermal,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -293,6 +293,7 @@ fn main() {
         "netinfo" => cmd_netinfo(&a),
         "status" => cmd_status(&a),
         "ripup" => cmd_ripup(&a),
+        "thermals" => cmd_thermals(&a),
         "pads" => cmd_pads(&a),
         "hints" => cmd_hints(&a),
         "netclass" => cmd_netclass(&a),
@@ -957,8 +958,16 @@ fn cmd_hints(a: &Args) -> CmdResult {
 /// net left open and route it again together with the ripped nets; a try that leaves any of
 /// these nets worse than before is rolled back
 fn cmd_route_core(a: &Args) -> CmdResult {
+    let t0 = Instant::now();
     let mut summary = route_once(a)?;
     if a.get("reroute-blockers").is_none() || summary["opens"].as_u64().unwrap_or(0) == 0 {
+        return Ok(summary);
+    }
+    // the reroute shares the route's --time-limit: none of it once the route used it up
+    let limit = a.f("time-limit", 0.0);
+    let out_of_time = || limit > 0.0 && t0.elapsed().as_secs_f64() >= limit;
+    if out_of_time() {
+        eprintln!("[reroute] skipped: --time-limit used up by the route");
         return Ok(summary);
     }
     let out = summary["out"].as_str().unwrap_or_default().to_string();
@@ -1002,6 +1011,9 @@ fn cmd_route_core(a: &Args) -> CmdResult {
     let mut log = Vec::new();
     let mut tried: std::collections::HashSet<String> = Default::default();
     for _ in 0..max_targets {
+        if out_of_time() {
+            break;
+        }
         let c = load_out(&out)?;
         let before = per_net(&c);
         let mut targets: Vec<(&String, &usize)> = before
@@ -1955,6 +1967,39 @@ fn cmd_ripup(a: &Args) -> CmdResult {
         "out": out, "removed": n,
         "nets": per.iter().map(|(k, (t, v))| json!({"net": k, "tracks": t, "vias": v})).collect::<Vec<_>>(),
     }))
+}
+
+/// second connection for starved thermal reliefs: refills the zones natively, then adds a short
+/// track from each pad with a single spoke into its net's fill (see `thermal.rs`); writes `--out`
+fn cmd_thermals(a: &Args) -> CmdResult {
+    let mut kv = a.kv.clone();
+    kv.insert("refill-zones".into(), "1".into());
+    kv.entry("fill-res".into()).or_insert_with(|| "0.05".into());
+    let c = load_ctx_filled(&Args {
+        cmd: a.cmd.clone(),
+        kv,
+    })?;
+    let out = out_path(a, &c, "thermals.kicad_pcb")?;
+    let m = model::Model::new(&c.board, &c.rules, c.cfg.clone(), model::CopperMode::All);
+    let starved: usize = c
+        .board
+        .zones
+        .iter()
+        .map(|z| thermal::starved(&m, z).len())
+        .sum();
+    let add = thermal::stubs(&m);
+    let n: usize = add.values().map(|r| r.segs.len()).sum();
+    let text = droute::copper_text(&c.board.text, &c.board.nets, &add)?;
+    write_file(&out, &text)?;
+    for (src, ext) in [(&c.pro, "kicad_pro"), (&c.dru, "kicad_dru")] {
+        let dst = out.replace(".kicad_pcb", &format!(".{ext}"));
+        // never onto itself (--out next to the input: copying would truncate it)
+        if std::path::Path::new(src).is_file() && *src != dst {
+            std::fs::copy(src, &dst).map_err(|e| format!("{src}: {e}"))?;
+        }
+    }
+    eprintln!("[thermals] {n} stub(s) for {starved} starved thermal pad(s) -> {out}");
+    Ok(json!({"out": out, "starved": starved, "stubs": n}))
 }
 
 /// one-call board overview for agents (milliseconds): stack, net classes, zones (with their
@@ -3567,10 +3612,13 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
         let t = Instant::now();
         // reserve for the gate, plus a fifth of the budget for the pour nets' own stage
         let reserve = (budget * 0.15).clamp(5.0, 90.0)
-            + if pour_nets.is_empty() {
-                0.0
-            } else {
+            + if !pour_nets.is_empty() {
                 budget * 0.2
+            } else if !plane_nets.is_empty() {
+                // plane pads the fanout could not join are routed after the signals
+                budget * 0.1
+            } else {
+                0.0
             };
         let tl = (left() - reserve).max(10.0);
         let o = format!("{work}/3_route.kicad_pcb");
@@ -3674,7 +3722,26 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
     // refill and repeat (up to 3 rounds) until the refilled board has no open pour net
     // runs even when the signals overran the budget: unconnected pour nets (GND) are worse than
     // a few seconds over it (each round then gets at least 10 s)
-    if !pour_nets.is_empty() {
+    // plane nets that the plane fills and the fanout left open (pads the plane cannot reach,
+    // e.g. dense through-hole pins) are routed here too, with tracks on the signal layers
+    let mut late = pour_nets.clone();
+    if !plane_nets.is_empty() {
+        let (_, per) = opens_all(a, &cur, &c)?;
+        for n in &per {
+            if let Some(x) = n["net"].as_str() {
+                if plane_nets.iter().any(|p| p == x) && !late.iter().any(|l| l == x) {
+                    late.push(x.to_string());
+                }
+            }
+        }
+    }
+    let pn_late = plane_nets
+        .iter()
+        .filter(|p| !late.contains(p))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
+    if !late.is_empty() {
         let t = Instant::now();
         let mut rounds = Vec::new();
         for round in 1..=3 {
@@ -3684,15 +3751,15 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
                 "{:.0}",
                 (left() - (budget * 0.05).clamp(2.0, 30.0)).max(10.0)
             );
-            let nets = pour_nets.join(",");
+            let nets = late.join(",");
             let mut kv: Vec<(&str, &str)> = vec![
                 ("pcb", &fo),
                 ("out", &o),
                 ("time-limit", &tls),
                 ("nets", &nets),
             ];
-            if !pn.is_empty() {
-                kv.push(("plane-nets", &pn));
+            if !pn_late.is_empty() {
+                kv.push(("plane-nets", &pn_late));
             }
             if !sig_layers.is_empty() {
                 kv.push(("signal-layers", &sig_layers));
@@ -3711,7 +3778,7 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
                         .filter(|n| {
                             n["net"]
                                 .as_str()
-                                .is_some_and(|x| pour_nets.iter().any(|p| p == x))
+                                .is_some_and(|x| late.iter().any(|p| p == x))
                         })
                         .count();
                     rounds.push(json!({"round": round, "segments": v["segments"], "vias": v["vias"], "opens": left_open, "open_pour_nets": pour_open}));
@@ -3735,9 +3802,48 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
             secs: t.elapsed().as_secs_f64(),
             opens,
             ok: opens.is_some(),
-            note: format!("{} pour net(s), {} round(s)", pour_nets.len(), rounds.len()),
-            detail: json!({"nets": pour_nets, "rounds": rounds}),
+            note: format!(
+                "{} pour/plane net(s), {} round(s)",
+                late.len(),
+                rounds.len()
+            ),
+            detail: json!({"nets": late, "rounds": rounds}),
         });
+    }
+    // 3d. starved thermal reliefs (kicad-cli: fewer than 2 spokes): a short stub track from the
+    // pad into its zone's fill counts as a spoke
+    // (skipped once the budget is spent: on large boards its fine refill takes seconds)
+    if a.get("no-thermals").is_none() && !c.board.zones.is_empty() && left() > 0.0 {
+        let t = Instant::now();
+        let o = format!("{work}/3d_thermals.kicad_pcb");
+        match cmd_thermals(&sub_args("thermals", &[("pcb", &cur), ("out", &o)])) {
+            // a board without starved pads gets no stage
+            Ok(v) if v["starved"].as_u64() == Some(0) => {}
+            Ok(v) => {
+                let n = v["stubs"].as_u64().unwrap_or(0);
+                if n > 0 {
+                    cur = o.clone();
+                }
+                stages.push(Stage {
+                    name: "thermals",
+                    out: cur.clone(),
+                    secs: t.elapsed().as_secs_f64(),
+                    opens: None,
+                    ok: true,
+                    note: format!("{n} stub(s) for {} starved pad(s)", v["starved"]),
+                    detail: v,
+                });
+            }
+            Err(e) => stages.push(Stage {
+                name: "thermals",
+                out: cur.clone(),
+                secs: t.elapsed().as_secs_f64(),
+                opens: None,
+                ok: false,
+                note: e,
+                detail: json!(null),
+            }),
+        }
     }
     // 4. stitching vias for outer pours of the plane nets
     if a.get("no-stitch").is_none() && left() > 5.0 {

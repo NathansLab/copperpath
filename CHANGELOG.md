@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `thermals`: a short stub track for every starved thermal pad (fewer than 2 spokes), and an
+  `autoroute` stage that runs it after the pours (`--no-thermals`); sizif128: kicad-cli
+  `starved_thermal` 17 -> 7.
+- Native DRC: `starved_thermal` counts spokes as kicad-cli 10 (per fill polygon, island spokes
+  ignored while the pad has another connection, tracks only when they end in the fill).
 - Net class names carry routing intents: `Power [low_r]` or a class named `quiet` applies that
   profile to its nets (after `--prio`, config and project block).
 - README benchmark section: PCBench results table, renders of the routed boards and a DRC time
@@ -119,6 +124,14 @@ All notable changes to this project are documented here. The format follows
   (all nets of a 6-layer board with 217 fills in about 1 s; per-net opens equal KiCad's DRC).
 
 ### Changed
+- `autoroute`: plane-net pads that the plane fill and the fanout leave open (e.g. dense
+  through-hole pins the plane cannot reach) are routed in the pour stage with tracks on the
+  signal layers; prog_rig: 110 -> 25 opens at the same budget.
+- Router: nets with job windows above 4 M nodes get a reachability flood first; components the
+  search cannot reach are skipped instead of expanding the whole window (prog_rig +5V in the
+  pour stage: 64 -> 5 s). The node cap for large windows is at most 3x `--max-expand`.
+- Router: the hard reroute after the negotiation runs in parallel waves (same result).
+- `route --reroute-blockers` stops at `--time-limit`.
 - Router: the A* buffers are kept per thread and only the nodes a search touched are reset, so
   a search costs the nodes it expands instead of its whole window. Same result; the first
   negotiation iteration on the PCBench sizif128 board (2801 x 1701 cells, a 56-pin GND) takes
