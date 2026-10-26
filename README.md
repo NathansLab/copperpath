@@ -37,9 +37,9 @@ classes, three custom rules), placed but not routed.
 ```bash
 B=target/release/copperpath
 $B route --pcb examples/demo/demo.kicad_pcb --out out/demo_routed.kicad_pcb --threads 4
-#   [route] 24 nets, 50 connections: 181 segments (601 mm), 31 vias ... 0 opens
+#   [route] 24 nets, 50 connections: 189 segments (604 mm), 29 vias ... 0 opens
 $B route --pcb examples/demo/demo.kicad_pcb --out out/demo_routed.kicad_pcb --drc --json
-#   {"ok": true, "opens": 0, "vias": 31, "drc": {"new_errors": 0, ...}, ...}
+#   {"ok": true, "opens": 0, "vias": 29, "drc": {"new_errors": 0, ...}, ...}
 $B check --pcb examples/demo/demo.kicad_pcb --out out/check     # routability report + PNG maps
 $B hints --pcb examples/demo/demo.kicad_pcb                      # placement hints
 ```
