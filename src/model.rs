@@ -122,6 +122,9 @@ pub struct BoardCfg {
     /// copper layers for the tracks of signal nets (not plane nets); vias pass every layer
     /// (`--signal-layers`; autoroute keeps signals off inner plane layers)
     pub signal_layers: u8,
+    /// explicit differential pairs (positive, negative): routed like the `pair` intent, for nets
+    /// whose names do not mark the polarity (`--pairs`, config / project `pairs`)
+    pub pairs: Vec<(String, String)>,
 }
 
 /// Routing intent of a net: multipliers on the router's costs and the track width, and whether
@@ -243,6 +246,41 @@ impl NetPrio {
 }
 
 impl BoardCfg {
+    /// `--pairs 'POS=NEG;POS2=NEG2'`
+    pub fn add_pairs(&mut self, spec: &str) -> Result<(), String> {
+        for t in spec.split(';').map(str::trim).filter(|t| !t.is_empty()) {
+            let (p, n) = t
+                .split_once('=')
+                .ok_or(format!("--pairs '{t}': expected POSITIVE=NEGATIVE"))?;
+            self.pairs
+                .push((p.trim().to_string(), n.trim().to_string()));
+        }
+        Ok(())
+    }
+
+    /// `"pairs": [["POS", "NEG"], ...]` of a config or the project's `copperpath` block
+    pub fn add_pairs_json(&mut self, v: &Value) {
+        for pr in v.as_array().into_iter().flatten() {
+            if let (Some(p), Some(n)) = (pr[0].as_str(), pr[1].as_str()) {
+                self.pairs.push((p.to_string(), n.to_string()));
+            }
+        }
+    }
+
+    /// differential pair partner of net `name`: an explicit pair first, else by name (see
+    /// [`pair_partner`]); (partner, this net is the positive one, explicit)
+    pub fn partner(&self, name: &str) -> Option<(String, bool, bool)> {
+        for (p, n) in &self.pairs {
+            if p == name {
+                return Some((n.clone(), true, true));
+            }
+            if n == name {
+                return Some((p.clone(), false, true));
+            }
+        }
+        pair_partner(name).map(|(o, pos)| (o, pos, false))
+    }
+
     /// routing intent of net `name` in net class `class`: the first entry whose wildcard matches
     /// the net name, or the class name for entries written `class:PATTERN` (default: neutral)
     pub fn prio(&self, name: &str, class: &str) -> NetPrio {
@@ -312,6 +350,7 @@ impl Default for BoardCfg {
             yield_pours: Vec::new(),
             net_prio: Vec::new(),
             signal_layers: 0x3f,
+            pairs: Vec::new(),
         }
     }
 }
@@ -367,6 +406,7 @@ pub fn parse_cfg(j: &Value, board: Option<&str>) -> Result<BoardCfg, String> {
     c.via_keepout_refs = strs(&b["via_keepout_refs"]);
     c.add_prio_json(&b["net_prio"])
         .map_err(|e| format!("config: {e}"))?;
+    c.add_pairs_json(&b["pairs"]);
     if let Some(cl) = b["class_layers"].as_object() {
         for (k, v) in cl {
             c.class_layers.push((k.clone(), layer_mask(&strs(v))));

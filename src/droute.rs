@@ -912,13 +912,14 @@ impl<'a> Router<'a> {
         let by_net: HashMap<usize, usize> =
             jobs.iter().enumerate().map(|(k, j)| (j.net, k)).collect();
         for k in 0..jobs.len() {
-            if !jobs[k].prio.pair {
-                continue;
-            }
             let net = jobs[k].net;
-            let Some((other, positive)) = crate::model::pair_partner(&m.b.nets[net]) else {
+            // an explicit pair (--pairs) needs no intent; a pair by name needs `pair`
+            let Some((other, positive, explicit)) = m.cfg.partner(&m.b.nets[net]) else {
                 continue;
             };
+            if !explicit && !jobs[k].prio.pair {
+                continue;
+            }
             let Some(&lk) = m.b.net_id.get(&other).and_then(|on| by_net.get(on)) else {
                 continue;
             };

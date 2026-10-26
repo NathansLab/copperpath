@@ -254,6 +254,10 @@ nets marked `first` are routed before the others:
 | `z:OHM` | track width for that single-ended impedance on the outer layers, from the board stackup (microstrip, Hammerstad-Jensen; without a stackup: FR4 4.5, 35 µm, 0.2 mm prepreg on multilayer boards, 1.51 mm on two layers) | RF, USB/LVDS lines, clocks: `RF_OUT=z:50` |
 | `via:X` `bend:X` `dir:X` `width:X` `iso:X` | the multipliers themselves, `iso` the soft spacing in mm | fine tuning |
 
+Pairs whose names do not mark the polarity (`Net-(J1-Pad3)`) are named explicitly:
+`--pairs 'POS=NEG;POS2=NEG2'` or `"pairs": [["POS", "NEG"]]` in the config or the project's
+`copperpath` block; they need no `pair` intent.
+
 A differential pair without and with `pair` (`USB_D*=pair`; `netinfo --near 0.4`: USB_D- runs
 within 0.4 mm of USB_D+ for 1.7 mm without, 28 mm of its 34 mm with the intent; DRC clean):
 

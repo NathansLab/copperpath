@@ -242,4 +242,18 @@ fn pair_intent_keeps_the_pair_together() {
         coupled[1] > 20.0 && coupled[1] > 4.0 * coupled[0],
         "{coupled:?}"
     );
+    // the same pair under names without polarity, paired explicitly with --pairs
+    let text = std::fs::read_to_string(pcb)
+        .unwrap()
+        .replace("USB_D+", "TXA")
+        .replace("USB_D-", "TXB");
+    let pcb2 = d.join("named.kicad_pcb");
+    std::fs::write(&pcb2, text).unwrap();
+    let out = d.join("out_named.kicad_pcb");
+    let (pcb2, out) = (pcb2.to_str().unwrap(), out.to_str().unwrap());
+    let r = cp(&["route", "--pcb", pcb2, "--pairs", "TXA=TXB", "--out", out]);
+    assert_eq!(r["opens"], 0, "{r}");
+    let info = cp(&["netinfo", "--pcb", out, "--nets", "TX*", "--near", "0.4"]);
+    let c = net(&info, "TXB")["coupled_mm"].as_f64().unwrap();
+    assert!(c > 20.0, "{c}");
 }

@@ -236,10 +236,14 @@ pub fn load_ctx(a: &Args) -> Result<Ctx, String> {
     if let Some(p) = a.get("prio") {
         cfg.add_prio(p)?;
     }
+    if let Some(p) = a.get("pairs") {
+        cfg.add_pairs(p)?;
+    }
     if let Ok(t) = std::fs::read_to_string(&pro) {
         if let Ok(j) = serde_json::from_str::<Value>(&t) {
             cfg.add_prio_json(&j["copperpath"]["net_prio"])
                 .map_err(|e| format!("{pro}: copperpath.{e}"))?;
+            cfg.add_pairs_json(&j["copperpath"]["pairs"]);
         }
     }
     eprintln!(
