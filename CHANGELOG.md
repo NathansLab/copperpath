@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `autoroute --json`: `next`, the follow-up commands (`explain` on the output when connections
+  are left open, `drc`).
 - `autoroute` stage `polish`: left-over budget goes to a rip-up-and-reroute round on the nets
   still open, kept when the board has fewer opens (rf_siggen 16 -> 14, rxadc_14 5 -> 4;
   `--no-polish`).
