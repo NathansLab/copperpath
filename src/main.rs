@@ -3657,7 +3657,7 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
     {
         let t = Instant::now();
         // reserve for the gate, plus a fifth of the budget for the pour nets' own stage
-        let reserve = (budget * 0.15).clamp(5.0, 90.0)
+        let reserve = (budget * 0.15).clamp(1.0, 90.0)
             + if !pour_nets.is_empty() {
                 budget * 0.2
             } else if !plane_nets.is_empty() {
@@ -3666,7 +3666,8 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
             } else {
                 0.0
             };
-        let tl = (left() - reserve).max(10.0);
+        // at least 40 % of the budget (at most 10 s): small budgets stay small
+        let tl = (left() - reserve).max((budget * 0.4).min(10.0)).max(1.0);
         let o = format!("{work}/3_route.kicad_pcb");
         let tls = format!("{tl:.0}");
         let mut kv: Vec<(&str, &str)> = vec![("pcb", &cur), ("out", &o), ("time-limit", &tls)];
@@ -3767,7 +3768,7 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
     // router starts on the fill), without ripping signals; new tracks can cut another pour, so
     // refill and repeat (up to 3 rounds) until the refilled board has no open pour net
     // runs even when the signals overran the budget: unconnected pour nets (GND) are worse than
-    // a few seconds over it (each round then gets at least 10 s)
+    // a few seconds over it (each round then gets at least 15 % of the budget, at most 10 s)
     // plane nets that the plane fills and the fanout left open (pads the plane cannot reach,
     // e.g. dense through-hole pins) are routed here too, with tracks on the signal layers
     let mut late = pour_nets.clone();
@@ -3795,7 +3796,9 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
             let o = format!("{work}/3c_pours_{round}.kicad_pcb");
             let tls = format!(
                 "{:.0}",
-                (left() - (budget * 0.05).clamp(2.0, 30.0)).max(10.0)
+                (left() - (budget * 0.05).clamp(2.0, 30.0))
+                    .max((budget * 0.15).min(10.0))
+                    .max(1.0)
             );
             let nets = late.join(",");
             let mut kv: Vec<(&str, &str)> = vec![

@@ -124,6 +124,60 @@ def progress(prev, now, path, prev_label, now_label):
     open(path, "w").write("\n".join(o))
 
 
+def budget_curve(rows, path):
+    """lines per board: share of the input's connections still open (%) against the actual
+    autoroute time (s) for several --time budgets; rows: (board, budget, opens_in, opens, s)"""
+    boards = []
+    for r in rows:
+        if r[0] not in boards:
+            boards.append(r[0])
+    cols = ["--s1", "--s2", "--s3", "--s4"]
+    left, right, top, bottom = 56, 110, 56, 44
+    w, h = 720, 380
+    pw, ph = w - left - right, h - top - bottom
+    tmax = max(r[4] for r in rows)
+    tstep = next(s for s in (5, 10, 20, 25, 50, 100, 200) if tmax / s <= 6)
+    tm = tstep * -(-tmax // tstep)
+    pmax = max(100.0 * r[3] / r[2] for r in rows)
+    pstep = next(s for s in (5, 10, 20, 25) if pmax / s <= 6)
+    pm = pstep * -(-pmax // pstep)
+    sx = lambda t: left + pw * t / tm
+    sy = lambda v: top + ph * (1 - v / pm)
+    o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" '
+         'font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12">',
+         '<style>svg{--bg:#fcfcfb;--t1:#0b0b0b;--t2:#52514e;--grid:#e4e3df;'
+         '--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100}'
+         '@media (prefers-color-scheme: dark){svg{--bg:#1a1a19;--t1:#f0efec;--t2:#c3c2b7;'
+         '--grid:#3a3936;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500}}'
+         'text{fill:var(--t1)}.m{fill:var(--t2)}</style>',
+         f'<rect width="{w}" height="{h}" rx="6" fill="var(--bg)"/>',
+         '<text x="16" y="22" font-size="14" font-weight="600">Connections still open vs. autoroute time '
+         '(--time 10, 30, 60, 120 s)</text>',
+         '<text x="16" y="40" class="m">% of the connections open in the input; x: actual run time on 4 cores</text>']
+    k = 0.0
+    while k <= pm + 1e-9:
+        y = sy(k)
+        o.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left + pw}" y2="{y:.1f}" stroke="var(--grid)"/>')
+        o.append(f'<text x="{left - 8}" y="{y + 4:.1f}" text-anchor="end" class="m">{k:.0f} %</text>')
+        k += pstep
+    t = 0
+    while t <= tm + 1e-9:
+        o.append(f'<text x="{sx(t):.1f}" y="{top + ph + 18}" text-anchor="middle" class="m">{t:.0f} s</text>')
+        t += tstep
+    for i, b in enumerate(boards):
+        pts = sorted((r[4], 100.0 * r[3] / r[2], r) for r in rows if r[0] == b)
+        col = cols[i % len(cols)]
+        d = " ".join(f"{'M' if j == 0 else 'L'}{sx(p[0]):.1f},{sy(p[1]):.1f}" for j, p in enumerate(pts))
+        o.append(f'<path d="{d}" fill="none" stroke="var({col})" stroke-width="2"/>')
+        for tt, v, r in pts:
+            o.append(f'<circle cx="{sx(tt):.1f}" cy="{sy(v):.1f}" r="4" fill="var({col})" stroke="var(--bg)" '
+                     f'stroke-width="2"><title>{b}, --time {r[1]}: {r[3]} of {r[2]} open after {tt:.0f} s</title></circle>')
+        tt, v, r = pts[-1]
+        o.append(f'<text x="{sx(tt) + 8:.1f}" y="{sy(v) + 4:.1f}">{b} {r[3]}</text>')
+    o.append("</svg>")
+    open(path, "w").write("\n".join(o))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", default="bench_work")

@@ -624,6 +624,13 @@ both boards with `copperpath drc --refill-zones` (about 1 s).
 
 ![Connections left open per board, previous run against the current main](docs/img/progress.svg)
 
+How much time to give `autoroute`: the same boards with `--time 10, 30, 60, 120` (x: the time
+the run actually took). Smaller boards are done in about 10 s and gain nothing from more time;
+the dense two-layer sizif128 needs about a minute. An agent can start with `--time 10`, look at
+the open nets and spend more time only where they remain.
+
+![Connections still open against autoroute time for four boards](docs/img/budget.svg)
+
 (a123_bcm has no earlier value: kicad-cli timed out on it before the benchmark fell back to the
 native DRC.) The history per release lives in [docs/benchmark.md](docs/benchmark.md); the `Benchmark`
 workflow adds a row for every release tag. Routed boards (`render --refill-zones --fills
