@@ -277,6 +277,11 @@ for the total length plus about 1.3 nH per 1.6 mm via). Demo board, `route` with
 | CLK (`low_l`) | 22.1 mm, 2 vias, 27.1 nH | 22.4 mm, **0 vias, 24.9 nH** |
 | ADC1 (`few_vias`) | 17.8 mm, 3 vias | 18.4 mm, **0 vias** |
 
+![demo board without (left) and with routing intents (right): +5V twice as wide, CLK on one layer, ADC1 without vias](docs/img/prio_demo.png)
+
+Left without, right with `--prio '+5V=low_r,CLK=low_l,ADC1=few_vias'` (`render --nets
+'\+5V|CLK|ADC1' --labels`: only these nets' copper, F.Cu red, B.Cu blue).
+
 ## Native DRC (`drc`)
 
 ```bash
