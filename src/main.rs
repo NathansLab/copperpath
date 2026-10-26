@@ -2090,7 +2090,17 @@ fn cmd_status(a: &Args) -> CmdResult {
     let suggested: Vec<String> = (1..b.nets.len())
         .filter(|&i| m.routable[i] && !pour.contains(&i))
         .filter(|&i| c.cfg.prio(&b.nets[i], &c.rules.class_of(i).name) == model::NetPrio::default())
-        .filter_map(|i| model::suggest_intent(&b.nets[i]).map(|p| format!("{}={p}", b.nets[i])))
+        .filter_map(|i| {
+            // differential pairs whose partner is on the board
+            let pair =
+                model::pair_partner(&b.nets[i]).is_some_and(|(o, _)| b.net_id.contains_key(&o));
+            let p = if pair {
+                Some("pair")
+            } else {
+                model::suggest_intent(&b.nets[i])
+            };
+            p.map(|p| format!("{}={p}", b.nets[i]))
+        })
         .take(16)
         .collect();
     let suggested = suggested.join(",");

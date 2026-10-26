@@ -148,6 +148,9 @@ pub struct NetPrio {
     pub z: f64,
     /// copper layers the net's tracks may use (`outer`: F.Cu and B.Cu; vias still pass)
     pub layers: u8,
+    /// differential pair (`pair`): the negative net follows the positive one at the pair gap
+    /// (partner by name, see [`pair_partner`])
+    pub pair: bool,
 }
 
 impl Default for NetPrio {
@@ -160,6 +163,7 @@ impl Default for NetPrio {
             iso: 0.0,
             z: 0.0,
             layers: 0x3f,
+            pair: false,
             first: false,
         }
     }
@@ -203,6 +207,7 @@ impl NetPrio {
                 "wide" => p.width *= 1.5,
                 "first" => p.first = true,
                 "outer" => p.layers &= 1 | 1 << (NL - 1),
+                "pair" => p.pair = true,
                 _ => {
                     let (k, v) = t
                         .split_once(':')
@@ -732,6 +737,35 @@ pub struct Pin {
     pub comp: usize, // connectivity component id within the net
 }
 
+/// differential pair partner of a net by name: the trailing polarity marker swapped (`_P`/`_N`,
+/// `+`/`-`, `DP`/`DM`, `P`/`N` after a digit or separator). Returns (partner name, this net is
+/// the positive one).
+pub fn pair_partner(name: &str) -> Option<(String, bool)> {
+    let swaps: [(&str, &str); 6] = [
+        ("_P", "_N"),
+        ("+", "-"),
+        ("DP", "DM"),
+        ("_DP", "_DN"),
+        ("P", "N"),
+        ("_T", "_C"),
+    ];
+    for (pos, neg) in swaps {
+        for (from, to, positive) in [(pos, neg, true), (neg, pos, false)] {
+            if let Some(stem) = name.strip_suffix(from) {
+                // a bare P/N only after a digit or separator (CLK_P, D0P; not VCCP or GPIO_N)
+                if from.len() == 1
+                    && from.chars().all(|c| c.is_ascii_alphabetic())
+                    && !stem.ends_with(|c: char| c.is_ascii_digit() || c == '_' || c == '.')
+                {
+                    continue;
+                }
+                return Some((format!("{stem}{to}"), positive));
+            }
+        }
+    }
+    None
+}
+
 /// routing intents suggested from net names (for agents: `status` proposes them): supply rails
 /// `low_r`, clocks `low_l`, RF lines `z:50+outer`, sensitive analog nets `quiet`, USB data
 /// lines `few_vias`. Conservative patterns on the upper-cased name; the first match wins.
@@ -1087,6 +1121,19 @@ pub fn mst_connections(pins: &[Pin]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn differential_partners_by_name() {
+        assert_eq!(pair_partner("USB_D+"), Some(("USB_D-".into(), true)));
+        assert_eq!(
+            pair_partner("LVDS_CLK_N"),
+            Some(("LVDS_CLK_P".into(), false))
+        );
+        assert_eq!(pair_partner("USB_DP"), Some(("USB_DM".into(), true)));
+        assert_eq!(pair_partner("D0P"), Some(("D0N".into(), true)));
+        assert_eq!(pair_partner("VCCP"), None);
+        assert_eq!(pair_partner("GND"), None);
+    }
 
     #[test]
     fn intents_suggested_from_net_names() {

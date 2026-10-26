@@ -249,9 +249,15 @@ nets marked `first` are routed before the others:
 | `wide` | 1.5x the class width | moderate current |
 | `quiet` | cells within 0.5 mm beyond the clearance of other nets' copper (fixed and routed) cost more | sensitive analog, clocks next to aggressors |
 | `first` | routed before the other nets | the nets that matter most |
+| `pair` | differential pair: the negative net (`_N`, `-`, `DM`) follows the positive one (`_P`, `+`, `DP`, routed first) at the class `diff_pair_gap` (else the clearance), both at `diff_pair_width` if set; the follower skips the pull-tight | USB, LVDS, MIPI: `USB_D*=pair` |
 | `outer` | tracks only on F.Cu and B.Cu (vias still pass the inner layers) | with `z:` so the width holds everywhere, nets to probe or rework |
 | `z:OHM` | track width for that single-ended impedance on the outer layers, from the board stackup (microstrip, Hammerstad-Jensen; without a stackup: FR4 4.5, 35 µm, 0.2 mm prepreg on multilayer boards, 1.51 mm on two layers) | RF, USB/LVDS lines, clocks: `RF_OUT=z:50` |
 | `via:X` `bend:X` `dir:X` `width:X` `iso:X` | the multipliers themselves, `iso` the soft spacing in mm | fine tuning |
+
+A differential pair without and with `pair` (`USB_D*=pair`; `netinfo --near 0.4`: USB_D- runs
+within 0.4 mm of USB_D+ for 1.7 mm without, 28 mm of its 34 mm with the intent; DRC clean):
+
+![USB pair routed without (left) and with the pair intent (right)](docs/img/pair_demo.png)
 
 `netinfo --match 'D[0-7];A[0-9]+'` adds the length skew per group of nets (shortest, longest,
 `skew_mm`) for buses that need length matching. `netinfo` reports `z0_ohm`, the microstrip impedance of a net's narrowest outer-layer track

@@ -168,3 +168,78 @@ fn outer_intent_keeps_tracks_off_inner_layers() {
     }
     assert!(flat.contains("(net \"ADC1\")"));
 }
+
+/// `pair`: the negative net of a differential pair follows the positive one at the pair gap
+/// (coupled over most of its length; without the intent the two part at an obstacle)
+#[test]
+fn pair_intent_keeps_the_pair_together() {
+    let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("net_prio_pair");
+    std::fs::create_dir_all(&d).unwrap();
+    let fp = |r: &str, x: f64, y: f64, pads: &[(&str, f64, f64, &str)]| {
+        let p: String = pads
+            .iter()
+            .map(|(n, dx, dy, net)| {
+                format!(
+                    "(pad \"{n}\" smd rect (at {dx} {dy}) (size 0.6 0.6) (layers \"F.Cu\") (net \"{net}\"))"
+                )
+            })
+            .collect();
+        format!(
+            "(footprint \"P\" (layer \"F.Cu\") (at {x} {y}) (property \"Reference\" \"{r}\") {p})"
+        )
+    };
+    let body = [
+        fp(
+            "J1",
+            5.0,
+            10.0,
+            &[("1", 0.0, 0.0, "USB_D+"), ("2", 0.0, 0.9, "USB_D-")],
+        ),
+        fp(
+            "U1",
+            35.0,
+            14.0,
+            &[("1", 0.0, 0.0, "USB_D+"), ("2", 0.0, 0.9, "USB_D-")],
+        ),
+        fp(
+            "X1",
+            20.0,
+            11.3,
+            &[("1", 0.0, 0.0, "A"), ("2", 0.0, 4.0, "A")],
+        ),
+        fp(
+            "X2",
+            12.0,
+            8.0,
+            &[("1", 0.0, 0.0, "B"), ("2", 0.0, 6.0, "B")],
+        ),
+    ]
+    .concat();
+    let pcb = d.join("pair.kicad_pcb");
+    std::fs::write(
+        &pcb,
+        format!(
+            "(kicad_pcb (version 20260206) (layers (0 \"F.Cu\" signal) (2 \"B.Cu\" signal) (25 \"Edge.Cuts\" user)) \
+             (gr_rect (start 0 0) (end 40 25) (stroke (width 0.1)) (layer \"Edge.Cuts\")) {body})"
+        ),
+    )
+    .unwrap();
+    let pcb = pcb.to_str().unwrap();
+    let mut coupled = Vec::new();
+    for (name, prio) in [("free", ""), ("paired", "USB_D*=pair")] {
+        let out = d.join(format!("out_{name}.kicad_pcb"));
+        let out = out.to_str().unwrap();
+        let mut args = vec!["route", "--pcb", pcb, "--out", out];
+        if !prio.is_empty() {
+            args.extend(["--prio", prio]);
+        }
+        assert_eq!(cp(&args)["opens"], 0);
+        assert_eq!(cp(&["drc", "--pcb", out])["violations"], 0, "{name}");
+        let info = cp(&["netinfo", "--pcb", out, "--nets", "USB_D*", "--near", "0.4"]);
+        coupled.push(net(&info, "USB_D-")["coupled_mm"].as_f64().unwrap());
+    }
+    assert!(
+        coupled[1] > 20.0 && coupled[1] > 4.0 * coupled[0],
+        "{coupled:?}"
+    );
+}

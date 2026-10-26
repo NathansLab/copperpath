@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Routing intent `pair`: differential pairs by name (`_P`/`_N`, `+`/`-`, `DP`/`DM`); the
+  negative net follows the positive one at the class `diff_pair_gap` (else the clearance), at
+  `diff_pair_width` if set. `status` suggests it for nets whose partner exists.
 - `netinfo --match 'D[0-7];A[0-9]+'`: length skew per group of nets (shortest, longest,
   `skew_mm`); the text output shows `z0_ohm`.
 - `status`: `suggested_prio`, routing intents from net names (supply rails `low_r`, clocks

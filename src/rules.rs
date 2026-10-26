@@ -19,6 +19,9 @@ pub struct NetClass {
     pub track_width: f64,
     pub via_d: f64,
     pub via_drill: f64,
+    /// differential pair gap and width (KiCad `diff_pair_gap`, `diff_pair_width`), if set
+    pub dp_gap: Option<f64>,
+    pub dp_width: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -386,6 +389,8 @@ impl Rules {
                 track_width: c["track_width"].as_f64().unwrap_or(0.25),
                 via_d: c["via_diameter"].as_f64().unwrap_or(0.6),
                 via_drill: c["via_drill"].as_f64().unwrap_or(0.3),
+                dp_gap: c["diff_pair_gap"].as_f64(),
+                dp_width: c["diff_pair_width"].as_f64(),
             });
         }
         let class_idx: HashMap<String, usize> = classes
