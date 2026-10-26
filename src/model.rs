@@ -807,7 +807,7 @@ pub fn pair_partner(name: &str) -> Option<(String, bool)> {
 }
 
 /// routing intents suggested from net names (for agents: `status` proposes them): supply rails
-/// `low_r`, clocks `low_l`, RF lines `z:50+outer`, sensitive analog nets `quiet`, USB data
+/// `wide`, clocks `low_l`, RF lines `z:50+outer`, sensitive analog nets `quiet`, USB data
 /// lines `few_vias`. Conservative patterns on the upper-cased name; the first match wins.
 pub fn suggest_intent(name: &str) -> Option<&'static str> {
     let u = name.rsplit('/').next().unwrap_or(name).to_uppercase();
@@ -822,7 +822,9 @@ pub fn suggest_intent(name: &str) -> Option<&'static str> {
         volt || has(&["VCC", "VDD", "VIN", "VBUS", "VBAT", "PWR", "VSYS"])
     };
     if rail && !has(&["SENSE", "FB", "EN", "ADC", "MON", "DET"]) {
-        Some("low_r")
+        // `wide` rather than `low_r`: twice the width costs completion on dense boards (icehat
+        // at --time 10: 18 opens with wide, 26 with low_r)
+        Some("wide")
     } else if has(&["CLK", "SCK", "XTAL", "OSC"]) {
         Some("low_l")
     } else if has(&["RF", "ANT"]) && !has(&["REF"]) {
@@ -1177,8 +1179,8 @@ mod tests {
 
     #[test]
     fn intents_suggested_from_net_names() {
-        assert_eq!(suggest_intent("+5V"), Some("low_r"));
-        assert_eq!(suggest_intent("/power/3V3"), Some("low_r"));
+        assert_eq!(suggest_intent("+5V"), Some("wide"));
+        assert_eq!(suggest_intent("/power/3V3"), Some("wide"));
         assert_eq!(suggest_intent("VBUS_SENSE"), Some("quiet"));
         assert_eq!(suggest_intent("I2S_BCLK"), Some("low_l"));
         assert_eq!(suggest_intent("RF_OUT"), Some("z:50+outer"));

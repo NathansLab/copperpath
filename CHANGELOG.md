@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `docs/agent-session.md`: a recorded agent session on icehat (status, autoroute, drc, explain,
+  ripup/route, netinfo, tune, render) with times and results.
 - `tune --match REGEX [--target MM]`: length matching with accordion meanders (exact target,
   clearance-checked); demo PWM_A/PWM_B/ADC1/ADC2 skew 4.97 -> 0 mm, DRC clean.
 - Routing intent `pair`: differential pairs by name (`_P`/`_N`, `+`/`-`, `DP`/`DM`); the
@@ -14,7 +16,7 @@ All notable changes to this project are documented here. The format follows
   pairs for nets without polarity in the name: `--pairs 'POS=NEG'`, config / project `pairs`.
 - `netinfo --match 'D[0-7];A[0-9]+'`: length skew per group of nets (shortest, longest,
   `skew_mm`); the text output shows `z0_ohm`.
-- `status`: `suggested_prio`, routing intents from net names (supply rails `low_r`, clocks
+- `status`: `suggested_prio`, routing intents from net names (supply rails `wide`, clocks
   `low_l`, RF lines `z:50+outer`, USB data `few_vias`, analog `quiet`), also appended to the
   suggested `autoroute` command.
 - Routing intent `z:OHM`: the track width for a single-ended impedance on the outer layers,
@@ -160,6 +162,10 @@ All notable changes to this project are documented here. The format follows
   parallel, so the autoroute quality gate and repeated runs check an unchanged input once.
 
 ### Fixed
+- `autoroute`, `fanout`, `stitch`, `plane fill/create/adjust` copy the project and rules files
+  next to their output, like `route`: commands run on the output (`drc`, `status`, `explain`)
+  used KiCad's default net class otherwise (icehat: 190 false clearance violations). `ripup`
+  too; `status` names a missing project file in `next`.
 - Routed copper: a track end on the middle of another track of the net (T-junction) splits
   that track there; kicad-cli counted such ends as `track_dangling` (icehat, rf_siggen).
 - `scripts/bench_pcbench.py`: when kicad-cli times out on the input board (a123_bcm zone

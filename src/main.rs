@@ -1843,6 +1843,7 @@ fn cmd_fanout(a: &Args) -> CmdResult {
     routed.insert(net, r.copper);
     droute::write_copper(&base_text(a, &c)?, &c.board.nets, &routed, &out)
         .map_err(|e| format!("{out}: {e}"))?;
+    copy_project(&c, &out)?;
     eprintln!("[fanout] -> {out}");
     Ok(json!({
         "out": out, "net": net_name, "via": [via_d, drill],
@@ -1922,6 +1923,7 @@ fn cmd_stitch(a: &Args) -> CmdResult {
         },
     );
     droute::write_copper(&text, &c.board.nets, &routed, &out).map_err(|e| format!("{out}: {e}"))?;
+    copy_project(&c, &out)?;
     eprintln!("[stitch] {} vias -> {out}", r.vias.len());
     Ok(json!({
         "out": out, "net": net_name, "via": [via_d, drill],
@@ -1981,11 +1983,25 @@ fn cmd_ripup(a: &Args) -> CmdResult {
     }
     let (text, n) = reroute::remove_items(&b.text, &uuids);
     write_file(&out, &text)?;
+    copy_project(&c, &out)?;
     eprintln!("[ripup] {n} items of {} nets removed -> {out}", per.len());
     Ok(json!({
         "out": out, "removed": n,
         "nets": per.iter().map(|(k, (t, v))| json!({"net": k, "tracks": t, "vias": v})).collect::<Vec<_>>(),
     }))
+}
+
+/// copy the input's project and rules files next to a written board (`OUT.kicad_pro`,
+/// `OUT.kicad_dru`), so later commands on it (and KiCad) use the board's net classes; never
+/// onto the input itself
+fn copy_project(c: &Ctx, out: &str) -> Result<(), String> {
+    for (src, ext) in [(&c.pro, "kicad_pro"), (&c.dru, "kicad_dru")] {
+        let dst = out.replace(".kicad_pcb", &format!(".{ext}"));
+        if std::path::Path::new(src).is_file() && *src != dst && dst != out {
+            std::fs::copy(src, &dst).map_err(|e| format!("{src}: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// length matching: `tune --match REGEX [--target MM] [--gap MM] [--amax 1] [--tol 0.05]
@@ -2020,25 +2036,34 @@ fn cmd_tune(a: &Args) -> CmdResult {
                 .filter(|t| t.net == net && !t.locked && !t.uuid.is_empty())
                 .collect();
             tracks.sort_by(|x, y| (y.b - y.a).len().total_cmp(&(x.b - x.a).len()));
-            for t in tracks {
-                if remaining <= tol {
-                    break;
-                }
-                let gap = a.f("gap", c.rules.class_of(net).clearance.max(t.w));
-                // what one track can take at the largest amplitude
-                let pitch = 2.0 * (t.w + gap);
-                let usable = (t.b - t.a).len() - 2.0 * (t.w + gap);
-                let cap = (usable / pitch).floor().max(0.0) * 2.0 * amax;
-                let part = remaining.min(cap);
-                if part <= tol {
-                    continue;
-                }
-                if let Some(segs) = tune::meander(&m, t, part, gap, amax, &placed) {
-                    removed.push(t.uuid.clone());
-                    placed.extend(segs.iter().map(|s| (net, s.clone())));
-                    add.entry(net).or_default().segs.extend(segs);
-                    remaining -= part;
-                    meanders += 1;
+            // --amax first; when the tracks are too short for the target, taller bumps on the
+            // tracks still free (2x, 3x)
+            let mut used = vec![false; tracks.len()];
+            for am in [amax, 2.0 * amax, 3.0 * amax] {
+                for (ti, t) in tracks.iter().enumerate() {
+                    if remaining <= tol {
+                        break;
+                    }
+                    if used[ti] {
+                        continue;
+                    }
+                    let gap = a.f("gap", c.rules.class_of(net).clearance.max(t.w));
+                    // what one track can take at this amplitude
+                    let pitch = 2.0 * (t.w + gap);
+                    let usable = (t.b - t.a).len() - 2.0 * (t.w + gap);
+                    let cap = (usable / pitch).floor().max(0.0) * 2.0 * am;
+                    let part = remaining.min(cap);
+                    if part <= tol {
+                        continue;
+                    }
+                    if let Some(segs) = tune::meander(&m, t, part, gap, am, &placed) {
+                        used[ti] = true;
+                        removed.push(t.uuid.clone());
+                        placed.extend(segs.iter().map(|s| (net, s.clone())));
+                        add.entry(net).or_default().segs.extend(segs);
+                        remaining -= part;
+                        meanders += 1;
+                    }
                 }
             }
         }
@@ -2142,6 +2167,12 @@ fn cmd_status(a: &Args) -> CmdResult {
     // next commands
     let pcb = &c.pcb;
     let mut next: Vec<String> = Vec::new();
+    if !std::path::Path::new(&c.pro).is_file() {
+        next.push(format!(
+            "no project file ({}): KiCad's default net class applies to every net; pass --pro with the board's .kicad_pro",
+            c.pcb.replace(".kicad_pcb", ".kicad_pro")
+        ));
+    }
     let unfilled = b
         .zones
         .iter()
@@ -2930,6 +2961,7 @@ fn cmd_plane(a: &Args) -> CmdResult {
                 &fill_params(a),
             );
             write_file(&out, &plane::write_fills(&c.board.text, &c.board))?;
+            copy_project(&c, &out)?;
             eprintln!(
                 "[plane] {k} fill polygons in {:.2} s -> {out}",
                 t.elapsed().as_secs_f64()
@@ -3212,6 +3244,7 @@ fn plane_outline(a: &Args, sub: &str) -> CmdResult {
     board::parse_board(text.clone())
         .map_err(|e| format!("internal: written board does not parse: {e}"))?;
     write_file(&out, &text)?;
+    copy_project(&c, &out)?;
     eprintln!(
         "[plane] {sub} in {:.2} s -> {out}",
         t.elapsed().as_secs_f64()
@@ -4091,6 +4124,7 @@ fn cmd_autoroute(a: &Args) -> CmdResult {
         opens_all(a, &chosen, &c)?
     };
     std::fs::copy(&chosen, &out).map_err(|e| format!("{out}: {e}"))?;
+    copy_project(&c, &out)?;
     stages.push(Stage {
         name: "gate",
         out: chosen.clone(),

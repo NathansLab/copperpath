@@ -40,6 +40,9 @@ fn autoroute_demo_with_gnd_plane() {
     assert_eq!(names, ["planes", "fanout", "route", "gate"], "{v}");
     let text = std::fs::read_to_string(&out).unwrap();
     assert!(text.contains("cp_plane_GND_In1"));
+    // the project and rules files travel with the output (later commands use its net classes)
+    assert!(out.with_extension("kicad_pro").is_file());
+    assert!(out.with_extension("kicad_dru").is_file());
     assert!(v["plane_nets"].as_array().unwrap().contains(&"GND".into()));
 }
 
