@@ -613,7 +613,7 @@ with `kicad-cli pcb drc --refill-zones`. Result of the current main (4 cores, 20
 | icehat | 4 | 59 | 104 → 10 | 0 | 52 | 61 (41) | 970 (1251) |
 | rf_siggen | 4 | 57 | 153 → 16 | 0 | 15 | 175 (369) | 998 (1108) |
 | a123_bcm | 4 | 139 | 92 → 1 ¹ | 0 ¹ | 6.4 | 66 (88) | 829 (1065) |
-| prog_rig | 4 | 287 | 499 → 29 | track_dangling 1 | 157 | 539 (332) | 9256 (12796) |
+| prog_rig | 4 | 287 | 499 → 29 | 0 | 154 | 539 (332) | 9250 (12796) |
 
 ¹ kicad-cli's zone refill on a123_bcm does not finish within 600 s; the benchmark then checks
 both boards with `copperpath drc --refill-zones` (about 1 s).
