@@ -514,7 +514,8 @@ kicad-cli failure), `2` unknown or missing command.
 Common fields: `ok`, `command`, `version`, `threads`, `total_s`, `warnings`. On error:
 `{"ok": false, "command": ..., "error": "...", "version": ...}`.
 
-A short loop for an agent (times on the PCBench icehat board, 4 cores):
+A short loop for an agent (times on the PCBench icehat board, 4 cores; a complete recorded
+session with every command and its result: [docs/agent-session.md](docs/agent-session.md)):
 
 | step | command | time |
 |---|---|---|

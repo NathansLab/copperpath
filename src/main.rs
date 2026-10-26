@@ -1983,6 +1983,7 @@ fn cmd_ripup(a: &Args) -> CmdResult {
     }
     let (text, n) = reroute::remove_items(&b.text, &uuids);
     write_file(&out, &text)?;
+    copy_project(&c, &out)?;
     eprintln!("[ripup] {n} items of {} nets removed -> {out}", per.len());
     Ok(json!({
         "out": out, "removed": n,
@@ -2166,6 +2167,12 @@ fn cmd_status(a: &Args) -> CmdResult {
     // next commands
     let pcb = &c.pcb;
     let mut next: Vec<String> = Vec::new();
+    if !std::path::Path::new(&c.pro).is_file() {
+        next.push(format!(
+            "no project file ({}): KiCad's default net class applies to every net; pass --pro with the board's .kicad_pro",
+            c.pcb.replace(".kicad_pcb", ".kicad_pro")
+        ));
+    }
     let unfilled = b
         .zones
         .iter()
