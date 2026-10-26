@@ -12,7 +12,7 @@
 use crate::board::Zone;
 use crate::drc::MIN_SPOKES;
 use crate::droute::{RNet, RSeg};
-use crate::geom::{point_in_poly, shape_dist, BBox, Shape, P};
+use crate::geom::{shape_dist, BBox, PolyIndex, Shape, P};
 use crate::model::{Kind, Model};
 use std::collections::HashMap;
 
@@ -21,9 +21,8 @@ const MARGIN: f64 = 0.01;
 
 /// fill polygons of one zone on one layer, with the polygons that connect to at least two items
 /// of the net (pads, vias, tracks); the others are isolated islands
-pub struct LayerFill<'a> {
-    polys: Vec<&'a Vec<P>>,
-    bbs: Vec<BBox>,
+pub struct LayerFill {
+    polys: Vec<PolyIndex>,
     pub connected: Vec<bool>,
 }
 
@@ -31,35 +30,29 @@ pub struct LayerFill<'a> {
 /// raster (spokes overlap the pad; a neighbour behind its relief gap does not count)
 const REACH: f64 = 0.08;
 
-fn touches(poly: &[P], bb: &BBox, sh: &Shape, d: f64) -> bool {
-    if !bb.inflate(d).overlaps(&sh.bbox()) {
+fn touches(pi: &PolyIndex, sh: &Shape, d: f64, buf: &mut Vec<u32>) -> bool {
+    let sb = sh.bbox().inflate(d);
+    if !pi.bbox.overlaps(&sb) {
         return false;
     }
-    let n = poly.len();
-    (0..n).any(|i| {
-        let (a, b) = (poly[i], poly[(i + 1) % n]);
+    pi.edges_near(&sb, buf);
+    let n = pi.pts.len();
+    buf.iter().any(|&e| {
+        let (a, b) = (pi.pts[e as usize], pi.pts[(e as usize + 1) % n]);
         shape_dist(sh, &Shape::Capsule { a, b, r: 0.0 }) <= d
-    }) || point_in_poly(sh.bbox().center(), poly)
+    }) || pi.contains(sh.bbox().center())
 }
 
-impl<'a> LayerFill<'a> {
-    pub fn new(m: &Model, z: &'a Zone, l: usize) -> LayerFill<'a> {
-        let polys: Vec<&Vec<P>> = z
+impl LayerFill {
+    pub fn new(m: &Model, z: &Zone, l: usize) -> LayerFill {
+        let polys: Vec<PolyIndex> = z
             .fills
             .iter()
             .filter(|(fl, _)| *fl == l)
-            .map(|(_, p)| p)
+            .map(|(_, p)| PolyIndex::new(p.clone()))
             .collect();
-        let bbs: Vec<BBox> = polys
-            .iter()
-            .map(|p| {
-                let mut b = BBox::empty();
-                p.iter().for_each(|&q| b.add(q));
-                b
-            })
-            .collect();
-        let d = REACH;
         let mut hits = vec![0usize; polys.len()];
+        let mut buf = Vec::new();
         for o in &m.objs {
             if o.net != z.net || o.layers & (1 << l) == 0 {
                 continue;
@@ -68,26 +61,23 @@ impl<'a> LayerFill<'a> {
                 continue;
             }
             for (i, p) in polys.iter().enumerate() {
-                if hits[i] < 2 && touches(p, &bbs[i], &o.shape, d) {
+                if hits[i] < 2 && touches(p, &o.shape, REACH, &mut buf) {
                     hits[i] += 1;
                 }
             }
         }
         LayerFill {
             polys,
-            bbs,
             connected: hits.iter().map(|&h| h >= 2).collect(),
         }
     }
 
     fn in_any(&self, q: P) -> bool {
-        (0..self.polys.len()).any(|i| self.bbs[i].contains(q) && point_in_poly(q, self.polys[i]))
+        self.polys.iter().any(|p| p.contains(q))
     }
 
     fn in_connected(&self, q: P) -> bool {
-        (0..self.polys.len()).any(|i| {
-            self.connected[i] && self.bbs[i].contains(q) && point_in_poly(q, self.polys[i])
-        })
+        (0..self.polys.len()).any(|i| self.connected[i] && self.polys[i].contains(q))
     }
 
     /// spokes of a pad into connected fill and into islands: runs of samples on the pad outline
@@ -98,13 +88,10 @@ impl<'a> LayerFill<'a> {
         ring.iter().for_each(|&q| bb.add(q));
         let (mut main, mut island) = (0, 0);
         for i in 0..self.polys.len() {
-            if !self.bbs[i].overlaps(&bb) {
+            if !self.polys[i].bbox.overlaps(&bb) {
                 continue;
             }
-            let inside: Vec<bool> = ring
-                .iter()
-                .map(|&q| point_in_poly(q, self.polys[i]))
-                .collect();
+            let inside: Vec<bool> = ring.iter().map(|&q| self.polys[i].contains(q)).collect();
             let n = inside.len();
             let runs = (0..n)
                 .filter(|&k| inside[k] && !inside[(k + n - 1) % n])

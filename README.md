@@ -205,7 +205,9 @@ Stages (each writes its board to `OUT_stages/`, the input is never modified):
    time left.
 3c. **pours**: the pour nets are routed after the signals: the zones are filled natively and
    the router only joins what the fill leaves apart, starting on the fill (no signal is
-   ripped); new tracks can cut another pour, so fill and route repeat up to 3 times.
+   ripped); new tracks can cut another pour, so fill and route repeat up to 3 times. Plane
+   nets with pads the plane and the fanout could not join (dense through-hole pins between
+   which the plane cannot pour) are routed here too, on the signal layers.
 3d. **thermals**: pads whose thermal relief resolves to fewer than 2 spokes (`starved_thermal`
    in kicad-cli) get a short stub track from the pad centre into connected fill of their zone,
    which kicad-cli counts as a spoke (`thermals`; off with `--no-thermals`). On the routed

@@ -375,6 +375,9 @@ struct NetMaps {
 /// extra cost per cell inside the `iso` spacing of another net's copper
 const ISO_COST: f32 = 1.5;
 
+/// job windows above this many nodes (cells x layers) get a reachability flood before the search
+const FLOOD_MIN_NODES: usize = 4_000_000;
+
 /// square dilation of a mask by r cells (Chebyshev distance), two separable passes with prefix
 /// sums: O(cells) for any r
 fn dilate(m: &[bool], nx: usize, ny: usize, r: usize) -> Vec<bool> {
@@ -1569,21 +1572,35 @@ impl<'a> Router<'a> {
                         ripped.push(k);
                         conf = self.conflicts(&routed, &cells, &vias);
                     }
-                    for &k in &ripped {
+                    // in waves: nets whose windows cannot see each other reroute in parallel,
+                    // with the same result as one after the other in `ripped` order
+                    for wave in self.waves(&ripped) {
                         if STOP.load(std::sync::atomic::Ordering::Relaxed) {
                             // signal: no time for hard reroutes, the ripped nets stay unrouted
-                            left[k] = self.jobs[k].pins.len().saturating_sub(1).max(1);
+                            for &k in &wave {
+                                left[k] = self.jobs[k].pins.len().saturating_sub(1).max(1);
+                            }
                             continue;
                         }
-                        let o = self.owner_maps(k, &routed);
-                        let fr = self.foreign(k, &routed);
-                        nst[k] = AesStats::default();
-                        let r = self.route_net(k, &o, None, &ck, &fr, &mut nst[k]);
-                        routed[k] = r.0;
-                        left[k] = r.1;
-                        cells[k] = r.2;
-                        vias[k] = r.3;
-                        routes += 1;
+                        let routed_ref = &routed;
+                        let rs: Vec<(usize, NetRouteResult, AesStats)> = wave
+                            .par_iter()
+                            .map(|&k| {
+                                let o = self.owner_maps(k, routed_ref);
+                                let fr = self.foreign(k, routed_ref);
+                                let mut st = AesStats::default();
+                                let r = self.route_net(k, &o, None, &ck, &fr, &mut st);
+                                (k, r, st)
+                            })
+                            .collect();
+                        for (k, r, st) in rs {
+                            nst[k] = st;
+                            routed[k] = r.0;
+                            left[k] = r.1;
+                            cells[k] = r.2;
+                            vias[k] = r.3;
+                            routes += 1;
+                        }
                     }
                     if dbg {
                         eprintln!(
@@ -2002,6 +2019,10 @@ impl<'a> Router<'a> {
         if starts.is_empty() {
             starts.push(0);
         }
+        // large windows: components the search cannot reach are known before it expands the
+        // whole window (2-pin nets across a board can take minutes to fail otherwise)
+        let grp: Option<Vec<u16>> = (n * NL > FLOOD_MIN_NODES && nc > 1)
+            .then(|| self.comp_groups(k, &comp_cells, o, nego.is_none()));
         let mut best: Option<NetRouteResult> = None;
         let mut best_in_tree = vec![false; nc];
         for &start in &starts {
@@ -2038,6 +2059,14 @@ impl<'a> Router<'a> {
                 self.p.par_conn
             };
             let mut dead = vec![false; nc];
+            if let Some(g) = &grp {
+                for c in 0..nc {
+                    if g[c] != g[start] && !comp_cells[c].is_empty() {
+                        dead[c] = true;
+                        self.why[k].store(3, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
             let mut found: Vec<Found> = Vec::new();
             loop {
                 let open: Vec<usize> = (0..nc)
@@ -2219,6 +2248,90 @@ impl<'a> Router<'a> {
 
     /// multi-source multi-target A* inside a window (bbox of sources and targets + `window` mm);
     /// retried on the whole grid when the window search fails
+    /// reachability groups of a net's components in its job window: a flood over the cells the
+    /// search may enter (fixed obstacles; with `hard` also other nets' copper), 8 neighbours and
+    /// vias, without costs or turn limits, so it reaches at least what the search can. Components
+    /// in different groups cannot be joined; the search would only find that out after
+    /// expanding the whole window.
+    fn comp_groups(
+        &self,
+        k: usize,
+        comp_cells: &[Vec<(usize, usize)>],
+        o: &Owners,
+        hard: bool,
+    ) -> Vec<u16> {
+        let mp = &self.maps[k];
+        let (nx, ny) = (mp.g.nx, mp.g.ny);
+        let n = nx * ny;
+        let free = |l: usize, w: usize| -> bool {
+            let ow = |m: &Vec<u16>| !hard || m.get(w).is_none_or(|&c| c == 0);
+            (mp.t[l][w] == R_FREE && ow(&o.t[l]))
+                || (mp.neck[w] && mp.tn[l][w] == R_FREE && ow(&o.tn[l]))
+        };
+        let via = |w: usize| mp.v[w] == R_FREE && (!hard || o.v[w] == 0);
+        let mut grp = vec![u16::MAX; comp_cells.len()];
+        let mut next = 0u16;
+        let mut seen = vec![0u8; n];
+        for c in 0..comp_cells.len() {
+            if grp[c] != u16::MAX || comp_cells[c].is_empty() {
+                continue;
+            }
+            seen.iter_mut().for_each(|v| *v = 0);
+            let mut stack: Vec<(usize, usize)> = Vec::new();
+            for &(l, i) in &comp_cells[c] {
+                if let Some(w) = self.wi(k, i) {
+                    if l < NL && seen[w] & (1 << l) == 0 {
+                        seen[w] |= 1 << l;
+                        stack.push((l, w));
+                    }
+                }
+            }
+            while let Some((l, w)) = stack.pop() {
+                let (x, y) = ((w % nx) as i64, (w / nx) as i64);
+                for (dx, dy) in [
+                    (1, 0),
+                    (-1, 0),
+                    (0, 1),
+                    (0, -1),
+                    (1, 1),
+                    (1, -1),
+                    (-1, 1),
+                    (-1, -1),
+                ] {
+                    let (xx, yy) = (x + dx, y + dy);
+                    if xx < 0 || yy < 0 || xx >= nx as i64 || yy >= ny as i64 {
+                        continue;
+                    }
+                    let wj = yy as usize * nx + xx as usize;
+                    if seen[wj] & (1 << l) == 0 && free(l, wj) {
+                        seen[wj] |= 1 << l;
+                        stack.push((l, wj));
+                    }
+                }
+                if via(w) {
+                    for l2 in 0..NL {
+                        if seen[w] & (1 << l2) == 0 && free(l2, w) {
+                            seen[w] |= 1 << l2;
+                            stack.push((l2, w));
+                        }
+                    }
+                }
+            }
+            for d in 0..comp_cells.len() {
+                if grp[d] == u16::MAX
+                    && (d == c
+                        || comp_cells[d].iter().any(|&(l, i)| {
+                            l < NL && self.wi(k, i).is_some_and(|w| seen[w] & (1 << l) != 0)
+                        }))
+                {
+                    grp[d] = next;
+                }
+            }
+            next = next.saturating_add(1);
+        }
+        grp
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn astar(
         &self,
@@ -2579,8 +2692,13 @@ impl<'a> Router<'a> {
         let mut expanded = 0u64;
         let mut found = None;
         let hw = self.p.hweight;
-        // node cap: the configured value, at least half the nodes of the job window
-        let cap = self.p.max_expand.max((n * NL / 2) as u64);
+        // node cap: the configured value, at least half the nodes of the job window but at most
+        // three times the configured value (a board-long net that needs more is boxed in; failing
+        // after tens of millions of nodes cost up to a minute per search)
+        let cap = self
+            .p
+            .max_expand
+            .max(((n * NL / 2) as u64).min(3 * self.p.max_expand));
         let (jx0, jy0) = (mp.ox as i32, mp.oy as i32);
         let (jx1, jy1) = (jx0 + mp.g.nx as i32 - 1, jy0 + mp.g.ny as i32 - 1);
         let clipped = mp.g.nx < self.gs.nx || mp.g.ny < self.gs.ny;
