@@ -159,6 +159,19 @@ impl Default for NetPrio {
 }
 
 impl NetPrio {
+    /// intent carried by a KiCad net class name: the name is a profile spec (`low_l`,
+    /// `quiet+wide`) or ends with one in brackets (`Power [low_r]`); None otherwise
+    pub fn from_class(class: &str) -> Option<NetPrio> {
+        let c = class.trim();
+        let spec = match c.strip_suffix(']').and_then(|h| h.rsplit_once('[')) {
+            Some((_, sp)) => sp,
+            None => c,
+        };
+        NetPrio::parse(spec)
+            .ok()
+            .filter(|_| !spec.trim().is_empty())
+    }
+
     pub fn parse(spec: &str) -> Result<NetPrio, String> {
         let mut p = NetPrio::default();
         for t in spec.split('+').map(str::trim).filter(|t| !t.is_empty()) {
@@ -218,6 +231,7 @@ impl BoardCfg {
                 None => wild(name, pat),
             })
             .map(|(_, p)| *p)
+            .or_else(|| NetPrio::from_class(class))
             .unwrap_or_default()
     }
 
@@ -1024,6 +1038,19 @@ pub fn mst_connections(pins: &[Pin]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn net_class_names_carry_intents() {
+        let mut c = BoardCfg::default();
+        assert!(c.prio("VBUS", "Power [low_r]").first);
+        assert_eq!(c.prio("VBUS", "Power [low_r]").width, 2.0);
+        assert_eq!(c.prio("A", "quiet").iso, 0.5);
+        assert_eq!(c.prio("A", "Default"), NetPrio::default());
+        assert_eq!(c.prio("A", "Odd [x]"), NetPrio::default());
+        // an explicit intent wins over the class name
+        c.add_prio("A=few_vias").unwrap();
+        assert_eq!(c.prio("A", "quiet").iso, 0.0);
+    }
 
     fn board(items: &str) -> Board {
         crate::board::parse_board(format!(

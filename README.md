@@ -256,7 +256,12 @@ next to its net classes, as a `copperpath` block in the `.kicad_pro` (KiCad keep
 "copperpath": { "net_prio": { "class:Power": "low_r", "CLK*": "low_l", "SW": { "via": 3, "width": 2 } } }
 ```
 
-Order: `--prio` first, then `net_prio` of `--cfg`, then the project block; the first match wins. `netinfo` reports the result per net: length, vias,
+The net class itself can carry the intent: a KiCad net class named after a profile (`quiet`,
+`low_l+wide`) or ending with one in brackets (`Power [low_r]`) gives its nets that intent, so it
+shows up in KiCad's net class list without extra configuration.
+
+Order: `--prio` first, then `net_prio` of `--cfg`, then the project block, then the net class
+name; the first match wins. `netinfo` reports the result per net: length, vias,
 width and rough DC resistance (copper 35 µm, `--cu-um`) and partial inductance (Grover formula
 for the total length plus about 1.3 nH per 1.6 mm via). Demo board, `route` without and with
 `--prio '+5V=low_r,CLK=low_l,ADC1=few_vias'` (both DRC-clean):
