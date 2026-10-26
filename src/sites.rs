@@ -292,7 +292,7 @@ fn edge_block(m: &Model, gs: &GridSpec, net: usize, r: f64, map: &mut [u8]) {
                     j += 1;
                 }
                 let i = gs.idx(ix, iy);
-                if map[i] == R_FREE && (xs.len() - j) % 2 == 0 {
+                if map[i] == R_FREE && (xs.len() - j).is_multiple_of(2) {
                     map[i] = K_EDGE;
                 }
             }
